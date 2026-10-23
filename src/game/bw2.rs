@@ -1,6 +1,8 @@
 use super::gen5::Gen5Title;
 
+pub mod field;
 pub mod map;
+pub mod terrain;
 
 /// Edition boundary for Black 2 / White 2 specific behavior.
 /// Shared Gen V rules belong in `gen5`; field data and behavior that differs

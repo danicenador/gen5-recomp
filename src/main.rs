@@ -1,12 +1,20 @@
 use gen5::formats::nds::NdsRom;
+use gen5::game::bw2::field;
 use gen5::game::bw2::map;
 use gen5::game::gen5 as gen5_game;
 use gen5::importer;
 use gen5::render;
+use gen5::runtime;
 use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("gen5=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
     if let Err(error) = run() {
         eprintln!("error: {error}");
         std::process::exit(1);
@@ -47,6 +55,60 @@ fn run() -> Result<(), String> {
                 PathBuf::from,
             );
             map_preview(cache_root, zone_id, &output)
+        }
+        Some("walk") if (2..=5).contains(&args.len()) => {
+            if args.len() == 4 {
+                print_usage();
+                return Err("provide both start coordinates or neither".to_owned());
+            }
+            let zone_id = args
+                .get(2)
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid zone index '{value}'"))
+                })
+                .transpose()?
+                .unwrap_or(map::ASPERTIA_CITY_ZONE);
+            let start = if args.len() == 5 {
+                let x = args[3]
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid start x coordinate '{}'", args[3]))?;
+                let z = args[4]
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid start z coordinate '{}'", args[4]))?;
+                Some((x, z))
+            } else {
+                None
+            };
+            field_walk(Path::new(&args[1]), zone_id, start)
+        }
+        Some("play") if (2..=5).contains(&args.len()) => {
+            if args.len() == 4 {
+                print_usage();
+                return Err("provide both start coordinates or neither".to_owned());
+            }
+            let zone_id = args
+                .get(2)
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid zone index '{value}'"))
+                })
+                .transpose()?
+                .unwrap_or(map::ASPERTIA_CITY_ZONE);
+            let start = if args.len() == 5 {
+                let x = args[3]
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid start x coordinate '{}'", args[3]))?;
+                let z = args[4]
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid start z coordinate '{}'", args[4]))?;
+                Some((x, z))
+            } else {
+                None
+            };
+            field_play(Path::new(&args[1]), zone_id, start)
         }
         Some("help" | "--help" | "-h") if args.len() == 1 => {
             print_usage();
@@ -169,6 +231,24 @@ fn map_preview(cache_root: &Path, zone_id: u32, output: &Path) -> Result<(), Str
     Ok(())
 }
 
+fn field_walk(
+    cache_root: &Path,
+    zone_id: u32,
+    start: Option<(usize, usize)>,
+) -> Result<(), String> {
+    let zone = map::load_zone(cache_root, zone_id)?;
+    field::run_terminal(cache_root, zone, start)
+}
+
+fn field_play(
+    cache_root: &Path,
+    zone_id: u32,
+    start: Option<(usize, usize)>,
+) -> Result<(), String> {
+    let zone = map::load_zone(cache_root, zone_id)?;
+    runtime::run(cache_root, zone, start)
+}
+
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -192,6 +272,8 @@ fn print_usage() {
          gen5 list <rom.nds> [path-prefix]\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 map-preview <import-cache-directory> [zone-index] [output.svg]\n\
+         gen5 play <import-cache-directory> [zone-index [start-x start-z]]\n\
+         gen5 walk <import-cache-directory> [zone-index [start-x start-z]]\n\
          gen5 help"
     );
 }
