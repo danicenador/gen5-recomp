@@ -5,18 +5,29 @@ use crate::game::bw2::map::ZoneMap;
 struct Vertex {
     position: [f64; 3],
     color: [u8; 3],
+    uv: [f64; 2],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct Triangle {
     vertices: [Vertex; 3],
     material_color: Option<[u8; 3]>,
+    texture_name: Option<String>,
     depth: f64,
 }
 
 #[derive(Debug)]
 pub(super) struct ModelGeometry {
     pub triangles: Vec<Triangle>,
+}
+
+pub(super) fn translate(triangles: &mut [Triangle], x: f64, z: f64) {
+    for triangle in triangles {
+        for vertex in &mut triangle.vertices {
+            vertex.position[0] += x;
+            vertex.position[2] += z;
+        }
+    }
 }
 
 pub(super) fn scene_triangles(triangles: &[Triangle]) -> Vec<super::SceneTriangle> {
@@ -39,7 +50,15 @@ pub(super) fn scene_triangles(triangles: &[Triangle]) -> Vec<super::SceneTriangl
                     1.0,
                 ]
             });
-            super::SceneTriangle { positions, colors }
+            let uvs = triangle
+                .vertices
+                .map(|vertex| [vertex.uv[0] as f32, vertex.uv[1] as f32]);
+            super::SceneTriangle {
+                positions,
+                colors,
+                uvs,
+                texture_name: triangle.texture_name.clone(),
+            }
         })
         .collect()
 }
@@ -51,10 +70,11 @@ struct Draw {
     object: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Material {
     diffuse: [u8; 3],
     uses_vertex_color: bool,
+    texture_name: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -182,14 +202,16 @@ pub(super) fn read_model(bytes: &[u8]) -> Result<ModelGeometry> {
             .get(draw.piece)
             .ok_or_else(|| format!("MDL0 render command refers to missing piece {}", draw.piece))?;
         let transform = objects.get(draw.object).copied().unwrap_or_default();
-        let material = materials_info.get(draw.material).copied();
+        let material = materials_info.get(draw.material).cloned();
         for mut triangle in decode_gpu_commands(commands)? {
             for vertex in &mut triangle.vertices {
                 vertex.position = transform.apply(vertex.position);
             }
             triangle.material_color = material
+                .as_ref()
                 .filter(|entry| !entry.uses_vertex_color)
                 .map(|entry| entry.diffuse);
+            triangle.texture_name = material.as_ref().map(|entry| entry.texture_name.clone());
             triangle.depth = triangle
                 .vertices
                 .iter()
@@ -250,7 +272,7 @@ fn read_material_info(bytes: &[u8], start: usize, limit: usize) -> Result<Vec<Ma
     let info = read_info_block(bytes, start + 4, start, limit)?;
     info.entries
         .iter()
-        .map(|(offset, _)| {
+        .map(|(offset, name)| {
             let material_start = info.relative_base + *offset as usize;
             require(bytes, material_start, 20, "MDL0 material record")?;
             if material_start + 20 > limit {
@@ -261,6 +283,7 @@ fn read_material_info(bytes: &[u8], start: usize, limit: usize) -> Result<Vec<Ma
             Ok(Material {
                 diffuse: rgb555(raw_color),
                 uses_vertex_color: diffuse_ambient & 0x8000 != 0,
+                texture_name: name.clone(),
             })
         })
         .collect()
@@ -413,6 +436,7 @@ fn decode_gpu_commands(bytes: &[u8]) -> Result<Vec<Triangle>> {
     let mut cursor = 0usize;
     let mut current = [0.0; 3];
     let mut current_color = [255; 3];
+    let mut current_uv = [0.0; 2];
     let mut primitive_mode = None;
     let mut primitive_vertices = Vec::new();
     let mut triangles = Vec::new();
@@ -433,6 +457,13 @@ fn decode_gpu_commands(bytes: &[u8]) -> Result<Vec<Triangle>> {
             }
             match opcode {
                 0x20 => current_color = rgb555(parameters[0]),
+                0x22 => {
+                    current_uv = [
+                        i16::from_le_bytes((parameters[0] as u16).to_le_bytes()) as f64 / 16.0,
+                        i16::from_le_bytes(((parameters[0] >> 16) as u16).to_le_bytes()) as f64
+                            / 16.0,
+                    ];
+                }
                 0x40 => {
                     primitive_mode = Some(parameters[0] as u8 & 3);
                     primitive_vertices.clear();
@@ -456,6 +487,7 @@ fn decode_gpu_commands(bytes: &[u8]) -> Result<Vec<Triangle>> {
                         primitive_mode,
                         current,
                         current_color,
+                        current_uv,
                     );
                 }
                 0x24 => {
@@ -470,6 +502,7 @@ fn decode_gpu_commands(bytes: &[u8]) -> Result<Vec<Triangle>> {
                         primitive_mode,
                         current,
                         current_color,
+                        current_uv,
                     );
                 }
                 0x25 => {
@@ -483,6 +516,7 @@ fn decode_gpu_commands(bytes: &[u8]) -> Result<Vec<Triangle>> {
                         primitive_mode,
                         current,
                         current_color,
+                        current_uv,
                     );
                 }
                 0x26 => {
@@ -496,6 +530,7 @@ fn decode_gpu_commands(bytes: &[u8]) -> Result<Vec<Triangle>> {
                         primitive_mode,
                         current,
                         current_color,
+                        current_uv,
                     );
                 }
                 0x27 => {
@@ -509,6 +544,7 @@ fn decode_gpu_commands(bytes: &[u8]) -> Result<Vec<Triangle>> {
                         primitive_mode,
                         current,
                         current_color,
+                        current_uv,
                     );
                 }
                 0x28 => {
@@ -521,10 +557,11 @@ fn decode_gpu_commands(bytes: &[u8]) -> Result<Vec<Triangle>> {
                         primitive_mode,
                         current,
                         current_color,
+                        current_uv,
                     );
                 }
-                // Matrix, texture-coordinate and normal commands do not alter
-                // the positions used by this flat-color preview.
+                // Texture coordinates are captured above; matrix and normal
+                // commands do not alter positions in this model reader.
                 _ => {}
             }
         }
@@ -532,9 +569,19 @@ fn decode_gpu_commands(bytes: &[u8]) -> Result<Vec<Triangle>> {
     Ok(triangles)
 }
 
-fn push_vertex(vertices: &mut Vec<Vertex>, mode: Option<u8>, position: [f64; 3], color: [u8; 3]) {
+fn push_vertex(
+    vertices: &mut Vec<Vertex>,
+    mode: Option<u8>,
+    position: [f64; 3],
+    color: [u8; 3],
+    uv: [f64; 2],
+) {
     if mode.is_some() {
-        vertices.push(Vertex { position, color });
+        vertices.push(Vertex {
+            position,
+            color,
+            uv,
+        });
     }
 }
 
@@ -585,6 +632,7 @@ fn make_triangle(vertices: [Vertex; 3], material_color: Option<[u8; 3]>) -> Tria
     Triangle {
         vertices,
         material_color,
+        texture_name: None,
         depth: 0.0,
     }
 }

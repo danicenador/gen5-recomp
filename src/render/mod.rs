@@ -1,7 +1,9 @@
 mod map_model;
 
 use crate::Result;
+use crate::formats::nitro::texture::{NitroTexture, parse_texture_archive};
 use crate::game::bw2::map::ZoneMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,21 +15,24 @@ pub struct PreviewReport {
     pub model_ids: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SceneTriangle {
     pub positions: [[f32; 3]; 3],
     pub colors: [[f32; 4]; 3],
+    /// Nitro UVs are in texels; the renderer normalizes them using the material texture size.
+    pub uvs: [[f32; 2]; 3],
+    pub texture_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MapScene {
+    pub triangles: Vec<SceneTriangle>,
+    pub textures: Vec<NitroTexture>,
 }
 
 /// Load the original map-model geometry in a renderer-neutral form.
 /// Game logic remains independent of wgpu and graphics resource types.
-pub fn load_map_scene(cache_root: &Path, zone: &ZoneMap) -> Result<Vec<SceneTriangle>> {
-    if zone.width != 1 || zone.height != 1 || zone.model_ids.len() != 1 {
-        return Err(format!(
-            "map scene currently supports one-cell maps; zone {} is {}x{}",
-            zone.zone_id, zone.width, zone.height
-        ));
-    }
+pub fn load_map_scene(cache_root: &Path, zone: &ZoneMap) -> Result<MapScene> {
     let romfs = if cache_root.join("romfs").is_dir() {
         cache_root.join("romfs")
     } else {
@@ -37,11 +42,28 @@ pub fn load_map_scene(cache_root: &Path, zone: &ZoneMap) -> Result<Vec<SceneTria
         .map_err(|error| format!("could not read BW2 map-model archive: {error}"))?;
     let archive = crate::formats::narc::NarcArchive::parse(&archive_bytes)?;
     let mut output = Vec::new();
-    for model_id in zone.model_ids.iter().flatten().copied() {
-        let index = usize::try_from(model_id)
-            .map_err(|_| format!("map model ID {model_id} does not fit this platform"))?;
-        let model = map_model::read_model(archive.member(index)?)?;
-        output.extend(map_model::scene_triangles(&model.triangles));
+    let mut model_cache = HashMap::new();
+    for cell_z in 0..usize::from(zone.height) {
+        for cell_x in 0..usize::from(zone.width) {
+            let Some(model_id) = zone.model_at(cell_x, cell_z) else {
+                continue;
+            };
+            if !model_cache.contains_key(&model_id) {
+                let index = usize::try_from(model_id)
+                    .map_err(|_| format!("map model ID {model_id} does not fit this platform"))?;
+                let model = map_model::read_model(archive.member(index)?)?;
+                model_cache.insert(model_id, model);
+            }
+            let model = model_cache.get(&model_id).expect("inserted above");
+            let mut triangles = map_model::scene_triangles(&model.triangles);
+            for triangle in &mut triangles {
+                for point in &mut triangle.positions {
+                    point[0] += cell_x as f32 * 8.0;
+                    point[2] += cell_z as f32 * 8.0;
+                }
+            }
+            output.extend(triangles);
+        }
     }
     if output.is_empty() {
         return Err(format!(
@@ -49,18 +71,39 @@ pub fn load_map_scene(cache_root: &Path, zone: &ZoneMap) -> Result<Vec<SceneTria
             zone.zone_id
         ));
     }
-    Ok(output)
+    let texture_bytes = fs::read(romfs.join("a/0/1/4"))
+        .map_err(|error| format!("could not read BW2 map-texture archive: {error}"))?;
+    let texture_archive = crate::formats::narc::NarcArchive::parse(&texture_bytes)?;
+    let texture_member = texture_archive.member(usize::from(zone.area_id))?;
+    let textures = parse_texture_archive(texture_member)?;
+    let available = textures
+        .iter()
+        .map(|texture| texture.name.as_str())
+        .collect::<HashSet<_>>();
+    let referenced = output
+        .iter()
+        .filter_map(|triangle| triangle.texture_name.as_deref())
+        .collect::<HashSet<_>>();
+    let missing = referenced
+        .iter()
+        .filter(|name| !available.contains(**name))
+        .count();
+    tracing::info!(
+        zone = zone.zone_id,
+        decoded_textures = textures.len(),
+        missing_material_textures = missing,
+        triangles = output.len(),
+        "loaded textured map scene"
+    );
+    Ok(MapScene {
+        triangles: output,
+        textures,
+    })
 }
 
 /// Render map model geometry to an SVG preview. This first renderer preserves
 /// model and vertex colors; external Nitro textures are a later graphics step.
 pub fn render_map_svg(cache_root: &Path, zone: &ZoneMap, output: &Path) -> Result<PreviewReport> {
-    if zone.width != 1 || zone.height != 1 || zone.model_ids.len() != 1 {
-        return Err(format!(
-            "map preview currently supports one-cell maps; zone {} is {}x{}",
-            zone.zone_id, zone.width, zone.height
-        ));
-    }
     let romfs = if cache_root.join("romfs").is_dir() {
         cache_root.join("romfs")
     } else {
@@ -72,13 +115,23 @@ pub fn render_map_svg(cache_root: &Path, zone: &ZoneMap, output: &Path) -> Resul
     let narc = crate::formats::narc::NarcArchive::parse(&model_archive)?;
     let mut triangles = Vec::new();
     let mut model_ids = Vec::new();
-    for model_id in zone.model_ids.iter().flatten().copied() {
-        let model_id_usize = usize::try_from(model_id)
-            .map_err(|_| format!("map model ID {model_id} does not fit this platform"))?;
-        let member = narc.member(model_id_usize)?;
-        let model = map_model::read_model(member)?;
-        triangles.extend(model.triangles);
-        model_ids.push(model_id);
+    for cell_z in 0..usize::from(zone.height) {
+        for cell_x in 0..usize::from(zone.width) {
+            let Some(model_id) = zone.model_at(cell_x, cell_z) else {
+                continue;
+            };
+            let model_id_usize = usize::try_from(model_id)
+                .map_err(|_| format!("map model ID {model_id} does not fit this platform"))?;
+            let member = narc.member(model_id_usize)?;
+            let mut model = map_model::read_model(member)?;
+            map_model::translate(
+                &mut model.triangles,
+                cell_x as f64 * 8.0,
+                cell_z as f64 * 8.0,
+            );
+            triangles.extend(model.triangles);
+            model_ids.push(model_id);
+        }
     }
     if triangles.is_empty() {
         return Err(format!(

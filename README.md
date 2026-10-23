@@ -31,16 +31,16 @@ geometry to SVG rather than converting every archive and asset type.
 The second vertical slice adds a bounds-checked NARC reader, BW2 zone and map
 matrix decoding, and a native Nitro model geometry reader. It can turn a map's
 original model geometry and available vertex/material colors into an SVG
-isometric preview. The first renderer supports single-cell matrices; external
-map textures are not decoded yet.
+isometric preview, including multi-cell matrices.
 
 ```text
 cargo run -- map-preview ".gen5-cache/pokemon-white-2/95AB5437"
-cargo run -- map-preview ".gen5-cache/pokemon-white-2/95AB5437" 428 "aspertia-city.svg"
+cargo run -- map-preview ".gen5-cache/pokemon-white-2/95AB5437" 427 "aspertia-city.svg"
 ```
 
-The default zone is White 2's Aspertia City (zone 428). The command writes to
-`<import-cache-directory>/previews/zone-428.svg` unless an output path is given.
+The default zone is White 2's Aspertia City (zone 427). Zone 428 is an indoor
+house. The command writes to `<import-cache-directory>/previews/zone-427.svg`
+unless an output path is given.
 
 ## BW2 field movement
 
@@ -53,25 +53,26 @@ available as `walk` for quick map and collision inspection.
 
 ```text
 cargo run -- play ".gen5-cache/pokemon-white-2/95AB5437"
-cargo run -- play ".gen5-cache/pokemon-white-2/95AB5437" 428 16 16
+cargo run -- play ".gen5-cache/pokemon-white-2/95AB5437" 427
 cargo run -- walk ".gen5-cache/pokemon-white-2/95AB5437"
 ```
 
 Controllers use the D-pad when available. The runtime initializes Kira's audio
 backend, but original ROM sound playback awaits SDAT conversion and sample
-loading. `wgpu` stays in the desktop renderer; `FieldSession` owns movement
-state and collision and has no rendering dependency. The runtime stack uses
-`winit`, `wgpu`, `glam`, `egui`, `gilrs`, `kira`, `serde`, and `tracing`.
+loading. The desktop renderer draws multi-cell geometry, samples decoded BTX0
+textures, and overlays nearby movement tiles on the 3D map. `wgpu` stays in the
+desktop renderer; `FieldSession` owns movement state and collision and has no
+rendering dependency. The runtime stack uses `winit`, `wgpu`, `glam`, `egui`,
+`gilrs`, `kira`, `serde`, and `tracing`.
 
 The terminal command uses W/A/S/D followed by Enter; Q quits.
 The default spawn is the nearest recognized walkable tile to the terrain-grid
 center. Supply a zone and optional grid coordinates to choose another start:
 
-For this first map, only Aspertia's known common ground terrain code is marked
-walkable. Other terrain codes are treated as solid until their movement
-permissions are decoded. Movement currently covers a single height-terrain
-layer and one-cell map; it does not yet resolve the original slope/height tables,
-events, map transitions, or render sprites in a native window.
+Movement currently uses the known ordinary-foot passable terrain codes and
+treats other codes as solid. It reads one height-terrain layer; slope/height
+tables, events, map transitions, and original character sprites are still
+future work.
 
 ## Planned layers
 
@@ -81,19 +82,19 @@ events, map transitions, or render sprites in a native window.
 - `game::gen5`: title identification and game-specific behavior boundaries.
 - `game::bw2`: Black 2 / White 2 behavior boundary and zone/matrix decoding;
   White 2 is the first runtime target.
-- `render`: first Nitro model geometry path and SVG map preview.
+- `render`: Nitro model geometry, BTX0 texture decoding, atlas sampling, and SVG
+  map preview.
 - `game::bw2::terrain` and `game::bw2::field`: original map terrain decoding,
   conservative tile collision, player state, and terminal input loop.
-- Future format modules: Nitro graphics and textures, text, sound, and script data.
+- Future format modules: text, sound, and script data.
 - Future runtime layers: original Gen V script VM, field/map simulation, Pokémon
   and battle rules, and PC rendering, audio, and input.
 
 ## Development sequence
 
 1. ROM explorer and validated import cache.
-2. Decode one BW2 map and render its original model geometry (initial preview;
-   texture decoding remains in this slice's follow-up work).
-3. Add player movement and map collision.
+2. Decode and render a multi-cell BW2 map with original model textures.
+3. Add player movement and map collision in the 3D field view.
 4. Execute one original NPC script and show its dialogue.
 5. Add map transitions, then menus and battles.
 6. Complete White 2, then Black 2 and BW1.
