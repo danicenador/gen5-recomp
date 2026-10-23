@@ -65,10 +65,11 @@ awaits SDAT conversion and sample loading. The desktop renderer draws
 multi-cell geometry, samples decoded BTX0 textures, overlays nearby movement
 tiles on the 3D map, and displays dialogue. `wgpu` stays in the desktop
 renderer; `FieldSession` owns movement, collision, and script state without a
-rendering dependency. This slice's script VM supports the commands used by the
-Aspertia outlook NPC; unsupported opcodes report their original command and
-byte offset. The runtime stack uses `winit`, `wgpu`, `glam`, `egui`, `gilrs`,
-`kira`, `serde`, and `tracing`.
+rendering dependency. The field VM handles the initial stack, event-variable,
+flag, branch, message, and wait commands used by Aspertia NPC scripts;
+unsupported opcodes report their original command and byte offset. The runtime
+stack uses `winit`, `wgpu`, `glam`, `egui`, `gilrs`, `kira`, `serde`, and
+`tracing`.
 
 The terminal command uses W/A/S/D followed by Enter to move, and a blank line
 or E to talk/continue; Q quits.
