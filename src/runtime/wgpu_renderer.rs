@@ -222,15 +222,31 @@ impl WgpuRenderer {
             return Ok(());
         }
         self.resize(size);
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err("wgpu rejected the current surface texture".to_owned());
+            }
+        };
 
-        let output = egui_ctx.run_ui(egui_input, |ui| {
+        let mut output = egui_ctx.run_ui(egui_input, |ui| {
             debug_panel(ui, session, audio_available);
         });
         egui_platform.handle_platform_output(window, output.platform_output);
-        for (id, deltas) in &output.textures_delta.set {
+        let texture_updates = std::mem::take(&mut output.textures_delta.set);
+        let textures_to_free = std::mem::take(&mut output.textures_delta.free);
+        for (id, deltas) in texture_updates {
             for delta in deltas {
                 self.egui_renderer
-                    .update_texture(&self.device, &self.queue, *id, delta);
+                    .update_texture(&self.device, &self.queue, id, &delta);
             }
         }
         let paint_jobs = egui_ctx.tessellate(output.shapes, output.pixels_per_point);
@@ -246,20 +262,6 @@ impl WgpuRenderer {
         );
         self.write_camera(size);
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err("wgpu rejected the current surface texture".to_owned());
-            }
-        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -339,7 +341,7 @@ impl WgpuRenderer {
                 .chain(std::iter::once(encoder.finish())),
         );
         self.queue.present(frame);
-        for id in &output.textures_delta.free {
+        for id in &textures_to_free {
             self.egui_renderer.free_texture(id);
         }
         Ok(())
