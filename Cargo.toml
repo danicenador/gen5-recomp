@@ -1,0 +1,7 @@
+[package]
+name = "gen5"
+version = "0.1.0"
+edition = "2024"
+description = "A native Rust foundation for exploring and importing Pokémon Gen V game data"
+
+[dependencies]
