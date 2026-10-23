@@ -1,8 +1,10 @@
 use gen5::formats::nds::NdsRom;
+use gen5::game::bw2::map;
 use gen5::game::gen5 as gen5_game;
 use gen5::importer;
+use gen5::render;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn main() {
     if let Err(error) = run() {
@@ -24,6 +26,27 @@ fn run() -> Result<(), String> {
                 .get(2)
                 .map_or_else(|| Path::new(".gen5-cache"), |path| Path::new(path));
             import(Path::new(&args[1]), cache_path)
+        }
+        Some("map-preview") if (2..=4).contains(&args.len()) => {
+            let zone_id = args
+                .get(2)
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid zone index '{value}'"))
+                })
+                .transpose()?
+                .unwrap_or(map::ASPERTIA_CITY_ZONE);
+            let cache_root = Path::new(&args[1]);
+            let output = args.get(3).map_or_else(
+                || {
+                    cache_root
+                        .join("previews")
+                        .join(format!("zone-{zone_id}.svg"))
+                },
+                PathBuf::from,
+            );
+            map_preview(cache_root, zone_id, &output)
         }
         Some("help" | "--help" | "-h") if args.len() == 1 => {
             print_usage();
@@ -123,6 +146,29 @@ fn import(path: &Path, cache_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn map_preview(cache_root: &Path, zone_id: u32, output: &Path) -> Result<(), String> {
+    let zone = map::load_zone(cache_root, zone_id)?;
+    let preview = render::render_map_svg(cache_root, &zone, output)?;
+    println!("Rendered {}", zone.display_name());
+    println!(
+        "Zone {}, area {}, matrix {} ({}×{}), map models: {}",
+        zone.zone_id,
+        zone.area_id,
+        zone.matrix_id,
+        zone.width,
+        zone.height,
+        preview
+            .model_ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!("Geometry: {} triangles", preview.triangle_count);
+    println!("Preview: {}", preview.output.display());
+    Ok(())
+}
+
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -145,6 +191,7 @@ fn print_usage() {
          gen5 inspect <rom.nds>\n\
          gen5 list <rom.nds> [path-prefix]\n\
          gen5 import <rom.nds> [cache-directory]\n\
+         gen5 map-preview <import-cache-directory> [zone-index] [output.svg]\n\
          gen5 help"
     );
 }

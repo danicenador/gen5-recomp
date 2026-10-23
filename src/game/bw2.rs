@@ -1,5 +1,7 @@
 use super::gen5::Gen5Title;
 
+pub mod map;
+
 /// Edition boundary for Black 2 / White 2 specific behavior.
 /// Shared Gen V rules belong in `gen5`; field data and behavior that differs
 /// between the two sequels will be introduced here as the runtime grows.

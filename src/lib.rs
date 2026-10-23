@@ -1,11 +1,11 @@
 //! Native format and import foundation for Pokémon Generation V.
 //!
-//! The first vertical slice is intentionally an asset importer and explorer. It
-//! reads the original NDS container directly and writes an immutable, file-level
-//! cache; game execution and asset conversion sit on top of these boundaries.
+//! The first slices provide a ROM explorer/importer and a BW2 map geometry
+//! preview. Runtime simulation and full asset conversion build on these layers.
 
 pub mod formats;
 pub mod game;
 pub mod importer;
+pub mod render;
 
 pub type Result<T> = std::result::Result<T, String>;
