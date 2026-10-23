@@ -13,7 +13,7 @@ the Nintendo DS.
 
 ```text
 cargo run -- inspect "roms/Pokemon White Version 2.nds"
-cargo run -- list "roms/Pokemon White Version 2.nds" data
+cargo run -- list "roms/Pokemon White Version 2.nds" a
 cargo run -- import "roms/Pokemon White Version 2.nds"
 ```
 

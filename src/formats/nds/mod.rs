@@ -67,7 +67,7 @@ impl NdsRom {
             .seek(SeekFrom::Start(0))
             .map_err(|error| format!("could not seek to start of ROM: {error}"))?;
         let mut crc = Crc32::new();
-        let mut buffer = [0_u8; 1024 * 1024];
+        let mut buffer = vec![0_u8; 1024 * 1024];
         loop {
             let count = self
                 .file
