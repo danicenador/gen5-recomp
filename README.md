@@ -22,24 +22,44 @@ cargo run -- import "roms/Pokemon White Version 2.nds"
 per-file CRC-32 values. Pass a second path argument to select a different cache
 root. The `.gen5-cache` directory is ignored by Git.
 
-This first cache is a byte-preserving import. It gives later format decoders a
-stable input layer; it does not yet unpack NARC archives or convert graphics,
-maps, text, scripts, models, textures, or audio into engine-native assets.
+The importer keeps ROM files byte-for-byte in a local cache. The map preview
+reads the needed NARC entries from that cache; it currently exports model
+geometry to SVG rather than converting every archive and asset type.
+
+## BW2 map preview
+
+The second vertical slice adds a bounds-checked NARC reader, BW2 zone and map
+matrix decoding, and a native Nitro model geometry reader. It can turn a map's
+original model geometry and available vertex/material colors into an SVG
+isometric preview. The first renderer supports single-cell matrices; external
+map textures are not decoded yet.
+
+```text
+cargo run -- map-preview ".gen5-cache/pokemon-white-2/95AB5437"
+cargo run -- map-preview ".gen5-cache/pokemon-white-2/95AB5437" 428 "aspertia-city.svg"
+```
+
+The default zone is White 2's Aspertia City (zone 428). The command writes to
+`<import-cache-directory>/previews/zone-428.svg` unless an output path is given.
 
 ## Planned layers
 
 - `formats::nds`: NDS header and NitroFS parsing.
+- `formats::narc`: bounded Nitro Archive member access.
 - `importer`: ROM validation and cache creation.
 - `game::gen5`: title identification and game-specific behavior boundaries.
-- `game::bw2`: Black 2 / White 2 behavior boundary; White 2 is the first runtime target.
-- Future format modules: NARC, Nitro graphics, map, text, sound, and script data.
+- `game::bw2`: Black 2 / White 2 behavior boundary and zone/matrix decoding;
+  White 2 is the first runtime target.
+- `render`: first Nitro model geometry path and SVG map preview.
+- Future format modules: Nitro graphics and textures, text, sound, and script data.
 - Future runtime layers: original Gen V script VM, field/map simulation, Pokémon
   and battle rules, and PC rendering, audio, and input.
 
 ## Development sequence
 
 1. ROM explorer and validated import cache.
-2. Decode one BW2 map and render its original tiles/objects.
+2. Decode one BW2 map and render its original model geometry (initial preview;
+   texture decoding remains in this slice's follow-up work).
 3. Add player movement and map collision.
 4. Execute one original NPC script and show its dialogue.
 5. Add map transitions, then menus and battles.
