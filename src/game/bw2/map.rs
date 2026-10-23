@@ -3,7 +3,7 @@ use crate::formats::narc::NarcArchive;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const ASPERTIA_CITY_ZONE: u32 = 428;
+pub const ASPERTIA_CITY_ZONE: u32 = 427;
 const ZONE_RECORD_SIZE: usize = 0x30;
 const ZONE_ARCHIVE: &str = "a/0/1/2";
 const MATRIX_ARCHIVE: &str = "a/0/0/9";
@@ -56,6 +56,15 @@ impl ZoneMap {
             ASPERTIA_CITY_ZONE => "Aspertia City",
             _ => "Unknown BW2 zone",
         }
+    }
+
+    pub fn model_at(&self, x: usize, z: usize) -> Option<u32> {
+        let width = usize::from(self.width);
+        let height = usize::from(self.height);
+        if x >= width || z >= height {
+            return None;
+        }
+        self.model_ids.get(z * width + x).copied().flatten()
     }
 }
 

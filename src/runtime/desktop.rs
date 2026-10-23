@@ -1,6 +1,6 @@
 use crate::Result;
 use crate::game::bw2::field::{Direction, FieldSession, MoveResult};
-use crate::render::SceneTriangle;
+use crate::render::MapScene;
 use crate::runtime::wgpu_renderer::WgpuRenderer;
 use gilrs::{EventType, Gilrs};
 use kira::{AudioManager, AudioManagerSettings, DefaultBackend};
@@ -13,7 +13,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-pub fn run(session: FieldSession, scene: Vec<SceneTriangle>) -> Result<()> {
+pub fn run(session: FieldSession, scene: MapScene) -> Result<()> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("could not create event loop: {error}"))?;
     let mut app = DesktopApp::new(session, scene);
@@ -28,7 +28,7 @@ pub fn run(session: FieldSession, scene: Vec<SceneTriangle>) -> Result<()> {
 
 struct DesktopApp {
     session: FieldSession,
-    scene: Vec<SceneTriangle>,
+    scene: MapScene,
     window: Option<Arc<Window>>,
     renderer: Option<WgpuRenderer>,
     egui_ctx: egui::Context,
@@ -39,7 +39,7 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
-    fn new(session: FieldSession, scene: Vec<SceneTriangle>) -> Self {
+    fn new(session: FieldSession, scene: MapScene) -> Self {
         let gilrs = match Gilrs::new() {
             Ok(gilrs) => {
                 info!("controller input initialized");

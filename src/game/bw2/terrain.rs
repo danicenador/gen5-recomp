@@ -6,9 +6,9 @@ use std::path::Path;
 
 const MODEL_ARCHIVE: &str = "a/0/0/8";
 
-/// The terrain code used by Aspertia City's broad, traversable ground.
-/// Other codes remain blocked until their Gen V movement permissions are mapped.
-pub const ASPERTIA_WALKABLE_TYPE: u32 = 0x0081_0001;
+/// Gen V movement permission values documented as passable for ordinary foot travel.
+/// Values not in this set remain blocked until their movement rules are implemented.
+const WALKABLE_MOVEMENT_CODES: [u16; 7] = [0, 2, 3, 4, 6, 10, 14];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerrainTile {
@@ -21,7 +21,19 @@ pub struct TerrainTile {
 
 impl TerrainTile {
     pub fn is_walkable(self) -> bool {
-        self.tile_type == ASPERTIA_WALKABLE_TYPE
+        WALKABLE_MOVEMENT_CODES.contains(&(self.tile_type as u16))
+    }
+
+    pub fn movement_code(self) -> u16 {
+        self.tile_type as u16
+    }
+
+    pub fn height_world(self) -> f32 {
+        if self.shape == 2 {
+            0.0
+        } else {
+            f32::from(self.height_index) / 256.0
+        }
     }
 }
 
@@ -41,16 +53,8 @@ impl TerrainLayer {
     }
 }
 
-/// Read the first height-terrain layer for a single-cell BW2 zone.
+/// Combine the first height-terrain layer from each model cell into a map grid.
 pub fn load_zone_terrain(cache_root: &Path, zone: &ZoneMap) -> Result<TerrainLayer> {
-    if zone.model_ids.len() != 1 || zone.width != 1 || zone.height != 1 {
-        return Err(format!(
-            "field movement currently supports one-cell maps; zone {} is {}x{}",
-            zone.zone_id, zone.width, zone.height
-        ));
-    }
-    let model_id =
-        zone.model_ids[0].ok_or_else(|| format!("zone {} has no map model", zone.zone_id))?;
     let romfs = if cache_root.join("romfs").is_dir() {
         cache_root.join("romfs")
     } else {
@@ -59,14 +63,59 @@ pub fn load_zone_terrain(cache_root: &Path, zone: &ZoneMap) -> Result<TerrainLay
     let archive_bytes = fs::read(romfs.join(MODEL_ARCHIVE))
         .map_err(|error| format!("could not read BW2 map-model archive: {error}"))?;
     let archive = NarcArchive::parse(&archive_bytes)?;
-    let member_index = usize::try_from(model_id)
-        .map_err(|_| format!("map model ID {model_id} does not fit this platform"))?;
-    let chunk = archive.member(member_index)?;
-    let layers = parse_terrain_layers(chunk)?;
-    layers
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("map model {model_id} contains no terrain layer"))
+    let chunk_width = 32usize;
+    let chunk_height = 32usize;
+    let width = usize::from(zone.width)
+        .checked_mul(chunk_width)
+        .ok_or_else(|| "zone terrain width overflowed".to_owned())?;
+    let height = usize::from(zone.height)
+        .checked_mul(chunk_height)
+        .ok_or_else(|| "zone terrain height overflowed".to_owned())?;
+    let tile_count = width
+        .checked_mul(height)
+        .ok_or_else(|| "zone terrain tile count overflowed".to_owned())?;
+    let blocked = TerrainTile {
+        shape: 0,
+        slope_index: 0,
+        height_index: 0,
+        tile_type: u32::MAX,
+        diagonal: false,
+    };
+    let mut output = TerrainLayer {
+        width: u16::try_from(width)
+            .map_err(|_| "zone terrain width exceeds the supported grid size".to_owned())?,
+        height: u16::try_from(height)
+            .map_err(|_| "zone terrain height exceeds the supported grid size".to_owned())?,
+        tiles: vec![blocked; tile_count],
+    };
+
+    for cell_z in 0..usize::from(zone.height) {
+        for cell_x in 0..usize::from(zone.width) {
+            let Some(model_id) = zone.model_at(cell_x, cell_z) else {
+                continue;
+            };
+            let member_index = usize::try_from(model_id)
+                .map_err(|_| format!("map model ID {model_id} does not fit this platform"))?;
+            let chunk = archive.member(member_index)?;
+            let Some(layer) = parse_terrain_layers(chunk)?.into_iter().next() else {
+                continue;
+            };
+            if usize::from(layer.width) != chunk_width || usize::from(layer.height) != chunk_height
+            {
+                return Err(format!(
+                    "map model {model_id} has terrain size {}x{}, expected {chunk_width}x{chunk_height}",
+                    layer.width, layer.height
+                ));
+            }
+            for local_z in 0..chunk_height {
+                let source_start = local_z * chunk_width;
+                let target_start = (cell_z * chunk_height + local_z) * width + cell_x * chunk_width;
+                output.tiles[target_start..target_start + chunk_width]
+                    .copy_from_slice(&layer.tiles[source_start..source_start + chunk_width]);
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn parse_terrain_layers(chunk: &[u8]) -> Result<Vec<TerrainLayer>> {

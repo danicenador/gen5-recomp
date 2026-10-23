@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::game::bw2::map::{ASPERTIA_CITY_ZONE, ZoneMap};
+use crate::game::bw2::map::ZoneMap;
 use crate::game::bw2::terrain::{TerrainLayer, TerrainTile, load_zone_terrain};
 use std::io::{self, Write};
 use std::path::Path;
@@ -35,12 +35,6 @@ pub struct FieldSession {
 
 impl FieldSession {
     pub fn load(cache_root: &Path, zone: ZoneMap, start: Option<(usize, usize)>) -> Result<Self> {
-        if zone.zone_id != ASPERTIA_CITY_ZONE {
-            return Err(format!(
-                "field movement currently has a terrain permission table for Aspertia City (zone {ASPERTIA_CITY_ZONE}); got zone {}",
-                zone.zone_id
-            ));
-        }
         let terrain = load_zone_terrain(cache_root, &zone)?;
         let (x, z) = match start {
             Some((x, z)) => {
@@ -100,10 +94,8 @@ pub fn run_terminal(cache_root: &Path, zone: ZoneMap, start: Option<(usize, usiz
     let mut session = FieldSession::load(cache_root, zone, start)?;
     println!("{} — native field movement", session.zone.display_name());
     println!(
-        "Terrain: {}×{} | recognized ground: 0x{:08X}",
-        session.terrain.width,
-        session.terrain.height,
-        crate::game::bw2::terrain::ASPERTIA_WALKABLE_TYPE
+        "Terrain: {}×{} | movement codes: 0, 2, 3, 4, 6, 10, 14",
+        session.terrain.width, session.terrain.height
     );
     println!("Move with W/A/S/D and Enter; Q quits. Coordinates start at (0, 0).\n");
     print_map(&session);
