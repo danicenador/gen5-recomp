@@ -24,7 +24,8 @@ struct PaletteEntry {
 }
 
 /// Decode the common tiled texture formats used by BW2 map texture sets.
-/// Unsupported 4x4-compressed images are skipped while the remaining images load.
+/// Unsupported or malformed individual images are skipped so one bad texture
+/// cannot prevent the rest of a map from loading.
 pub fn parse_texture_archive(bytes: &[u8]) -> Result<Vec<NitroTexture>> {
     if bytes.len() < 20 || &bytes[..4] != b"BTX0" {
         return Err("Nitro texture member has no BTX0 header".to_owned());
@@ -91,7 +92,7 @@ pub fn parse_texture_archive(bytes: &[u8]) -> Result<Vec<NitroTexture>> {
         } else {
             palette_data_offset
         };
-        let rgba8 = decode_pixels(
+        let rgba8 = match decode_pixels(
             bytes,
             data_start,
             data_size,
@@ -101,7 +102,17 @@ pub fn parse_texture_archive(bytes: &[u8]) -> Result<Vec<NitroTexture>> {
             entry.parameters & (1 << 13) != 0,
             palette_start,
             tex0_end,
-        )?;
+        ) {
+            Ok(rgba8) => rgba8,
+            Err(error) => {
+                tracing::warn!(
+                    texture = %entry.name,
+                    %error,
+                    "skipping undecodable Nitro texture"
+                );
+                continue;
+            }
+        };
         decoded.push(NitroTexture {
             name: entry.name,
             width: u16::try_from(entry.width)
@@ -204,22 +215,6 @@ fn decode_pixels(
         .checked_mul(4)
         .ok_or_else(|| "decoded texture size overflowed".to_owned())?;
     let mut output = vec![0; output_size];
-    let palette_size = match format {
-        1 => 32,
-        2 => 4,
-        3 => 16,
-        4 => 256,
-        6 => 8,
-        _ => 0,
-    };
-    let palette_bytes = palette_size * 2;
-    if palette_size > 0 {
-        require(bytes, palette_start, palette_bytes, "TEX0 palette colors")?;
-        if palette_start + palette_bytes > limit {
-            return Err("texture palette extends past TEX0".to_owned());
-        }
-    }
-
     for y in 0..height {
         for x in 0..width {
             let tiled_index = tiled_pixel_index(x, y, width);
@@ -230,11 +225,14 @@ fn decode_pixels(
                         .ok_or_else(|| "A3I5 texture pixel extends past its data".to_owned())?;
                     let index = usize::from(packed & 0x1F);
                     let alpha = u32::from(packed >> 5) * 255 / 7;
-                    (palette_color(bytes, palette_start, index)?, alpha as u8)
+                    (
+                        palette_color(bytes, palette_start, index, limit)?,
+                        alpha as u8,
+                    )
                 }
                 2 => {
                     let packed = packed_bits(bytes, data_start, data_size, tiled_index, 2)?;
-                    let color = palette_color(bytes, palette_start, packed as usize)?;
+                    let color = palette_color(bytes, palette_start, packed as usize, limit)?;
                     let alpha = if transparent_zero && packed == 0 {
                         0
                     } else {
@@ -244,7 +242,7 @@ fn decode_pixels(
                 }
                 3 => {
                     let packed = packed_bits(bytes, data_start, data_size, tiled_index, 4)?;
-                    let color = palette_color(bytes, palette_start, packed as usize)?;
+                    let color = palette_color(bytes, palette_start, packed as usize, limit)?;
                     let alpha = if transparent_zero && packed == 0 {
                         0
                     } else {
@@ -256,7 +254,7 @@ fn decode_pixels(
                     let packed = *bytes
                         .get(data_start + tiled_index)
                         .ok_or_else(|| "indexed texture pixel extends past its data".to_owned())?;
-                    let color = palette_color(bytes, palette_start, usize::from(packed))?;
+                    let color = palette_color(bytes, palette_start, usize::from(packed), limit)?;
                     let alpha = if transparent_zero && packed == 0 {
                         0
                     } else {
@@ -270,7 +268,10 @@ fn decode_pixels(
                         .ok_or_else(|| "A5I3 texture pixel extends past its data".to_owned())?;
                     let index = usize::from(packed & 0x07);
                     let alpha = u32::from(packed >> 3) * 255 / 31;
-                    (palette_color(bytes, palette_start, index)?, alpha as u8)
+                    (
+                        palette_color(bytes, palette_start, index, limit)?,
+                        alpha as u8,
+                    )
                 }
                 7 => {
                     let offset = data_start + tiled_index * 2;
@@ -311,11 +312,19 @@ fn tiled_pixel_index(x: usize, y: usize, width: usize) -> usize {
     tile_index * 64 + (y % 8) * 8 + (x % 8)
 }
 
-fn palette_color(bytes: &[u8], palette_start: usize, index: usize) -> Result<[u8; 3]> {
+fn palette_color(
+    bytes: &[u8],
+    palette_start: usize,
+    index: usize,
+    limit: usize,
+) -> Result<[u8; 3]> {
     let offset = palette_start
         .checked_add(index * 2)
         .ok_or_else(|| "palette color offset overflowed".to_owned())?;
     require(bytes, offset, 2, "TEX0 palette color")?;
+    if offset + 2 > limit {
+        return Err("TEX0 palette color extends past its section".to_owned());
+    }
     Ok(rgb555(u16_at(bytes, offset)?))
 }
 

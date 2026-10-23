@@ -1,12 +1,12 @@
 use crate::Result;
 use crate::formats::narc::NarcArchive;
-use crate::game::bw2::events::{self, FieldNpc};
-use crate::game::bw2::map::ZoneMap;
+use crate::game::bw2::events::{self, FieldNpc, FieldWarp};
+use crate::game::bw2::map::{self, ZoneMap};
 use crate::game::bw2::terrain::{TerrainLayer, TerrainTile, load_zone_terrain};
 use crate::game::gen5::script_vm::{FieldScriptState, FieldScriptVm};
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SCRIPT_ARCHIVE: &str = "a/0/5/6";
 const MESSAGE_ARCHIVE: &str = "a/0/0/3";
@@ -28,9 +28,11 @@ pub struct Player {
     pub steps: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MoveResult {
     Moved,
+    Transitioned { from_zone: u32, to_zone: u32 },
+    TransitionFailed(String),
     BlockedByEdge,
     BlockedByTerrain(TerrainTile),
     BlockedByScript,
@@ -41,6 +43,8 @@ pub struct FieldSession {
     pub terrain: TerrainLayer,
     pub player: Player,
     pub npcs: Vec<FieldNpc>,
+    warps: Vec<FieldWarp>,
+    cache_root: PathBuf,
     script_bank: Vec<u8>,
     message_bank: Vec<u8>,
     script_state: FieldScriptState,
@@ -51,6 +55,7 @@ impl FieldSession {
     pub fn load(cache_root: &Path, zone: ZoneMap, start: Option<(usize, usize)>) -> Result<Self> {
         let terrain = load_zone_terrain(cache_root, &zone)?;
         let npcs = events::load_zone_npcs(cache_root, zone.event_bank)?;
+        let warps = events::load_zone_warps(cache_root, zone.event_bank)?;
         let script_bank = load_archive_member(cache_root, SCRIPT_ARCHIVE, zone.scripts_bank)?;
         let message_bank = load_archive_member(cache_root, MESSAGE_ARCHIVE, zone.text_bank)?;
         let (x, z, facing) = match start {
@@ -74,6 +79,8 @@ impl FieldSession {
             zone,
             terrain,
             npcs,
+            warps,
+            cache_root: cache_root.to_path_buf(),
             script_bank,
             message_bank,
             script_state: FieldScriptState::default(),
@@ -106,6 +113,21 @@ impl FieldSession {
         let Some(tile) = self.terrain.tile(x, z) else {
             return MoveResult::BlockedByEdge;
         };
+        // Door and map-exit tiles use a dedicated movement code that can look
+        // blocked to ordinary walking. Let the zone's warp event claim the
+        // tile before applying the regular terrain collision rule.
+        if let Some(warp) = self
+            .warps
+            .iter()
+            .copied()
+            .find(|warp| warp.destination_zone.is_some() && warp.contains_tile(x, z))
+        {
+            let from_zone = self.zone.zone_id;
+            return match self.transition_through(warp, direction) {
+                Ok(to_zone) => MoveResult::Transitioned { from_zone, to_zone },
+                Err(error) => MoveResult::TransitionFailed(error),
+            };
+        }
         if !tile.is_walkable() {
             return MoveResult::BlockedByTerrain(tile);
         }
@@ -113,6 +135,41 @@ impl FieldSession {
         self.player.z = z;
         self.player.steps += 1;
         MoveResult::Moved
+    }
+
+    fn transition_through(&mut self, source: FieldWarp, direction: Direction) -> Result<u32> {
+        let destination_zone_id = u32::from(
+            source
+                .destination_zone
+                .ok_or_else(|| "warp has no fixed destination zone".to_owned())?,
+        );
+        let destination_zone = map::load_zone(&self.cache_root, destination_zone_id)?;
+        let destination_warps =
+            events::load_zone_warps(&self.cache_root, destination_zone.event_bank)?;
+        let destination_warp = destination_warps
+            .iter()
+            .copied()
+            .find(|warp| warp.id == source.destination_warp)
+            .ok_or_else(|| {
+                format!(
+                    "zone {destination_zone_id} has no warp {}",
+                    source.destination_warp
+                )
+            })?;
+        let arrival = destination_warp.arrival_tile();
+        let terrain = load_zone_terrain(&self.cache_root, &destination_zone)?;
+        let (x, z) = nearest_walkable_spawn(&terrain, arrival).ok_or_else(|| {
+            format!(
+                "destination warp {} in zone {destination_zone_id} has no nearby walkable tile",
+                source.destination_warp
+            )
+        })?;
+        let mut destination = Self::load(&self.cache_root, destination_zone, Some((x, z)))?;
+        destination.player.facing = direction;
+        destination.player.steps = self.player.steps + 1;
+        destination.script_state = self.script_state.clone();
+        *self = destination;
+        Ok(destination_zone_id)
     }
 
     /// Execute the script attached to the NPC in front of the player, or
@@ -248,6 +305,16 @@ pub fn run_terminal(cache_root: &Path, zone: ZoneMap, start: Option<(usize, usiz
                 MoveResult::Moved => {
                     println!("Moved to ({}, {}).", session.player.x, session.player.z)
                 }
+                MoveResult::Transitioned { from_zone, to_zone } => println!(
+                    "Transitioned from zone {from_zone} to {} ({}), at ({}, {}).",
+                    to_zone,
+                    session.zone.display_name(),
+                    session.player.x,
+                    session.player.z
+                ),
+                MoveResult::TransitionFailed(error) => {
+                    eprintln!("Could not transition through warp: {error}")
+                }
                 MoveResult::BlockedByEdge => println!("Blocked by map edge."),
                 MoveResult::BlockedByTerrain(tile) => println!(
                     "Blocked by terrain type 0x{:08X} at ({}, {}).",
@@ -299,6 +366,26 @@ fn find_spawn(terrain: &TerrainLayer) -> Option<(usize, usize)> {
         .flat_map(|z| (0..usize::from(terrain.width)).map(move |x| (x, z)))
         .filter(|(x, z)| terrain.tile(*x, *z).is_some_and(TerrainTile::is_walkable))
         .min_by_key(|(x, z)| x.abs_diff(center_x) + z.abs_diff(center_z))
+}
+
+fn nearest_walkable_spawn(
+    terrain: &TerrainLayer,
+    origin: (usize, usize),
+) -> Option<(usize, usize)> {
+    let (origin_x, origin_z) = origin;
+    let radius = 8usize;
+    let min_x = origin_x.saturating_sub(radius);
+    let min_z = origin_z.saturating_sub(radius);
+    let max_x = origin_x
+        .saturating_add(radius + 1)
+        .min(usize::from(terrain.width));
+    let max_z = origin_z
+        .saturating_add(radius + 1)
+        .min(usize::from(terrain.height));
+    (min_z..max_z)
+        .flat_map(|z| (min_x..max_x).map(move |x| (x, z)))
+        .filter(|(x, z)| terrain.tile(*x, *z).is_some_and(TerrainTile::is_walkable))
+        .min_by_key(|(x, z)| x.abs_diff(origin_x) + z.abs_diff(origin_z))
 }
 
 fn print_map(session: &FieldSession) {

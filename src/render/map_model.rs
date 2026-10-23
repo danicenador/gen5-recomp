@@ -680,7 +680,7 @@ pub(super) fn write_svg(zone: &ZoneMap, triangles: &[Triangle]) -> Result<String
     svg.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1280 900\" width=\"1280\" height=\"900\">\n");
     svg.push_str("<rect width=\"1280\" height=\"900\" fill=\"#eef2f6\"/>\n");
     svg.push_str("<text x=\"32\" y=\"42\" font-family=\"sans-serif\" font-size=\"25\" font-weight=\"700\" fill=\"#172033\">");
-    svg.push_str(zone.display_name());
+    svg.push_str(&zone.display_name());
     svg.push_str(" — BW2 map geometry</text>\n");
     let model_ids = zone
         .model_ids
