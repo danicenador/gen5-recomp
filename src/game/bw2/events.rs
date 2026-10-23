@@ -21,7 +21,47 @@ pub struct FieldNpc {
     pub height: u16,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FieldWarp {
+    pub id: u16,
+    pub destination_zone: Option<u16>,
+    pub destination_warp: u16,
+    pub transition: u8,
+    /// World position in sixteenths of a tile, as stored by the event archive.
+    pub x: u16,
+    pub z: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl FieldWarp {
+    pub fn contains_tile(self, x: usize, z: usize) -> bool {
+        let tile_center_x = (x as u64).saturating_mul(32).saturating_add(16);
+        let tile_center_z = (z as u64).saturating_mul(32).saturating_add(16);
+        let warp_center_x = u64::from(self.x) * 2;
+        let warp_center_z = u64::from(self.z) * 2;
+        let half_width = u64::from(self.width.max(1)) * 16;
+        let half_height = u64::from(self.height.max(1)) * 16;
+        tile_center_x.abs_diff(warp_center_x) <= half_width
+            && tile_center_z.abs_diff(warp_center_z) <= half_height
+    }
+
+    pub fn arrival_tile(self) -> (usize, usize) {
+        (usize::from(self.x / 16), usize::from(self.z / 16))
+    }
+}
+
 pub fn load_zone_npcs(cache_root: &Path, event_bank: u16) -> Result<Vec<FieldNpc>> {
+    let (npcs, _) = load_zone_events(cache_root, event_bank)?;
+    Ok(npcs)
+}
+
+pub fn load_zone_warps(cache_root: &Path, event_bank: u16) -> Result<Vec<FieldWarp>> {
+    let (_, warps) = load_zone_events(cache_root, event_bank)?;
+    Ok(warps)
+}
+
+fn load_zone_events(cache_root: &Path, event_bank: u16) -> Result<(Vec<FieldNpc>, Vec<FieldWarp>)> {
     let romfs = if cache_root.join("romfs").is_dir() {
         cache_root.join("romfs")
     } else {
@@ -31,10 +71,10 @@ pub fn load_zone_npcs(cache_root: &Path, event_bank: u16) -> Result<Vec<FieldNpc
         .map_err(|error| format!("could not read BW2 zone-event archive: {error}"))?;
     let archive = NarcArchive::parse(&bytes)?;
     let event = archive.member(usize::from(event_bank))?;
-    parse_zone_npcs(event)
+    parse_zone_events(event)
 }
 
-fn parse_zone_npcs(bytes: &[u8]) -> Result<Vec<FieldNpc>> {
+fn parse_zone_events(bytes: &[u8]) -> Result<(Vec<FieldNpc>, Vec<FieldWarp>)> {
     if bytes.len() < 8 {
         return Err("BW2 zone-event entry is shorter than its header".to_owned());
     }
@@ -100,7 +140,34 @@ fn parse_zone_npcs(bytes: &[u8]) -> Result<Vec<FieldNpc>> {
             height,
         });
     }
-    Ok(npcs)
+    let warp_start = npc_start + npc_bytes;
+    let mut warps = Vec::with_capacity(warp_count);
+    for index in 0..warp_count {
+        let start = warp_start + index * WARP_RECORD_SIZE;
+        let destination_zone = u16_at(bytes, start)?;
+        let destination_warp = u16_at(bytes, start + 2)?;
+        let transition = *bytes
+            .get(start + 5)
+            .ok_or_else(|| "zone-event warp transition extends past its entry".to_owned())?;
+        let is_rail = u16_at(bytes, start + 6)?;
+        // Rail warps use a component/front/side union rather than a tile rectangle.
+        // They are retained by the importer but cannot trigger in this grid-based field slice.
+        if is_rail != 0 {
+            continue;
+        }
+        warps.push(FieldWarp {
+            id: u16::try_from(index)
+                .map_err(|_| "zone-event warp index exceeds 16 bits".to_owned())?,
+            destination_zone: (destination_zone != u16::MAX).then_some(destination_zone),
+            destination_warp,
+            transition,
+            x: u16_at(bytes, start + 8)?,
+            z: u16_at(bytes, start + 12)?,
+            width: u16_at(bytes, start + 14)?,
+            height: u16_at(bytes, start + 16)?,
+        });
+    }
+    Ok((npcs, warps))
 }
 
 fn u16_at(bytes: &[u8], offset: usize) -> Result<u16> {

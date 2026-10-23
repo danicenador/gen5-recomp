@@ -39,6 +39,8 @@ pub struct WgpuRenderer {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     texture_bind_group: wgpu::BindGroup,
+    texture_layout: wgpu::BindGroupLayout,
+    texture_sampler: wgpu::Sampler,
     map_buffer: wgpu::Buffer,
     map_vertex_count: u32,
     collision_buffer: wgpu::Buffer,
@@ -299,6 +301,8 @@ impl WgpuRenderer {
             camera_buffer,
             camera_bind_group,
             texture_bind_group,
+            texture_layout,
+            texture_sampler,
             map_buffer,
             map_vertex_count,
             collision_buffer,
@@ -310,6 +314,113 @@ impl WgpuRenderer {
             egui_renderer,
             fallback_rect: atlas.fallback_rect,
         })
+    }
+
+    /// Replace the static map resources after the field session has changed zones.
+    pub fn replace_scene(&mut self, scene: &MapScene, session: &FieldSession) -> Result<()> {
+        let atlas = build_texture_atlas(
+            &scene.textures,
+            self.device.limits().max_texture_dimension_2d,
+        )?;
+        let vertices = make_map_vertices(&scene.triangles, &atlas.entries, atlas.fallback_rect);
+        let map_vertex_count = u32::try_from(vertices.len())
+            .map_err(|_| "map vertex count exceeds the GPU draw limit".to_owned())?;
+        let map_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("BW2 map model vertices"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("BW2 map texture atlas"),
+            size: wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas.width * 4),
+                rows_per_image: Some(atlas.height),
+            },
+            wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("map atlas texture bind group"),
+            layout: &self.texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
+                },
+            ],
+        });
+
+        let collision_capacity = collision_vertex_capacity(session);
+        let collision_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("field collision overlay vertices"),
+            size: u64::from(collision_capacity) * std::mem::size_of::<GpuVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let initial_player = make_player_vertices(session, atlas.fallback_rect);
+        let player_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("field player marker vertices"),
+                contents: bytemuck::cast_slice(&initial_player),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let initial_npcs = make_npc_vertices(session, atlas.fallback_rect);
+        let npc_vertex_capacity = u32::try_from(initial_npcs.len().max(1))
+            .map_err(|_| "NPC vertex count exceeds the GPU draw limit".to_owned())?;
+        let npc_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("field NPC marker vertices"),
+            size: u64::from(npc_vertex_capacity) * std::mem::size_of::<GpuVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if !initial_npcs.is_empty() {
+            self.queue
+                .write_buffer(&npc_buffer, 0, bytemuck::cast_slice(&initial_npcs));
+        }
+
+        self.texture_bind_group = texture_bind_group;
+        self.map_buffer = map_buffer;
+        self.map_vertex_count = map_vertex_count;
+        self.collision_buffer = collision_buffer;
+        self.collision_vertex_capacity = collision_capacity;
+        self.player_buffer = player_buffer;
+        self.npc_buffer = npc_buffer;
+        self.npc_vertex_capacity = npc_vertex_capacity;
+        self.fallback_rect = atlas.fallback_rect;
+        Ok(())
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {

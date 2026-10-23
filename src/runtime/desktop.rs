@@ -1,9 +1,10 @@
 use crate::Result;
 use crate::game::bw2::field::{Direction, FieldSession, MoveResult};
-use crate::render::MapScene;
+use crate::render::{self, MapScene};
 use crate::runtime::wgpu_renderer::WgpuRenderer;
 use gilrs::{EventType, Gilrs};
 use kira::{AudioManager, AudioManagerSettings, DefaultBackend};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -13,10 +14,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-pub fn run(session: FieldSession, scene: MapScene) -> Result<()> {
+const KEY_REPEAT_INTERVAL: Duration = Duration::from_millis(120);
+
+pub fn run(cache_root: &Path, session: FieldSession, scene: MapScene) -> Result<()> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("could not create event loop: {error}"))?;
-    let mut app = DesktopApp::new(session, scene);
+    let mut app = DesktopApp::new(cache_root.to_path_buf(), session, scene);
     event_loop
         .run_app(&mut app)
         .map_err(|error| format!("desktop event loop failed: {error}"))?;
@@ -27,6 +30,7 @@ pub fn run(session: FieldSession, scene: MapScene) -> Result<()> {
 }
 
 struct DesktopApp {
+    cache_root: PathBuf,
     session: FieldSession,
     scene: MapScene,
     window: Option<Arc<Window>>,
@@ -36,10 +40,12 @@ struct DesktopApp {
     gilrs: Option<Gilrs>,
     audio: Option<AudioManager<DefaultBackend>>,
     fatal_error: Option<String>,
+    held_keys: Vec<KeyCode>,
+    next_key_move: Instant,
 }
 
 impl DesktopApp {
-    fn new(session: FieldSession, scene: MapScene) -> Self {
+    fn new(cache_root: PathBuf, session: FieldSession, scene: MapScene) -> Self {
         let gilrs = match Gilrs::new() {
             Ok(gilrs) => {
                 info!("controller input initialized");
@@ -61,6 +67,7 @@ impl DesktopApp {
             }
         };
         Self {
+            cache_root,
             session,
             scene,
             window: None,
@@ -70,6 +77,8 @@ impl DesktopApp {
             gilrs,
             audio,
             fatal_error: None,
+            held_keys: Vec::new(),
+            next_key_move: Instant::now(),
         }
     }
 
@@ -79,7 +88,7 @@ impl DesktopApp {
         event_loop.exit();
     }
 
-    fn step(&mut self, direction: Direction) {
+    fn step(&mut self, event_loop: &ActiveEventLoop, direction: Direction) {
         match self.session.move_player(direction) {
             MoveResult::Moved => info!(
                 x = self.session.player.x,
@@ -87,6 +96,36 @@ impl DesktopApp {
                 ?direction,
                 "player moved"
             ),
+            MoveResult::Transitioned { from_zone, to_zone } => {
+                match render::load_map_scene(&self.cache_root, &self.session.zone) {
+                    Ok(scene) => {
+                        let replace_result = self
+                            .renderer
+                            .as_mut()
+                            .map(|renderer| renderer.replace_scene(&scene, &self.session))
+                            .transpose();
+                        if let Err(error) = replace_result {
+                            self.fail(event_loop, error);
+                            return;
+                        }
+                        self.scene = scene;
+                        if let Some(window) = &self.window {
+                            window.set_title(&format!(
+                                "Gen5 Native · {}",
+                                self.session.zone.display_name()
+                            ));
+                        }
+                        info!(from_zone, to_zone, "field map transition complete");
+                    }
+                    Err(error) => {
+                        self.fail(event_loop, error);
+                        return;
+                    }
+                }
+            }
+            MoveResult::TransitionFailed(error) => {
+                warn!(%error, "field map transition could not be completed")
+            }
             MoveResult::BlockedByEdge => debug!(?direction, "player reached map edge"),
             MoveResult::BlockedByTerrain(tile) => debug!(
                 tile_type = format_args!("0x{:08X}", tile.tile_type),
@@ -109,7 +148,7 @@ impl DesktopApp {
         }
     }
 
-    fn poll_gamepad(&mut self) {
+    fn poll_gamepad(&mut self, event_loop: &ActiveEventLoop) {
         let mut directions = Vec::new();
         let mut action_pressed = false;
         if let Some(gilrs) = &mut self.gilrs {
@@ -124,10 +163,29 @@ impl DesktopApp {
             }
         }
         for direction in directions {
-            self.step(direction);
+            self.step(event_loop, direction);
+            if self.fatal_error.is_some() {
+                return;
+            }
         }
         if action_pressed {
             self.press_action();
+        }
+    }
+
+    fn repeat_held_key(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now < self.next_key_move {
+            return;
+        }
+        let direction = self
+            .held_keys
+            .iter()
+            .rev()
+            .find_map(|key| key_direction(*key));
+        if let Some(direction) = direction {
+            self.next_key_move = now + KEY_REPEAT_INTERVAL;
+            self.step(event_loop, direction);
         }
     }
 
@@ -162,6 +220,16 @@ fn controller_direction(button: gilrs::Button) -> Option<Direction> {
         gilrs::Button::DPadRight => Some(Direction::East),
         gilrs::Button::DPadDown => Some(Direction::South),
         gilrs::Button::DPadLeft => Some(Direction::West),
+        _ => None,
+    }
+}
+
+fn key_direction(key: KeyCode) -> Option<Direction> {
+    match key {
+        KeyCode::KeyW | KeyCode::ArrowUp => Some(Direction::North),
+        KeyCode::KeyD | KeyCode::ArrowRight => Some(Direction::East),
+        KeyCode::KeyS | KeyCode::ArrowDown => Some(Direction::South),
+        KeyCode::KeyA | KeyCode::ArrowLeft => Some(Direction::West),
         _ => None,
     }
 }
@@ -239,26 +307,33 @@ impl ApplicationHandler for DesktopApp {
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
-            WindowEvent::KeyboardInput { event, .. }
-                if !consumed && event.state == ElementState::Pressed && !event.repeat =>
-            {
-                let direction = match event.physical_key {
-                    PhysicalKey::Code(KeyCode::KeyW | KeyCode::ArrowUp) => Some(Direction::North),
-                    PhysicalKey::Code(KeyCode::KeyD | KeyCode::ArrowRight) => Some(Direction::East),
-                    PhysicalKey::Code(KeyCode::KeyS | KeyCode::ArrowDown) => Some(Direction::South),
-                    PhysicalKey::Code(KeyCode::KeyA | KeyCode::ArrowLeft) => Some(Direction::West),
-                    PhysicalKey::Code(KeyCode::Enter | KeyCode::Space) => {
-                        self.press_action();
-                        None
-                    }
-                    PhysicalKey::Code(KeyCode::Escape) => {
-                        event_loop.exit();
-                        None
-                    }
+            WindowEvent::Focused(false) => self.held_keys.clear(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                let key = match event.physical_key {
+                    PhysicalKey::Code(key) => Some(key),
                     _ => None,
                 };
-                if let Some(direction) = direction {
-                    self.step(direction);
+                if let Some(key) = key {
+                    match event.state {
+                        ElementState::Pressed if !consumed && !event.repeat => {
+                            if let Some(direction) = key_direction(key) {
+                                self.held_keys.retain(|held| *held != key);
+                                self.held_keys.push(key);
+                                self.next_key_move = Instant::now() + KEY_REPEAT_INTERVAL;
+                                self.step(event_loop, direction);
+                            } else {
+                                match key {
+                                    KeyCode::Enter | KeyCode::Space => self.press_action(),
+                                    KeyCode::Escape => event_loop.exit(),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        ElementState::Released => {
+                            self.held_keys.retain(|held| *held != key);
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -266,7 +341,8 @@ impl ApplicationHandler for DesktopApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.poll_gamepad();
+        self.poll_gamepad(event_loop);
+        self.repeat_held_key(event_loop);
         event_loop.set_control_flow(ControlFlow::WaitUntil(
             Instant::now() + Duration::from_millis(16),
         ));

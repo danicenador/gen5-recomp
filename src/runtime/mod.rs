@@ -11,5 +11,5 @@ use std::path::Path;
 pub fn run(cache_root: &Path, zone: ZoneMap, start: Option<(usize, usize)>) -> Result<()> {
     let session = FieldSession::load(cache_root, zone.clone(), start)?;
     let scene = render::load_map_scene(cache_root, &zone)?;
-    desktop::run(session, scene)
+    desktop::run(cache_root, session, scene)
 }

@@ -68,10 +68,10 @@ pub fn load_zone(cache_root: &Path, zone_id: u32) -> Result<ZoneMap> {
 }
 
 impl ZoneMap {
-    pub fn display_name(&self) -> &'static str {
+    pub fn display_name(&self) -> String {
         match self.zone_id {
-            ASPERTIA_CITY_ZONE => "Aspertia City",
-            _ => "Unknown BW2 zone",
+            ASPERTIA_CITY_ZONE => "Aspertia City".to_owned(),
+            _ => format!("BW2 zone {}", self.zone_id),
         }
     }
 
