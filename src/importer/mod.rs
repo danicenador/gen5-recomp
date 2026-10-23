@@ -1,10 +1,30 @@
 use crate::Result;
 use crate::formats::nds::{NdsRom, RomFile};
 use crate::game::gen5::{self, Gen5Title};
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheManifest {
+    format: String,
+    game: String,
+    title: String,
+    game_code: String,
+    rom_size: u64,
+    rom_crc32: String,
+    files: Vec<CacheFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheFile {
+    id: u16,
+    path: String,
+    size: u32,
+    crc32: String,
+}
 
 #[derive(Debug)]
 pub struct ImportReport {
@@ -37,10 +57,11 @@ pub fn import_rom(mut rom: NdsRom, cache_root: &Path) -> Result<ImportReport> {
                     manifest.display()
                 )
             })?;
-            let expected_crc = format!("\"rom_crc32\": \"{rom_crc32:08X}\"");
-            if manifest_text.contains("\"format\": \"gen5-rom-cache-v1\"")
-                && manifest_text.contains(&expected_crc)
-                && final_path.join("romfs").is_dir()
+            let parsed = serde_json::from_str::<CacheManifest>(&manifest_text);
+            if parsed.is_ok_and(|manifest| {
+                manifest.format == "gen5-rom-cache-v1"
+                    && manifest.rom_crc32 == format!("{rom_crc32:08X}")
+            }) && final_path.join("romfs").is_dir()
             {
                 return Ok(ImportReport {
                     cache_path: final_path,
@@ -148,49 +169,30 @@ fn write_cache(
             )
         })?;
         let file_crc32 = copy_file(rom, file, &mut output)?;
-        manifest_entries.push(format!(
-            "    {{\"id\":{},\"path\":{},\"size\":{},\"crc32\":\"{file_crc32:08X}\"}}",
-            file.id,
-            json_string(&file.path),
-            file.size
-        ));
+        manifest_entries.push(CacheFile {
+            id: file.id,
+            path: file.path.clone(),
+            size: file.size,
+            crc32: format!("{file_crc32:08X}"),
+        });
         bytes_written += u64::from(file.size);
     }
 
     let manifest_path = staging_path.join("manifest.json");
-    let mut manifest = File::create(&manifest_path)
+    let manifest_file = File::create(&manifest_path)
         .map_err(|error| format!("could not create cache manifest: {error}"))?;
-    writeln!(manifest, "{{").map_err(|error| format!("could not write cache manifest: {error}"))?;
-    writeln!(manifest, "  \"format\": \"gen5-rom-cache-v1\",")
+    let manifest = CacheManifest {
+        format: "gen5-rom-cache-v1".to_owned(),
+        game: game.cache_key().to_owned(),
+        title: rom.header.title.clone(),
+        game_code: String::from_utf8_lossy(&rom.header.game_code).into_owned(),
+        rom_size: rom.byte_len,
+        rom_crc32: format!("{rom_crc32:08X}"),
+        files: manifest_entries,
+    };
+    serde_json::to_writer_pretty(&manifest_file, &manifest)
         .map_err(|error| format!("could not write cache manifest: {error}"))?;
-    writeln!(manifest, "  \"game\": {},", json_string(game.cache_key()))
-        .map_err(|error| format!("could not write cache manifest: {error}"))?;
-    writeln!(manifest, "  \"title\": {},", json_string(&rom.header.title))
-        .map_err(|error| format!("could not write cache manifest: {error}"))?;
-    writeln!(
-        manifest,
-        "  \"game_code\": {},",
-        json_string(&String::from_utf8_lossy(&rom.header.game_code))
-    )
-    .map_err(|error| format!("could not write cache manifest: {error}"))?;
-    writeln!(manifest, "  \"rom_size\": {},", rom.byte_len)
-        .map_err(|error| format!("could not write cache manifest: {error}"))?;
-    writeln!(manifest, "  \"rom_crc32\": \"{rom_crc32:08X}\",")
-        .map_err(|error| format!("could not write cache manifest: {error}"))?;
-    writeln!(manifest, "  \"files\": [")
-        .map_err(|error| format!("could not write cache manifest: {error}"))?;
-    for (index, entry) in manifest_entries.iter().enumerate() {
-        let suffix = if index + 1 == manifest_entries.len() {
-            ""
-        } else {
-            ","
-        };
-        writeln!(manifest, "{entry}{suffix}")
-            .map_err(|error| format!("could not write cache manifest: {error}"))?;
-    }
-    writeln!(manifest, "  ]\n}}")
-        .map_err(|error| format!("could not write cache manifest: {error}"))?;
-    manifest
+    manifest_file
         .sync_all()
         .map_err(|error| format!("could not flush cache manifest: {error}"))?;
 
@@ -216,25 +218,4 @@ fn copy_file(rom: &mut NdsRom, entry: &RomFile, output: &mut File) -> Result<u32
         .sync_all()
         .map_err(|error| format!("could not flush extracted file '{}': {error}", entry.path))?;
     Ok(crc.finish())
-}
-
-fn json_string(value: &str) -> String {
-    let mut output = String::with_capacity(value.len() + 2);
-    output.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            character if character.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(&mut output, "\\u{:04X}", u32::from(character));
-            }
-            character => output.push(character),
-        }
-    }
-    output.push('"');
-    output
 }

@@ -42,6 +42,37 @@ cargo run -- map-preview ".gen5-cache/pokemon-white-2/95AB5437" 428 "aspertia-ci
 The default zone is White 2's Aspertia City (zone 428). The command writes to
 `<import-cache-directory>/previews/zone-428.svg` unless an output path is given.
 
+## BW2 field movement
+
+The third vertical slice reads the map's original height-terrain grid and adds
+a turn-by-turn field session. The `play` command opens the native WGPU window;
+use W/A/S/D or the arrow keys to move, and Escape to exit. The original model
+geometry is drawn using its available colors, with a simple native player
+marker and an egui collision-grid/debug panel. A terminal control mode remains
+available as `walk` for quick map and collision inspection.
+
+```text
+cargo run -- play ".gen5-cache/pokemon-white-2/95AB5437"
+cargo run -- play ".gen5-cache/pokemon-white-2/95AB5437" 428 16 16
+cargo run -- walk ".gen5-cache/pokemon-white-2/95AB5437"
+```
+
+Controllers use the D-pad when available. The runtime initializes Kira's audio
+backend, but original ROM sound playback awaits SDAT conversion and sample
+loading. `wgpu` stays in the desktop renderer; `FieldSession` owns movement
+state and collision and has no rendering dependency. The runtime stack uses
+`winit`, `wgpu`, `glam`, `egui`, `gilrs`, `kira`, `serde`, and `tracing`.
+
+The terminal command uses W/A/S/D followed by Enter; Q quits.
+The default spawn is the nearest recognized walkable tile to the terrain-grid
+center. Supply a zone and optional grid coordinates to choose another start:
+
+For this first map, only Aspertia's known common ground terrain code is marked
+walkable. Other terrain codes are treated as solid until their movement
+permissions are decoded. Movement currently covers a single height-terrain
+layer and one-cell map; it does not yet resolve the original slope/height tables,
+events, map transitions, or render sprites in a native window.
+
 ## Planned layers
 
 - `formats::nds`: NDS header and NitroFS parsing.
@@ -51,6 +82,8 @@ The default zone is White 2's Aspertia City (zone 428). The command writes to
 - `game::bw2`: Black 2 / White 2 behavior boundary and zone/matrix decoding;
   White 2 is the first runtime target.
 - `render`: first Nitro model geometry path and SVG map preview.
+- `game::bw2::terrain` and `game::bw2::field`: original map terrain decoding,
+  conservative tile collision, player state, and terminal input loop.
 - Future format modules: Nitro graphics and textures, text, sound, and script data.
 - Future runtime layers: original Gen V script VM, field/map simulation, Pokémon
   and battle rules, and PC rendering, audio, and input.

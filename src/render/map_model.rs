@@ -19,6 +19,31 @@ pub(super) struct ModelGeometry {
     pub triangles: Vec<Triangle>,
 }
 
+pub(super) fn scene_triangles(triangles: &[Triangle]) -> Vec<super::SceneTriangle> {
+    triangles
+        .iter()
+        .map(|triangle| {
+            let positions = triangle.vertices.map(|vertex| {
+                [
+                    vertex.position[0] as f32,
+                    vertex.position[1] as f32,
+                    vertex.position[2] as f32,
+                ]
+            });
+            let colors = triangle.vertices.map(|vertex| {
+                let color = triangle.material_color.unwrap_or(vertex.color);
+                [
+                    f32::from(color[0]) / 255.0,
+                    f32::from(color[1]) / 255.0,
+                    f32::from(color[2]) / 255.0,
+                    1.0,
+                ]
+            });
+            super::SceneTriangle { positions, colors }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Draw {
     piece: usize,

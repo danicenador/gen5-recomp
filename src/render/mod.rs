@@ -13,6 +13,45 @@ pub struct PreviewReport {
     pub model_ids: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SceneTriangle {
+    pub positions: [[f32; 3]; 3],
+    pub colors: [[f32; 4]; 3],
+}
+
+/// Load the original map-model geometry in a renderer-neutral form.
+/// Game logic remains independent of wgpu and graphics resource types.
+pub fn load_map_scene(cache_root: &Path, zone: &ZoneMap) -> Result<Vec<SceneTriangle>> {
+    if zone.width != 1 || zone.height != 1 || zone.model_ids.len() != 1 {
+        return Err(format!(
+            "map scene currently supports one-cell maps; zone {} is {}x{}",
+            zone.zone_id, zone.width, zone.height
+        ));
+    }
+    let romfs = if cache_root.join("romfs").is_dir() {
+        cache_root.join("romfs")
+    } else {
+        cache_root.to_path_buf()
+    };
+    let archive_bytes = fs::read(romfs.join("a/0/0/8"))
+        .map_err(|error| format!("could not read BW2 map-model archive: {error}"))?;
+    let archive = crate::formats::narc::NarcArchive::parse(&archive_bytes)?;
+    let mut output = Vec::new();
+    for model_id in zone.model_ids.iter().flatten().copied() {
+        let index = usize::try_from(model_id)
+            .map_err(|_| format!("map model ID {model_id} does not fit this platform"))?;
+        let model = map_model::read_model(archive.member(index)?)?;
+        output.extend(map_model::scene_triangles(&model.triangles));
+    }
+    if output.is_empty() {
+        return Err(format!(
+            "zone {} contains no renderable geometry",
+            zone.zone_id
+        ));
+    }
+    Ok(output)
+}
+
 /// Render map model geometry to an SVG preview. This first renderer preserves
 /// model and vertex colors; external Nitro textures are a later graphics step.
 pub fn render_map_svg(cache_root: &Path, zone: &ZoneMap, output: &Path) -> Result<PreviewReport> {
