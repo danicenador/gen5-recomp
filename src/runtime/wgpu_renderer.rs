@@ -44,6 +44,8 @@ pub struct WgpuRenderer {
     collision_buffer: wgpu::Buffer,
     collision_vertex_capacity: u32,
     player_buffer: wgpu::Buffer,
+    npc_buffer: wgpu::Buffer,
+    npc_vertex_capacity: u32,
     depth_view: wgpu::TextureView,
     egui_renderer: egui_wgpu::Renderer,
     fallback_rect: [f32; 4],
@@ -113,6 +115,18 @@ impl WgpuRenderer {
             contents: bytemuck::cast_slice(&initial_player),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
+        let initial_npcs = make_npc_vertices(session, atlas.fallback_rect);
+        let npc_vertex_capacity = u32::try_from(initial_npcs.len().max(1))
+            .map_err(|_| "NPC vertex count exceeds the GPU draw limit".to_owned())?;
+        let npc_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("field NPC marker vertices"),
+            size: u64::from(npc_vertex_capacity) * std::mem::size_of::<GpuVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if !initial_npcs.is_empty() {
+            queue.write_buffer(&npc_buffer, 0, bytemuck::cast_slice(&initial_npcs));
+        }
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("field camera uniform"),
@@ -290,6 +304,8 @@ impl WgpuRenderer {
             collision_buffer,
             collision_vertex_capacity: collision_capacity,
             player_buffer,
+            npc_buffer,
+            npc_vertex_capacity,
             depth_view,
             egui_renderer,
             fallback_rect: atlas.fallback_rect,
@@ -337,6 +353,7 @@ impl WgpuRenderer {
 
         let mut output = egui_ctx.run_ui(egui_input, |ui| {
             debug_panel(ui, session, audio_available);
+            dialogue_panel(ui, session);
         });
         egui_platform.handle_platform_output(window, output.platform_output);
         let texture_updates = std::mem::take(&mut output.textures_delta.set);
@@ -353,6 +370,14 @@ impl WgpuRenderer {
             pixels_per_point: output.pixels_per_point,
         };
         let player_vertices = make_player_vertices(session, self.fallback_rect);
+        let npc_vertices = make_npc_vertices(session, self.fallback_rect);
+        if npc_vertices.len() > self.npc_vertex_capacity as usize {
+            return Err("NPC markers exceed their reserved vertex capacity".to_owned());
+        }
+        if !npc_vertices.is_empty() {
+            self.queue
+                .write_buffer(&self.npc_buffer, 0, bytemuck::cast_slice(&npc_vertices));
+        }
         self.queue.write_buffer(
             &self.player_buffer,
             0,
@@ -425,6 +450,11 @@ impl WgpuRenderer {
                 pass.set_pipeline(&self.collision_pipeline);
                 pass.set_vertex_buffer(0, self.collision_buffer.slice(..));
                 pass.draw(0..collision_vertices.len() as u32, 0..1);
+            }
+            if !npc_vertices.is_empty() {
+                pass.set_pipeline(&self.player_pipeline);
+                pass.set_vertex_buffer(0, self.npc_buffer.slice(..));
+                pass.draw(0..npc_vertices.len() as u32, 0..1);
             }
             pass.set_pipeline(&self.player_pipeline);
             pass.set_vertex_buffer(0, self.player_buffer.slice(..));
@@ -662,6 +692,36 @@ fn make_player_vertices(session: &FieldSession, fallback_rect: [f32; 4]) -> Vec<
     torso.into_iter().chain(head).collect()
 }
 
+fn make_npc_vertices(session: &FieldSession, fallback_rect: [f32; 4]) -> Vec<GpuVertex> {
+    let cell = 0.25;
+    let mut vertices = Vec::new();
+    for npc in &session.npcs {
+        let Some(tile) = session.terrain.tile(npc.x, npc.z) else {
+            continue;
+        };
+        let center = Vec3::new(
+            npc.x as f32 * cell - 4.0 + cell * 0.5,
+            tile.height_world(),
+            npc.z as f32 * cell - 4.0 + cell * 0.5,
+        );
+        let torso = box_vertices(
+            center + Vec3::Y * 0.22,
+            Vec3::new(cell * 0.34, 0.22, cell * 0.28),
+            [0.12, 0.68, 0.30, 1.0],
+            fallback_rect,
+        );
+        let head = box_vertices(
+            center + Vec3::Y * 0.53,
+            Vec3::splat(cell * 0.29),
+            [0.96, 0.78, 0.52, 1.0],
+            fallback_rect,
+        );
+        vertices.extend(torso);
+        vertices.extend(head);
+    }
+    vertices
+}
+
 fn box_vertices(
     center: Vec3,
     half_size: Vec3,
@@ -843,10 +903,45 @@ fn debug_panel(root: &mut egui::Ui, session: &FieldSession, audio_available: boo
                         "Audio backend: unavailable"
                     });
                     ui.separator();
-                    ui.label("WASD / arrow keys · controller D-pad");
+                    ui.label("WASD / arrows · controller D-pad");
+                    ui.label("Enter / Space / controller A · talk / continue");
                     ui.horizontal(|ui| {
                         ui.colored_label(egui::Color32::from_rgb(45, 230, 110), "Walkable");
                         ui.colored_label(egui::Color32::from_rgb(245, 70, 60), "Blocked");
+                    });
+                });
+        });
+}
+
+fn dialogue_panel(root: &mut egui::Ui, session: &FieldSession) {
+    let Some(dialogue) = session.dialogue() else {
+        return;
+    };
+    egui::Area::new(egui::Id::unique("field_dialogue"))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -22.0))
+        .order(egui::Order::Foreground)
+        .show(root.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(16, 20, 34, 238))
+                .stroke(egui::Stroke::new(
+                    2.0,
+                    egui::Color32::from_rgb(236, 235, 220),
+                ))
+                .inner_margin(egui::Margin::same(18))
+                .show(ui, |ui| {
+                    ui.set_width(900.0);
+                    ui.label(
+                        egui::RichText::new(dialogue)
+                            .size(22.0)
+                            .color(egui::Color32::WHITE),
+                    );
+                    ui.add_space(8.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("Enter / Space / A")
+                                .small()
+                                .color(egui::Color32::from_rgb(190, 204, 225)),
+                        );
                     });
                 });
         });

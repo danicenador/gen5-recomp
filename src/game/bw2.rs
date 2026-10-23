@@ -1,5 +1,6 @@
 use super::gen5::Gen5Title;
 
+pub mod events;
 pub mod field;
 pub mod map;
 pub mod terrain;

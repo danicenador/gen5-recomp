@@ -13,6 +13,10 @@ pub struct ZoneMap {
     pub zone_id: u32,
     pub area_id: u16,
     pub matrix_id: u16,
+    pub scripts_bank: u16,
+    pub init_scripts_bank: u16,
+    pub text_bank: u16,
+    pub event_bank: u16,
     pub width: u16,
     pub height: u16,
     pub model_ids: Vec<Option<u32>>,
@@ -42,12 +46,25 @@ pub fn load_zone(cache_root: &Path, zone_id: u32) -> Result<ZoneMap> {
         .ok_or_else(|| format!("zone {zone_id} is outside the {zone_count} BW2 zone records"))?;
     let area_id = u16_at(record, 2);
     let matrix_id = u16_at(record, 4);
+    let scripts_bank = u16_at(record, 6);
+    let init_scripts_bank = u16_at(record, 8);
+    let text_bank = u16_at(record, 10);
+    let event_bank = u16_at(record, 22);
 
     let matrix_archive = fs::read(romfs.join(MATRIX_ARCHIVE))
         .map_err(|error| format!("could not read BW2 map-matrix archive: {error}"))?;
     let matrix_narc = NarcArchive::parse(&matrix_archive)?;
     let matrix_bytes = matrix_narc.member(usize::from(matrix_id))?;
-    parse_matrix(zone_id, area_id, matrix_id, matrix_bytes)
+    parse_matrix(
+        zone_id,
+        area_id,
+        matrix_id,
+        scripts_bank,
+        init_scripts_bank,
+        text_bank,
+        event_bank,
+        matrix_bytes,
+    )
 }
 
 impl ZoneMap {
@@ -68,7 +85,16 @@ impl ZoneMap {
     }
 }
 
-fn parse_matrix(zone_id: u32, area_id: u16, matrix_id: u16, bytes: &[u8]) -> Result<ZoneMap> {
+fn parse_matrix(
+    zone_id: u32,
+    area_id: u16,
+    matrix_id: u16,
+    scripts_bank: u16,
+    init_scripts_bank: u16,
+    text_bank: u16,
+    event_bank: u16,
+    bytes: &[u8],
+) -> Result<ZoneMap> {
     if bytes.len() < 8 {
         return Err(format!(
             "matrix {matrix_id} is shorter than its 8-byte header"
@@ -104,6 +130,10 @@ fn parse_matrix(zone_id: u32, area_id: u16, matrix_id: u16, bytes: &[u8]) -> Res
         zone_id,
         area_id,
         matrix_id,
+        scripts_bank,
+        init_scripts_bank,
+        text_bank,
+        event_bank,
         width,
         height,
         model_ids,

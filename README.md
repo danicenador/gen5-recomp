@@ -46,10 +46,12 @@ unless an output path is given.
 
 The third vertical slice reads the map's original height-terrain grid and adds
 a turn-by-turn field session. The `play` command opens the native WGPU window;
-use W/A/S/D or the arrow keys to move, and Escape to exit. The original model
-geometry is drawn using its available colors, with a simple native player
-marker and an egui collision-grid/debug panel. A terminal control mode remains
-available as `walk` for quick map and collision inspection.
+use W/A/S/D or the arrow keys to move, Enter or Space to talk/continue, and
+Escape to exit. On Aspertia City, the default spawn is beside the outlook NPC.
+Press Enter to run that NPC's original White 2 field script and show its
+original dialogue. NPCs and the player currently use simple native markers. A
+terminal control mode remains available as `walk` for quick map and collision
+inspection.
 
 ```text
 cargo run -- play ".gen5-cache/pokemon-white-2/95AB5437"
@@ -57,21 +59,26 @@ cargo run -- play ".gen5-cache/pokemon-white-2/95AB5437" 427
 cargo run -- walk ".gen5-cache/pokemon-white-2/95AB5437"
 ```
 
-Controllers use the D-pad when available. The runtime initializes Kira's audio
-backend, but original ROM sound playback awaits SDAT conversion and sample
-loading. The desktop renderer draws multi-cell geometry, samples decoded BTX0
-textures, and overlays nearby movement tiles on the 3D map. `wgpu` stays in the
-desktop renderer; `FieldSession` owns movement state and collision and has no
-rendering dependency. The runtime stack uses `winit`, `wgpu`, `glam`, `egui`,
-`gilrs`, `kira`, `serde`, and `tracing`.
+Controllers use the D-pad to move and the South/A button to talk or continue.
+The runtime initializes Kira's audio backend, but original ROM sound playback
+awaits SDAT conversion and sample loading. The desktop renderer draws
+multi-cell geometry, samples decoded BTX0 textures, overlays nearby movement
+tiles on the 3D map, and displays dialogue. `wgpu` stays in the desktop
+renderer; `FieldSession` owns movement, collision, and script state without a
+rendering dependency. This slice's script VM supports the commands used by the
+Aspertia outlook NPC; unsupported opcodes report their original command and
+byte offset. The runtime stack uses `winit`, `wgpu`, `glam`, `egui`, `gilrs`,
+`kira`, `serde`, and `tracing`.
 
-The terminal command uses W/A/S/D followed by Enter; Q quits.
-The default spawn is the nearest recognized walkable tile to the terrain-grid
-center. Supply a zone and optional grid coordinates to choose another start:
+The terminal command uses W/A/S/D followed by Enter to move, and a blank line
+or E to talk/continue; Q quits.
+On zones without the Aspertia outlook event, the default spawn is the nearest
+recognized walkable tile to the terrain-grid center. Supply a zone and
+optional grid coordinates to choose another start:
 
 Movement currently uses the known ordinary-foot passable terrain codes and
-treats other codes as solid. It reads one height-terrain layer; slope/height
-tables, events, map transitions, and original character sprites are still
+treats other codes as solid. It reads one height-terrain layer. Map transitions,
+the full Gen V script command set, and original character sprites are still
 future work.
 
 ## Planned layers
@@ -80,21 +87,23 @@ future work.
 - `formats::narc`: bounded Nitro Archive member access.
 - `importer`: ROM validation and cache creation.
 - `game::gen5`: title identification and game-specific behavior boundaries.
-- `game::bw2`: Black 2 / White 2 behavior boundary and zone/matrix decoding;
-  White 2 is the first runtime target.
+- `game::bw2`: Black 2 / White 2 behavior boundary, zone/matrix/event decoding,
+  and White 2 field behavior.
 - `render`: Nitro model geometry, BTX0 texture decoding, atlas sampling, and SVG
   map preview.
 - `game::bw2::terrain` and `game::bw2::field`: original map terrain decoding,
   conservative tile collision, player state, and terminal input loop.
-- Future format modules: text, sound, and script data.
-- Future runtime layers: original Gen V script VM, field/map simulation, Pokémon
-  and battle rules, and PC rendering, audio, and input.
+- `formats::gen5_script` and `formats::gen5_text`: original script pointers and
+  message-bank decoding.
+- `game::gen5::script_vm`: resumable field-script execution for the commands
+  needed by the current NPC slice.
+- `runtime`: PC rendering, audio initialization, and keyboard/controller input.
 
 ## Development sequence
 
 1. ROM explorer and validated import cache.
 2. Decode and render a multi-cell BW2 map with original model textures.
 3. Add player movement and map collision in the 3D field view.
-4. Execute one original NPC script and show its dialogue.
+4. Execute one original NPC script and show its dialogue (implemented).
 5. Add map transitions, then menus and battles.
 6. Complete White 2, then Black 2 and BW1.
