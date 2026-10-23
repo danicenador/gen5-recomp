@@ -3,7 +3,7 @@ use crate::formats::narc::NarcArchive;
 use crate::game::bw2::events::{self, FieldNpc};
 use crate::game::bw2::map::ZoneMap;
 use crate::game::bw2::terrain::{TerrainLayer, TerrainTile, load_zone_terrain};
-use crate::game::gen5::script_vm::FieldScriptVm;
+use crate::game::gen5::script_vm::{FieldScriptState, FieldScriptVm};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -43,6 +43,7 @@ pub struct FieldSession {
     pub npcs: Vec<FieldNpc>,
     script_bank: Vec<u8>,
     message_bank: Vec<u8>,
+    script_state: FieldScriptState,
     script_vm: Option<FieldScriptVm>,
 }
 
@@ -75,6 +76,7 @@ impl FieldSession {
             npcs,
             script_bank,
             message_bank,
+            script_state: FieldScriptState::default(),
             script_vm: None,
             player: Player {
                 x,
@@ -117,7 +119,9 @@ impl FieldSession {
     /// advance the active script when it is waiting for a button press.
     pub fn press_action(&mut self) -> Result<()> {
         if let Some(vm) = &mut self.script_vm {
-            vm.press_action()?;
+            let result = vm.press_action();
+            self.script_state = vm.state().clone();
+            result?;
             if vm.is_ended() {
                 self.script_vm = None;
             }
@@ -133,7 +137,13 @@ impl FieldSession {
         let Some(npc) = self.npcs.iter().find(|npc| npc.x == x && npc.z == z) else {
             return Ok(());
         };
-        let vm = FieldScriptVm::start(&self.script_bank, npc.script_id, &self.message_bank)?;
+        let vm = FieldScriptVm::start(
+            &self.script_bank,
+            npc.script_id,
+            &self.message_bank,
+            &self.script_state,
+        )?;
+        self.script_state = vm.state().clone();
         self.script_vm = (!vm.is_ended()).then_some(vm);
         Ok(())
     }
