@@ -8,6 +8,8 @@ pub enum Gen5Title {
     White2,
 }
 
+pub mod script_vm;
+
 impl Gen5Title {
     pub const fn cache_key(self) -> &'static str {
         match self {

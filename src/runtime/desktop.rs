@@ -93,6 +93,16 @@ impl DesktopApp {
                 ?direction,
                 "player movement blocked"
             ),
+            MoveResult::BlockedByScript => debug!("field script locked movement"),
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn press_action(&mut self) {
+        if let Err(error) = self.session.press_action() {
+            warn!(%error, "could not execute NPC field script");
         }
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -101,17 +111,23 @@ impl DesktopApp {
 
     fn poll_gamepad(&mut self) {
         let mut directions = Vec::new();
+        let mut action_pressed = false;
         if let Some(gilrs) = &mut self.gilrs {
             while let Some(event) = gilrs.next_event() {
                 if let EventType::ButtonPressed(button, _) = event.event {
                     if let Some(direction) = controller_direction(button) {
                         directions.push(direction);
+                    } else if button == gilrs::Button::South {
+                        action_pressed = true;
                     }
                 }
             }
         }
         for direction in directions {
             self.step(direction);
+        }
+        if action_pressed {
+            self.press_action();
         }
     }
 
@@ -231,6 +247,10 @@ impl ApplicationHandler for DesktopApp {
                     PhysicalKey::Code(KeyCode::KeyD | KeyCode::ArrowRight) => Some(Direction::East),
                     PhysicalKey::Code(KeyCode::KeyS | KeyCode::ArrowDown) => Some(Direction::South),
                     PhysicalKey::Code(KeyCode::KeyA | KeyCode::ArrowLeft) => Some(Direction::West),
+                    PhysicalKey::Code(KeyCode::Enter | KeyCode::Space) => {
+                        self.press_action();
+                        None
+                    }
                     PhysicalKey::Code(KeyCode::Escape) => {
                         event_loop.exit();
                         None
