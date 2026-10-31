@@ -131,6 +131,52 @@ about 7 seconds. All files compile with `gcc -O1 -Wall` without warnings. The
 build takes about 200 seconds on 14 threads. Linked against a stub runtime, it
 is a 52 MB executable.
 
+## Runtime
+
+The fourth step builds the generated C into a game library and runs it on a
+Rust model of the DS hardware:
+
+```text
+cargo run --release -- build ".gen5-cache/pokemon-white-2/95AB5437"
+cargo run --release -- boot ".gen5-cache/pokemon-white-2/95AB5437" "roms/Pokemon White Version 2.nds" 60
+```
+
+`build` compiles `recomp/*.c` with gcc in parallel into
+`recomp/build/game.dll`, reusing objects whose sources have not changed.
+`gen5host.c` forwards every `rt_*` hook to callbacks the runtime registers,
+so the library builds once and the Rust runtime loads it with `libloading`.
+
+The `nds` module provides:
+
+- `memory`: the ARM9 address space as 4 KiB page tables over host buffers.
+  It covers main RAM and its mirrors, ITCM and DTCM (placed through CP15),
+  shared WRAM, palette, VRAM and OAM.
+- `io`: I/O registers. Display timing advances when the game polls it, and
+  there are vblank and interrupt flags, immediate DMA, the divider and
+  square-root units, and IPCSYNC and the IPC FIFO.
+- `card`: game card reads (`0xB7` data blocks and `0xB8` chip ID) from the
+  ROM file, including card-triggered DMA and the transfer-complete
+  interrupt.
+- `cpu`: banked registers, CPSR and SPSR, and exception entry and return.
+- `machine`: boot as the firmware leaves memory, CP15, BIOS calls (waits,
+  division, copies, CRC, LZ77 and RLE), and interrupt delivery through the
+  handler at the end of DTCM. Overlay-aware dispatch picks the overlay whose
+  code is currently in RAM.
+- `interpreter`: runs code with no recompiled function, such as routines the
+  game copies to ITCM before running them, or jumps into a function's middle.
+  Calls from it go back to native code.
+
+The ARM7 is not run. A stand-in answers the shared-RAM boot handshakes and
+the PXI start-up handshake, and reports every PXI service as registered.
+
+White 2 currently runs crt0 and NitroSDK initialization: TCM setup, both
+boot handshakes, PXI, OS, threads, cache maintenance and card ID reads. It
+then sends its first service requests to the ARM7 (CTRDG, CARD and OS) and
+idles waiting for replies. When the game cannot continue, `boot` stops with
+a report: the reason, the registers, recent runtime events, the decoded IPC
+messages and every I/O register touched. A watchdog reports loops in
+recompiled code that never reach the runtime.
+
 ## BW2 map preview
 
 The second vertical slice adds a bounds-checked NARC reader, BW2 zone and map
@@ -209,8 +255,9 @@ future work.
 
 The steps below come from the hand-written field prototype. The plan from here
 is recompilation: export the code (done), disassembly and function discovery
-(done), the code generator (done), then the hardware runtime, aiming first to
-boot White 2 to its title screen.
+(done), the code generator (done), and a first runtime (done). Next are the
+ARM7 services that answer the game's IPC requests, then display output,
+aiming first to boot White 2 to its title screen.
 
 1. ROM explorer and validated import cache.
 2. Decode and render a multi-cell BW2 map with original model textures.

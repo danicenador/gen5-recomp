@@ -55,6 +55,12 @@ pub struct OverlayFile {
 }
 
 /// Write the code export into `destination`, which must not exist yet.
+/// Write `header.bin`: the cartridge header the firmware copies to RAM.
+pub fn export_header(rom: &mut NdsRom, destination: &Path) -> Result<()> {
+    let header = rom.read_at(0, 0x200)?;
+    write_file(&destination.join("header.bin"), &header).map(|_| ())
+}
+
 pub fn export_code(rom: &mut NdsRom, destination: &Path) -> Result<CodeManifest> {
     fs::create_dir_all(destination).map_err(|error| {
         format!(
@@ -63,6 +69,7 @@ pub fn export_code(rom: &mut NdsRom, destination: &Path) -> Result<CodeManifest>
         )
     })?;
 
+    export_header(rom, destination)?;
     let arm9 = rom.arm9_image()?;
     let arm9_crc = write_file(&destination.join("arm9.bin"), &arm9.bytes)?;
     let arm7 = rom.arm7_binary()?;

@@ -24,6 +24,8 @@ use std::fs;
 use std::path::Path;
 
 pub const RUNTIME_HEADER: &str = include_str!("gen5rt.h");
+/// Forwards the `rt_*` hooks to host callbacks inside the game library.
+pub const HOST_SHIM: &str = include_str!("gen5host.c");
 
 pub fn function_name(key: FunctionKey) -> String {
     format!("f_{}_{:08X}", key.module, key.address)
@@ -49,13 +51,18 @@ pub struct GenerateReport {
 pub fn generate(program: &Program, analysis: &Analysis, out_dir: &Path) -> Result<GenerateReport> {
     fs::create_dir_all(out_dir)
         .map_err(|error| format!("could not create '{}': {error}", out_dir.display()))?;
+    // Unchanged files keep their timestamps, so rebuilds reuse their objects.
     let write = |name: &str, text: &str| {
-        fs::write(out_dir.join(name), text)
-            .map_err(|error| format!("could not write '{name}': {error}"))
+        let path = out_dir.join(name);
+        if fs::read(&path).is_ok_and(|existing| existing == text.as_bytes()) {
+            return Ok(());
+        }
+        fs::write(&path, text).map_err(|error| format!("could not write '{name}': {error}"))
     };
     let mut report = GenerateReport::default();
 
     write("gen5rt.h", RUNTIME_HEADER)?;
+    write("gen5host.c", HOST_SHIM)?;
     let mut header = String::from(
         "/* Generated: prototypes of all recompiled functions. */\n\
          #ifndef GEN5_RECOMP_H\n#define GEN5_RECOMP_H\n#include \"gen5rt.h\"\n",
@@ -65,7 +72,7 @@ pub fn generate(program: &Program, analysis: &Analysis, out_dir: &Path) -> Resul
     }
     header.push_str("#endif\n");
     write("recomp.h", &header)?;
-    report.files += 2;
+    report.files += 3;
 
     let mut table = String::from(
         "/* Generated: recompiled functions for indirect calls. */\n#include \"recomp.h\"\n\n\
