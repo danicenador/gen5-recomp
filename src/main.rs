@@ -29,6 +29,7 @@ fn run() -> Result<(), String> {
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
         Some("code-info") if args.len() == 2 => code_info(Path::new(&args[1])),
         Some("analyze") if args.len() == 2 => analyze(Path::new(&args[1])),
+        Some("codegen") if args.len() == 2 => codegen(Path::new(&args[1])),
         Some("disasm") if args.len() == 4 => {
             let module = args[2].parse::<ModuleId>()?;
             let address = parse_address(&args[3])?;
@@ -287,6 +288,20 @@ fn analyze(cache_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn codegen(cache_root: &Path) -> Result<(), String> {
+    let (program, analysis) = run_analysis(cache_root)?;
+    let out_dir = cache_root.join("recomp");
+    let report = gen5::recomp::codegen::generate(&program, &analysis, &out_dir)?;
+    println!(
+        "Generated {} functions into {} files ({}) at {}",
+        report.functions,
+        report.files,
+        human_size(report.bytes as u64),
+        out_dir.display()
+    );
+    Ok(())
+}
+
 fn disasm(cache_root: &Path, module: ModuleId, address: u32) -> Result<(), String> {
     let (_, analysis) = run_analysis(cache_root)?;
     let function = analysis
@@ -517,6 +532,7 @@ fn print_usage() {
          gen5 list <rom.nds> [path-prefix]\n\
          gen5 code-info <rom.nds>\n\
          gen5 analyze <import-cache-directory>\n\
+         gen5 codegen <import-cache-directory>\n\
          gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 map-preview <import-cache-directory> [zone-index] [output.svg]\n\
