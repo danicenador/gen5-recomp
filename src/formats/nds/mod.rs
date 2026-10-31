@@ -1,6 +1,8 @@
+mod code;
 mod filesystem;
 mod header;
 
+pub use code::{Arm9Image, AutoloadBlock, Cpu, ModuleParams, OverlayEntry};
 pub use filesystem::{RomFile, RomFileSystem};
 pub use header::{NdsHeader, RomSection};
 

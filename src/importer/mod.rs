@@ -1,3 +1,5 @@
+pub mod code;
+
 use crate::Result;
 use crate::formats::nds::{NdsRom, RomFile};
 use crate::game::gen5::{self, Gen5Title};
@@ -63,6 +65,10 @@ pub fn import_rom(mut rom: NdsRom, cache_root: &Path) -> Result<ImportReport> {
                     && manifest.rom_crc32 == format!("{rom_crc32:08X}")
             }) && final_path.join("romfs").is_dir()
             {
+                // Caches from before the code export gain `code/` in place.
+                if !final_path.join("code").is_dir() {
+                    add_code_export(&mut rom, &final_path)?;
+                }
                 return Ok(ImportReport {
                     cache_path: final_path,
                     game,
@@ -178,6 +184,8 @@ fn write_cache(
         bytes_written += u64::from(file.size);
     }
 
+    code::export_code(rom, &staging_path.join("code"))?;
+
     let manifest_path = staging_path.join("manifest.json");
     let manifest_file = File::create(&manifest_path)
         .map_err(|error| format!("could not create cache manifest: {error}"))?;
@@ -197,6 +205,19 @@ fn write_cache(
         .map_err(|error| format!("could not flush cache manifest: {error}"))?;
 
     Ok((files.len(), bytes_written))
+}
+
+fn add_code_export(rom: &mut NdsRom, cache_path: &Path) -> Result<()> {
+    let staging_path = cache_path.join(format!(".code-staging-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staging_path);
+    let result = code::export_code(rom, &staging_path).and_then(|_| {
+        fs::rename(&staging_path, cache_path.join("code"))
+            .map_err(|error| format!("could not publish code export: {error}"))
+    });
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging_path);
+    }
+    result
 }
 
 fn copy_file(rom: &mut NdsRom, entry: &RomFile, output: &mut File) -> Result<u32> {

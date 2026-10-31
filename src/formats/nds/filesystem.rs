@@ -16,6 +16,8 @@ pub struct RomFile {
 #[derive(Debug, Clone)]
 pub struct RomFileSystem {
     pub files: Vec<RomFile>,
+    /// Raw FAT ranges indexed by file ID, including unnamed overlay files.
+    pub allocations: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -31,7 +33,10 @@ impl RomFileSystem {
         let fat_entries = parse_fat(&fat, rom_size)?;
         let directories = parse_directory_records(&fnt)?;
 
-        let mut filesystem = Self { files: Vec::new() };
+        let mut filesystem = Self {
+            files: Vec::new(),
+            allocations: Vec::new(),
+        };
         let mut visited = HashSet::new();
         let mut seen_file_ids = HashSet::new();
         walk_directory(
@@ -57,6 +62,7 @@ impl RomFileSystem {
         filesystem
             .files
             .sort_by(|left, right| left.path.cmp(&right.path));
+        filesystem.allocations = fat_entries;
         Ok(filesystem)
     }
 }
