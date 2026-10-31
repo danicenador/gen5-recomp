@@ -1,4 +1,4 @@
-use gen5::formats::nds::NdsRom;
+use gen5::formats::nds::{Cpu, NdsRom};
 use gen5::game::bw2::field;
 use gen5::game::bw2::map;
 use gen5::game::gen5 as gen5_game;
@@ -25,6 +25,7 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
+        Some("code-info") if args.len() == 2 => code_info(Path::new(&args[1])),
         Some("list") if args.len() == 2 || args.len() == 3 => {
             let prefix = args.get(2).map(String::as_str).unwrap_or("");
             list(Path::new(&args[1]), prefix)
@@ -171,6 +172,55 @@ fn inspect(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn code_info(path: &Path) -> Result<(), String> {
+    let mut rom = NdsRom::open(path)?;
+    let arm9 = rom.arm9_image()?;
+    println!(
+        "ARM9: load 0x{:08X}, entry 0x{:08X}, {} bytes ({}), SDK 0x{:08X}",
+        arm9.load_address,
+        arm9.entry,
+        arm9.bytes.len(),
+        if arm9.was_compressed {
+            "BLZ-compressed in ROM"
+        } else {
+            "stored uncompressed"
+        },
+        arm9.params.sdk_version
+    );
+    println!(
+        "  static BSS 0x{:08X}..0x{:08X}",
+        arm9.params.static_bss_start, arm9.params.static_bss_end
+    );
+    for block in &arm9.autoloads {
+        println!(
+            "  autoload 0x{:08X}: {} bytes + {} BSS",
+            block.ram_address, block.size, block.bss_size
+        );
+    }
+    println!(
+        "ARM7: load 0x{:08X}, entry 0x{:08X}, {} bytes",
+        rom.header.arm7_load, rom.header.arm7_entry, rom.header.arm7.size
+    );
+    for cpu in [Cpu::Arm9, Cpu::Arm7] {
+        let overlays = rom.overlay_table(cpu)?;
+        println!("{cpu:?} overlays: {}", overlays.len());
+        for entry in &overlays {
+            let image = rom.overlay_image(entry)?;
+            println!(
+                "  {:4} file {:4}: 0x{:08X}..0x{:08X} ({} bytes{}, {} BSS)",
+                entry.id,
+                entry.file_id,
+                entry.ram_address,
+                entry.ram_end(),
+                image.len(),
+                if entry.compressed { ", BLZ" } else { "" },
+                entry.bss_size
+            );
+        }
+    }
+    Ok(())
+}
+
 fn list(path: &Path, prefix: &str) -> Result<(), String> {
     let rom = NdsRom::open(path)?;
     let files = rom.files_under(prefix);
@@ -270,6 +320,7 @@ fn print_usage() {
          Usage:\n\
          gen5 inspect <rom.nds>\n\
          gen5 list <rom.nds> [path-prefix]\n\
+         gen5 code-info <rom.nds>\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 map-preview <import-cache-directory> [zone-index] [output.svg]\n\
          gen5 play <import-cache-directory> [zone-index [start-x start-z]]\n\

@@ -26,6 +26,33 @@ The importer keeps ROM files byte-for-byte in a local cache. The map preview
 reads the needed NARC entries from that cache; it currently exports model
 geometry to SVG rather than converting every archive and asset type.
 
+## Code export for static recompilation
+
+Game logic will run as statically recompiled ARM code, the way gen1recomp
+runs Game Boy code, instead of being rewritten by hand. The first step is
+getting the code out of the ROM in the form it takes in RAM:
+
+```text
+cargo run -- code-info "roms/Pokemon White Version 2.nds"
+```
+
+`code-info` prints the ARM9/ARM7 load and entry addresses, the ARM9 autoload
+blocks (ITCM, DTCM and others) and every overlay. `import` also writes a
+`code/` directory into the cache (and adds it to older caches that lack one):
+
+- `arm9.bin`: the ARM9 static binary after BLZ decompression, with the module
+  params' compressed-end field cleared as the boot code would.
+- `arm7.bin`: the ARM7 static binary.
+- `overlay9/overlay_NNNN.bin`: each ARM9 overlay, decompressed and checked
+  against its table size.
+- `code.json`: addresses, module params, autoload blocks (with their offsets in
+  `arm9.bin`), the overlay tables and a CRC-32 per file.
+
+All four games extract cleanly. Black and White have 237 ARM9 overlays, and
+Black 2 and White 2 have 344. None of them has ARM7 overlays. These titles are
+DSi-enhanced, so the autoload records use the TWL SDK's 16-byte layout. The
+DSi-only ARM9i/ARM7i binaries are not exported because the target is DS mode.
+
 ## BW2 map preview
 
 The second vertical slice adds a bounds-checked NARC reader, BW2 zone and map
@@ -101,6 +128,11 @@ future work.
 - `runtime`: PC rendering, audio initialization, and keyboard/controller input.
 
 ## Development sequence
+
+The steps below come from the hand-written field prototype. The plan from here
+is recompilation: export the code (done), then disassembly and function
+discovery, then the code generator, then the hardware runtime, aiming first to
+boot White 2 to its title screen.
 
 1. ROM explorer and validated import cache.
 2. Decode and render a multi-cell BW2 map with original model textures.
