@@ -7,4 +7,5 @@
 
 pub mod analysis;
 pub mod arm;
+pub mod codegen;
 pub mod program;

@@ -92,6 +92,45 @@ into `0x027xxxxx` (about 120) fall outside all loaded code. These are probably
 DSi-mode paths, which are not targeted. A handful of functions still report
 problems, mostly targets reached only from inline data.
 
+## C code generation
+
+The third recompilation step translates every discovered function to C:
+
+```text
+cargo run --release -- codegen ".gen5-cache/pokemon-white-2/95AB5437"
+```
+
+This writes `recomp/` into the cache:
+
+- `gen5rt.h`: the ABI between generated code and the runtime. It defines the
+  CPU state, inline memory access through 4 KiB page tables (with a runtime
+  fallback for I/O), shifter and flag helpers, and the `rt_*` functions the
+  runtime implements.
+- `recomp.h`: prototypes for every function.
+- One file per module (`main.c`, `autoload0.c`, `ov000.c`, ...) with
+  `void f_<module>_<address>(Cpu *cpu)` per function.
+- `functions.c`: a table of every function by module and address, for
+  indirect calls.
+
+Each instruction becomes a block of C, with labels at branch targets:
+
+- Direct calls set `lr` and call the callee's C function, and a return is a C
+  `return`.
+- Switch tables become C `switch` statements.
+- Literal-pool loads are folded into constants.
+- Indirect calls, ambiguous cross-overlay calls, BIOS calls (`swi`) and
+  CP15/PSR access go through the runtime.
+
+Unit tests compile generated code with gcc and run it to check ARM semantics:
+flags, shifter carry, unaligned and signed loads, writeback, push and pop, long
+multiplies, switch tables and runtime calls. The tests are skipped if gcc is
+not installed.
+
+For White 2, the generator emits 39,948 functions (209 MB of C in 260 files) in
+about 7 seconds. All files compile with `gcc -O1 -Wall` without warnings. The
+build takes about 200 seconds on 14 threads. Linked against a stub runtime, it
+is a 52 MB executable.
+
 ## BW2 map preview
 
 The second vertical slice adds a bounds-checked NARC reader, BW2 zone and map
@@ -170,7 +209,7 @@ future work.
 
 The steps below come from the hand-written field prototype. The plan from here
 is recompilation: export the code (done), disassembly and function discovery
-(done), then the code generator, then the hardware runtime, aiming first to
+(done), the code generator (done), then the hardware runtime, aiming first to
 boot White 2 to its title screen.
 
 1. ROM explorer and validated import cache.
