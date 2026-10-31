@@ -53,6 +53,45 @@ Black 2 and White 2 have 344. None of them has ARM7 overlays. These titles are
 DSi-enhanced, so the autoload records use the TWL SDK's 16-byte layout. The
 DSi-only ARM9i/ARM7i binaries are not exported because the target is DS mode.
 
+## Disassembly and function discovery
+
+The second recompilation step decodes the exported code and finds every
+function in it:
+
+```text
+cargo run --release -- analyze ".gen5-cache/pokemon-white-2/95AB5437"
+cargo run --release -- disasm ".gen5-cache/pokemon-white-2/95AB5437" main 0x02004800
+cargo run --release -- disasm ".gen5-cache/pokemon-white-2/95AB5437" ov011 0x0218B360
+```
+
+- `recomp::arm` decodes ARMv5TE ARM and Thumb code into one structured form,
+  which the code generator will also use.
+- `recomp::program` loads `main`, the autoload blocks (`autoloadN`) and each
+  overlay (`ovNNN`) as separate modules. A function is identified by module
+  and address, because many overlays load at the same address.
+- `recomp::analysis` finds functions by recursive traversal, starting from the
+  entry point and the overlays' static initializers. It follows calls and tail
+  calls, and accepts code pointers from literal pools and data once they decode
+  cleanly. It recognizes the compiler's switch tables, `ldr`/`bx` veneers,
+  Thumb `bx pc` state switches and interworking returns.
+
+`analyze` writes `analysis/functions.json` into the cache. Results:
+
+| | Functions | Main code coverage | Overlay code coverage | Unresolved indirect jumps |
+|---|---|---|---|---|
+| Black 2 / White 2 | about 39,950 | 82.6% | 79.2% | about 33 |
+| Black / White | about 34,680 | 86.4% | 82.1% | 28 |
+
+Coverage counts bytes decoded as code. The rest is mostly data and literal
+pools.
+
+About 9,600 BW2 calls cross from one overlay into an address that several
+non-overlapping overlays can occupy. Which one is loaded is only known at run
+time, so those calls stay `ambiguous` and the runtime will dispatch them. Calls
+into `0x027xxxxx` (about 120) fall outside all loaded code. These are probably
+DSi-mode paths, which are not targeted. A handful of functions still report
+problems, mostly targets reached only from inline data.
+
 ## BW2 map preview
 
 The second vertical slice adds a bounds-checked NARC reader, BW2 zone and map
@@ -130,8 +169,8 @@ future work.
 ## Development sequence
 
 The steps below come from the hand-written field prototype. The plan from here
-is recompilation: export the code (done), then disassembly and function
-discovery, then the code generator, then the hardware runtime, aiming first to
+is recompilation: export the code (done), disassembly and function discovery
+(done), then the code generator, then the hardware runtime, aiming first to
 boot White 2 to its title screen.
 
 1. ROM explorer and validated import cache.

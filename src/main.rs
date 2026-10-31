@@ -3,6 +3,8 @@ use gen5::game::bw2::field;
 use gen5::game::bw2::map;
 use gen5::game::gen5 as gen5_game;
 use gen5::importer;
+use gen5::recomp::analysis::{self as recomp_analysis, Analysis};
+use gen5::recomp::program::{ModuleId, Program, Resolution};
 use gen5::render;
 use gen5::runtime;
 use std::env;
@@ -26,6 +28,12 @@ fn run() -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
         Some("code-info") if args.len() == 2 => code_info(Path::new(&args[1])),
+        Some("analyze") if args.len() == 2 => analyze(Path::new(&args[1])),
+        Some("disasm") if args.len() == 4 => {
+            let module = args[2].parse::<ModuleId>()?;
+            let address = parse_address(&args[3])?;
+            disasm(Path::new(&args[1]), module, address)
+        }
         Some("list") if args.len() == 2 || args.len() == 3 => {
             let prefix = args.get(2).map(String::as_str).unwrap_or("");
             list(Path::new(&args[1]), prefix)
@@ -167,6 +175,193 @@ fn inspect(path: &Path) -> Result<(), String> {
         println!(
             "{:<20} offset 0x{:08X}, size 0x{:08X}",
             section.name, section.offset, section.size
+        );
+    }
+    Ok(())
+}
+
+fn parse_address(text: &str) -> Result<u32, String> {
+    let digits = text.trim_start_matches("0x").trim_start_matches("0X");
+    u32::from_str_radix(digits, 16).map_err(|_| format!("invalid hexadecimal address '{text}'"))
+}
+
+fn run_analysis(cache_root: &Path) -> Result<(Program, Analysis), String> {
+    let program = Program::load(&cache_root.join("code"))?;
+    let started = std::time::Instant::now();
+    let analysis = recomp_analysis::analyze(&program);
+    tracing::info!(
+        "analyzed {} functions in {} rounds ({:.1}s)",
+        analysis.functions.len(),
+        analysis.rounds,
+        started.elapsed().as_secs_f32()
+    );
+    Ok((program, analysis))
+}
+
+fn analyze(cache_root: &Path) -> Result<(), String> {
+    let (program, analysis) = run_analysis(cache_root)?;
+    let functions = analysis.functions.values();
+    let count = |predicate: &dyn Fn(&recomp_analysis::Function) -> usize| {
+        analysis.functions.values().map(predicate).sum::<usize>()
+    };
+    let thumb = functions.clone().filter(|function| function.thumb).count();
+    println!(
+        "Functions: {} ({thumb} Thumb, {} ARM)",
+        analysis.functions.len(),
+        analysis.functions.len() - thumb
+    );
+    let mut by_source = std::collections::BTreeMap::new();
+    for function in functions.clone() {
+        for source in &function.sources {
+            *by_source.entry(format!("{source:?}")).or_insert(0) += 1;
+        }
+    }
+    println!("Found via: {by_source:?}");
+    println!(
+        "Jump tables: {}, unresolved indirect jumps: {}, indirect calls: {}",
+        count(&|function| function.jump_tables.len()),
+        count(&|function| function.indirect_jumps.len()),
+        count(&|function| function.indirect_calls.len())
+    );
+    let calls = || functions.clone().flat_map(|function| function.calls.iter());
+    println!(
+        "Calls: {}, ambiguous between overlays: {}, outside loaded code: {}",
+        calls().count(),
+        calls()
+            .filter(|call| matches!(call.resolution, Resolution::Ambiguous(_)))
+            .count(),
+        calls()
+            .filter(|call| call.resolution == Resolution::Outside)
+            .count()
+    );
+    let problems = functions
+        .clone()
+        .filter(|function| !function.problems.is_empty())
+        .count();
+    println!(
+        "Functions with problems: {problems}, ARM/Thumb conflicts: {}",
+        analysis.state_conflicts.len()
+    );
+
+    println!("Coverage (bytes decoded as code):");
+    let mut overlay_total = (0_u64, 0_u64, 0_usize);
+    for module in &program.modules {
+        let code = recomp_analysis::module_code_bytes(&analysis, module.id);
+        let size = module.bytes.len() as u64;
+        let function_count = functions
+            .clone()
+            .filter(|function| function.module == module.id)
+            .count();
+        if let ModuleId::Overlay(_) = module.id {
+            overlay_total.0 += u64::from(code);
+            overlay_total.1 += size;
+            overlay_total.2 += function_count;
+            continue;
+        }
+        println!(
+            "  {:<10} 0x{:08X} {:>8} bytes, {:>5} functions, {:5.1}% code",
+            module.id.to_string(),
+            module.base,
+            size,
+            function_count,
+            100.0 * f64::from(code) / size.max(1) as f64
+        );
+    }
+    println!(
+        "  overlays   {:>19} bytes, {:>5} functions, {:5.1}% code",
+        overlay_total.1,
+        overlay_total.2,
+        100.0 * overlay_total.0 as f64 / overlay_total.1.max(1) as f64
+    );
+
+    let output_dir = cache_root.join("analysis");
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("could not create '{}': {error}", output_dir.display()))?;
+    let output = output_dir.join("functions.json");
+    let file = std::fs::File::create(&output)
+        .map_err(|error| format!("could not create '{}': {error}", output.display()))?;
+    let list: Vec<_> = analysis.functions.values().collect();
+    serde_json::to_writer(std::io::BufWriter::new(file), &list)
+        .map_err(|error| format!("could not write '{}': {error}", output.display()))?;
+    println!("Wrote {}", output.display());
+    Ok(())
+}
+
+fn disasm(cache_root: &Path, module: ModuleId, address: u32) -> Result<(), String> {
+    let (_, analysis) = run_analysis(cache_root)?;
+    let function = analysis
+        .functions
+        .values()
+        .filter(|function| function.module == module)
+        .find(|function| {
+            function.address == address || function.instructions.contains_key(&address)
+        })
+        .ok_or_else(|| format!("no discovered function in {module} contains 0x{address:08X}"))?;
+    println!(
+        "{}:0x{:08X} ({}, {} instructions, found via {:?})",
+        function.module,
+        function.address,
+        if function.thumb { "Thumb" } else { "ARM" },
+        function.instruction_count,
+        function.sources
+    );
+    for problem in &function.problems {
+        println!("  ; problem: {problem}");
+    }
+    let targets: std::collections::HashSet<u32> = function
+        .instructions
+        .values()
+        .filter_map(|ins| match ins.op {
+            gen5::recomp::arm::Op::Branch {
+                target,
+                link: false,
+                ..
+            } => Some(target),
+            _ => None,
+        })
+        .chain(
+            function
+                .jump_tables
+                .iter()
+                .flat_map(|table| table.targets.iter().copied()),
+        )
+        .collect();
+    let mut previous_end = None;
+    for ins in function.instructions.values() {
+        if previous_end.is_some_and(|end| end != ins.address) {
+            println!("  ; gap");
+        }
+        if targets.contains(&ins.address) {
+            println!("loc_{:08X}:", ins.address);
+        }
+        let raw = if ins.size == 2 {
+            format!("{:04X}    ", ins.raw)
+        } else if ins.thumb {
+            format!("{:04X}{:04X}", ins.raw & 0xFFFF, ins.raw >> 16)
+        } else {
+            format!("{:08X}", ins.raw)
+        };
+        let mut note = String::new();
+        if let gen5::recomp::arm::Op::Branch {
+            target, link: true, ..
+        } = ins.op
+            && let Some(call) = function.calls.iter().find(|call| call.from == ins.address)
+        {
+            note = match &call.resolution {
+                Resolution::Module(module) => format!(" ; {module}:0x{target:08X}"),
+                Resolution::Ambiguous(modules) => format!(" ; ambiguous: {modules:?}"),
+                Resolution::Outside => " ; outside loaded code".to_owned(),
+            };
+        }
+        println!("  {:08X}: {raw}  {ins}{note}", ins.address);
+        previous_end = Some(ins.end());
+    }
+    for table in &function.jump_tables {
+        println!(
+            "  ; jump table at 0x{:08X} (from 0x{:08X}): {} entries",
+            table.table,
+            table.jump,
+            table.targets.len()
         );
     }
     Ok(())
@@ -321,6 +516,8 @@ fn print_usage() {
          gen5 inspect <rom.nds>\n\
          gen5 list <rom.nds> [path-prefix]\n\
          gen5 code-info <rom.nds>\n\
+         gen5 analyze <import-cache-directory>\n\
+         gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 map-preview <import-cache-directory> [zone-index] [output.svg]\n\
          gen5 play <import-cache-directory> [zone-index [start-x start-z]]\n\

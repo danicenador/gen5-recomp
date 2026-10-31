@@ -6,6 +6,7 @@
 pub mod formats;
 pub mod game;
 pub mod importer;
+pub mod recomp;
 pub mod render;
 pub mod runtime;
 
