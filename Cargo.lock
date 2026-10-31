@@ -900,6 +900,7 @@ dependencies = [
  "gilrs",
  "glam 0.34.1",
  "kira",
+ "libloading",
  "pollster",
  "serde",
  "serde_json",

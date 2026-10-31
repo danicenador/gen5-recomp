@@ -68,6 +68,8 @@ pub fn import_rom(mut rom: NdsRom, cache_root: &Path) -> Result<ImportReport> {
                 // Caches from before the code export gain `code/` in place.
                 if !final_path.join("code").is_dir() {
                     add_code_export(&mut rom, &final_path)?;
+                } else if !final_path.join("code").join("header.bin").is_file() {
+                    code::export_header(&mut rom, &final_path.join("code"))?;
                 }
                 return Ok(ImportReport {
                     cache_path: final_path,

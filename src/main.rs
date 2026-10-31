@@ -30,6 +30,29 @@ fn run() -> Result<(), String> {
         Some("code-info") if args.len() == 2 => code_info(Path::new(&args[1])),
         Some("analyze") if args.len() == 2 => analyze(Path::new(&args[1])),
         Some("codegen") if args.len() == 2 => codegen(Path::new(&args[1])),
+        Some("build") if args.len() == 2 || args.len() == 3 => {
+            let compiler = args.get(2).map_or("gcc", String::as_str);
+            build(Path::new(&args[1]), compiler)
+        }
+        Some("boot") if args.len() == 3 || args.len() == 4 => {
+            let max_frames = args
+                .get(3)
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid frame count '{value}'"))
+                })
+                .transpose()?
+                .unwrap_or(60);
+            gen5::nds::machine::boot(
+                Path::new(&args[1]),
+                Path::new(&args[2]),
+                gen5::nds::machine::Options {
+                    max_frames,
+                    seconds: 20,
+                },
+            )
+        }
         Some("disasm") if args.len() == 4 => {
             let module = args[2].parse::<ModuleId>()?;
             let address = parse_address(&args[3])?;
@@ -302,6 +325,19 @@ fn codegen(cache_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn build(cache_root: &Path, compiler: &str) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let report = gen5::recomp::compile::build_library(&cache_root.join("recomp"), compiler)?;
+    println!(
+        "Built {} ({} files compiled, {} reused) in {:.0}s",
+        report.library.display(),
+        report.compiled,
+        report.reused,
+        started.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
+
 fn disasm(cache_root: &Path, module: ModuleId, address: u32) -> Result<(), String> {
     let (_, analysis) = run_analysis(cache_root)?;
     let function = analysis
@@ -533,6 +569,8 @@ fn print_usage() {
          gen5 code-info <rom.nds>\n\
          gen5 analyze <import-cache-directory>\n\
          gen5 codegen <import-cache-directory>\n\
+         gen5 build <import-cache-directory> [c-compiler]\n\
+         gen5 boot <import-cache-directory> <rom.nds> [frames]\n\
          gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 map-preview <import-cache-directory> [zone-index] [output.svg]\n\

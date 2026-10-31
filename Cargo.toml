@@ -11,6 +11,7 @@ egui-wgpu = { version = "0.37.0", features = ["winit"] }
 egui-winit = "0.37.0"
 glam = { version = "0.34.1", features = ["serde"] }
 gilrs = "0.11.2"
+libloading = "0.8.9"
 kira = "0.12.5"
 pollster = "0.4"
 serde = { version = "1.0.229", features = ["derive"] }
