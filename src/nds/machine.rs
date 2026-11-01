@@ -10,6 +10,7 @@ use super::backup::{self, Backup};
 use super::card::{self, Card};
 use super::cpu::{Banks, Cpu, MODE_IRQ, MODE_SVC, MODE_SYSTEM};
 use super::firmware::{self, Firmware};
+use super::gpu2d::{self, Frame};
 use super::io::{self, Effect, Io};
 use super::memory::Memory;
 use crate::Result;
@@ -110,11 +111,16 @@ enum Event {
     },
 }
 
+/// Receives each frame number and both screens.
+pub type FrameSink = Box<dyn FnMut(u64, &Frame) + Send>;
+
 pub struct Options {
     /// Stop after this many frames (vertical blanks).
     pub max_frames: u64,
     /// Stop with a report after this much wall-clock time.
     pub seconds: u64,
+    /// Called with each frame at the start of vertical blank.
+    pub on_frame: Option<FrameSink>,
 }
 
 pub struct Machine {
@@ -148,6 +154,8 @@ pub struct Machine {
     /// The shared card backup command block, set by the INIT request.
     backup_block: u32,
     backup_expects_block: bool,
+    /// The sound driver's shared work area (`SNDSharedWork`), once known.
+    sound_shared_work: u32,
     backup: Backup,
     firmware: Firmware,
     /// The ARM7 stand-in's IPCSYNC output nibble.
@@ -155,6 +163,8 @@ pub struct Machine {
     /// Progress through the shared-RAM init handshake at 0x027FFFF0.
     arm7_init_phase: u8,
     options: Options,
+    /// The last frame handed to `Options::on_frame`.
+    presented: u64,
     _library: Library,
 }
 
@@ -164,6 +174,9 @@ const ACTIVITY_PER_LINE: u64 = 32;
 const LOOP_BUDGET: u32 = 2000;
 const PXI_TAG_PM: u32 = 8;
 const PXI_TAG_TOUCHPANEL: u32 = 6;
+const PXI_TAG_SOUND: u32 = 7;
+/// `SND_COMMAND_SHARED_WORK`: argument 0 is the `SNDSharedWork` address.
+const SND_COMMAND_SHARED_WORK: u32 = 0x1D;
 const PXI_TAG_NVRAM: u32 = 4;
 const PXI_TAG_RTC: u32 = 5;
 /// Where the ARM7 leaves the RTC date and time (BCD) for the SDK.
@@ -309,10 +322,23 @@ impl Machine {
         if self.activity.is_multiple_of(ACTIVITY_PER_LINE) {
             let frame = self.io.frame;
             self.io.set_line(self.io.line + 1);
+            self.present();
             if self.io.frame != frame && self.io.frame >= self.options.max_frames {
                 let frames = self.io.frame;
                 self.stop(&format!("reached frame {frames}"));
             }
+        }
+    }
+
+    /// Render and hand over the frame if a new one has started.
+    fn present(&mut self) {
+        if self.io.frame == self.presented {
+            return;
+        }
+        self.presented = self.io.frame;
+        if let Some(on_frame) = &mut self.options.on_frame {
+            let frame = gpu2d::render(&self.io, &self.memory);
+            on_frame(self.presented, &frame);
         }
     }
 
@@ -331,8 +357,25 @@ impl Machine {
             Some(Effect::Sync(value)) => self.arm7_sync(value),
             None => {}
         }
+        if address < io::VRAMCNT + 10 && address + size > io::VRAMCNT {
+            self.update_vram_mapping();
+        }
         if address & !3 == card::ROMCTRL && size == 4 && value & card::ROMCTRL_BUSY != 0 {
             self.start_card_transfer(value);
+        }
+    }
+
+    /// VRAMCNT changed: remap the banks (0x04000247 is WRAMCNT, not a bank).
+    fn update_vram_mapping(&mut self) {
+        let mut control = [0; 9];
+        for (bank, value) in control.iter_mut().enumerate() {
+            let offset = if bank < 7 { bank } else { bank + 1 };
+            *value = self.io.get8(io::VRAMCNT + offset as u32);
+        }
+        if control != self.memory.vram.control {
+            self.memory.vram.control = control;
+            self.memory.vram.update();
+            self.memory.remap();
         }
     }
 
@@ -451,6 +494,7 @@ impl Machine {
                 }
             }
             PXI_TAG_FS => self.card_backup_message(data),
+            PXI_TAG_SOUND => self.sound_message(data),
             PXI_TAG_TOUCHPANEL => {
                 // Touch panel packets are framed like PM's; commands are
                 // answered with the command and result 0. Sampled touch
@@ -582,6 +626,31 @@ impl Machine {
         let time = bcd(seconds / 3600) | (bcd(seconds / 60 % 60) << 8) | (bcd(seconds % 60) << 16);
         self.write32(RTC_DATE, date);
         self.write32(RTC_TIME, time);
+    }
+
+    /// The sound driver: the ARM9 sends linked lists of commands
+    /// (`SNDCommand`: next, id, four arguments) and waits for the ARM7 to
+    /// count each finished list in `SNDSharedWork::finishCommandTag`. The
+    /// commands are not carried out, so nothing plays yet; word 0 asks the
+    /// ARM7 to process pending lists now.
+    fn sound_message(&mut self, data: u32) {
+        if data == 0 {
+            return;
+        }
+        let mut command = data;
+        for _ in 0..4096 {
+            if command == 0 {
+                break;
+            }
+            if self.read32(command + 4) == SND_COMMAND_SHARED_WORK {
+                self.sound_shared_work = self.read32(command + 8);
+            }
+            command = self.read32(command);
+        }
+        if self.sound_shared_work != 0 {
+            let finished = self.read32(self.sound_shared_work);
+            self.write32(self.sound_shared_work, finished.wrapping_add(1));
+        }
     }
 
     /// Card backup (save memory) requests, which the ARM7 serves over SPI.
@@ -1106,6 +1175,7 @@ fn halt(cpu: *mut Cpu) {
 fn advance_frame(cpu: *mut Cpu) {
     let machine = unsafe { machine(cpu) };
     machine.io.advance_to_vblank();
+    machine.present();
     if machine.io.frame >= machine.options.max_frames {
         let frames = machine.io.frame;
         machine.stop(&format!("reached frame {frames}"));
@@ -1505,11 +1575,13 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         nvram_bytes: Vec::new(),
         backup_block: 0,
         backup_expects_block: false,
+        sound_shared_work: 0,
         backup: Backup::open(cache_root.join("save.bin")),
         firmware: Firmware::open(cache_root.join("firmware.bin")),
         arm7_sync_output: 7,
         arm7_init_phase: 0,
         options,
+        presented: 0,
         _library: library,
     });
 

@@ -34,7 +34,7 @@ fn run() -> Result<(), String> {
             let compiler = args.get(2).map_or("gcc", String::as_str);
             build(Path::new(&args[1]), compiler)
         }
-        Some("boot") if args.len() == 3 || args.len() == 4 => {
+        Some("boot") if (3..=5).contains(&args.len()) => {
             let max_frames = args
                 .get(3)
                 .map(|value| {
@@ -44,12 +44,31 @@ fn run() -> Result<(), String> {
                 })
                 .transpose()?
                 .unwrap_or(60);
+            // Optionally save both screens every 30 frames and at the end.
+            let on_frame = args.get(4).map(|directory| {
+                let directory = std::path::PathBuf::from(directory);
+                Box::new(move |number: u64, frame: &gen5::nds::gpu2d::Frame| {
+                    if !number.is_multiple_of(30) && number != max_frames {
+                        return;
+                    }
+                    let mut pixels = frame.top.clone();
+                    pixels.extend_from_slice(&frame.bottom);
+                    let image = gen5::nds::gpu2d::png(256, 384, &pixels);
+                    let path = directory.join(format!("frame-{number:05}.png"));
+                    if let Err(error) = std::fs::create_dir_all(&directory)
+                        .and_then(|()| std::fs::write(&path, image))
+                    {
+                        eprintln!("could not write {}: {error}", path.display());
+                    }
+                }) as gen5::nds::machine::FrameSink
+            });
             gen5::nds::machine::boot(
                 Path::new(&args[1]),
                 Path::new(&args[2]),
                 gen5::nds::machine::Options {
                     max_frames,
                     seconds: 20,
+                    on_frame,
                 },
             )
         }

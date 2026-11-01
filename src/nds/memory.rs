@@ -3,7 +3,10 @@
 //! Recompiled code reads and writes RAM through the page tables directly;
 //! pages left null (I/O, unmapped space) go through the runtime. Mirrors are
 //! modelled at page granularity, which is exact for every region except
-//! palette and OAM (2 KiB, stored in a 4 KiB page each).
+//! palette and OAM (2 KiB, stored in a 4 KiB page each). VRAM pages follow
+//! the bank mapping in `Vram`; unmapped VRAM goes through the runtime.
+
+use super::vram::Vram;
 
 pub const PAGE_SHIFT: u32 = 12;
 const PAGE_COUNT: usize = 1 << (32 - PAGE_SHIFT);
@@ -12,7 +15,6 @@ pub const MAIN_RAM_SIZE: usize = 4 * 1024 * 1024;
 const ITCM_SIZE: usize = 32 * 1024;
 const DTCM_SIZE: usize = 16 * 1024;
 const SHARED_WRAM_SIZE: usize = 32 * 1024;
-const VRAM_SIZE: usize = 1024 * 1024;
 const PAGE: usize = 1 << PAGE_SHIFT;
 
 pub struct Memory {
@@ -21,7 +23,7 @@ pub struct Memory {
     pub dtcm: Vec<u8>,
     pub shared_wram: Vec<u8>,
     pub palette: Vec<u8>,
-    pub vram: Vec<u8>,
+    pub vram: Vram,
     pub oam: Vec<u8>,
     pub bios: Vec<u8>,
     pub read_pages: Vec<*mut u8>,
@@ -42,7 +44,7 @@ impl Memory {
             dtcm: vec![0; DTCM_SIZE],
             shared_wram: vec![0; SHARED_WRAM_SIZE],
             palette: vec![0; PAGE],
-            vram: vec![0; VRAM_SIZE],
+            vram: Vram::new(),
             oam: vec![0; PAGE],
             bios: vec![0; 32 * 1024],
             read_pages: vec![std::ptr::null_mut(); PAGE_COUNT],
@@ -77,8 +79,15 @@ impl Memory {
             map(pages, 0x0200_0000, 0x0300_0000, &mut self.main);
             map(pages, 0x0300_0000, 0x0400_0000, &mut self.shared_wram);
             map(pages, 0x0500_0000, 0x0600_0000, &mut self.palette);
-            map(pages, 0x0600_0000, 0x0700_0000, &mut self.vram);
             map(pages, 0x0700_0000, 0x0800_0000, &mut self.oam);
+            let banks = self.vram.banks.as_mut_ptr();
+            for page in (0x0600_0000_u32 >> PAGE_SHIFT)..(0x0700_0000 >> PAGE_SHIFT) {
+                if let Some(offset) = self.vram.cpu_offset(page << PAGE_SHIFT) {
+                    // SAFETY: the offset is inside the bank buffer, which is
+                    // never reallocated.
+                    pages[page as usize] = unsafe { banks.add(offset) };
+                }
+            }
             if self.itcm_enabled {
                 map(pages, 0, self.itcm_end, &mut self.itcm);
             }

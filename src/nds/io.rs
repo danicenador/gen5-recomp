@@ -19,6 +19,7 @@ pub const IPCSYNC: u32 = 0x0400_0180;
 pub const IPCFIFOCNT: u32 = 0x0400_0184;
 pub const IPCFIFOSEND: u32 = 0x0400_0188;
 pub const IME: u32 = 0x0400_0208;
+pub const VRAMCNT: u32 = 0x0400_0240;
 pub const IE: u32 = 0x0400_0210;
 pub const IF: u32 = 0x0400_0214;
 pub const DIVCNT: u32 = 0x0400_0280;
