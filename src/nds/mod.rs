@@ -12,6 +12,7 @@
 pub mod backup;
 pub mod card;
 pub mod cpu;
+pub mod firmware;
 mod interpreter;
 pub mod io;
 pub mod machine;

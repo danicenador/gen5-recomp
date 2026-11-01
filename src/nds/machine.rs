@@ -9,6 +9,7 @@
 use super::backup::{self, Backup};
 use super::card::{self, Card};
 use super::cpu::{Banks, Cpu, MODE_IRQ, MODE_SVC, MODE_SYSTEM};
+use super::firmware::{self, Firmware};
 use super::io::{self, Effect, Io};
 use super::memory::Memory;
 use crate::Result;
@@ -148,6 +149,7 @@ pub struct Machine {
     backup_block: u32,
     backup_expects_block: bool,
     backup: Backup,
+    firmware: Firmware,
     /// The ARM7 stand-in's IPCSYNC output nibble.
     arm7_sync_output: u32,
     /// Progress through the shared-RAM init handshake at 0x027FFFF0.
@@ -164,8 +166,6 @@ const PXI_TAG_PM: u32 = 8;
 const PXI_TAG_TOUCHPANEL: u32 = 6;
 const PXI_TAG_NVRAM: u32 = 4;
 const PXI_TAG_RTC: u32 = 5;
-const NVRAM_READ: u32 = 0x23;
-const NVRAM_READ_SHORT: u32 = 0x25;
 /// Where the ARM7 leaves the RTC date and time (BCD) for the SDK.
 const RTC_DATE: u32 = 0x027F_FDE8;
 const RTC_TIME: u32 = 0x027F_FDEC;
@@ -178,6 +178,8 @@ const ARM7_BOOT_PROGRESS: u32 = 0x027F_FC28;
 const ARM7_INIT_SYNC: u32 = 0x027F_FFF0;
 /// Bit mask of PXI FIFO tags the ARM7 has registered handlers for.
 const ARM7_PXI_READY: u32 = 0x027F_FF8C;
+/// Where the firmware's user settings are copied at boot.
+const USER_SETTINGS_COPY: u32 = 0x027F_FC80;
 const POLL_LIMIT: u64 = 20_000_000;
 const WAIT_LIMIT_FRAMES: u64 = 600;
 
@@ -491,8 +493,7 @@ impl Machine {
         }
     }
 
-    /// Run a complete firmware flash request. There is no firmware image:
-    /// reads return erased flash (0xFF).
+    /// Run a complete firmware flash request against the firmware image.
     fn nvram_request(&mut self) {
         let bytes = std::mem::take(&mut self.nvram_bytes);
         let command = self.nvram_command;
@@ -503,30 +504,69 @@ impl Machine {
                     .fold(0_u32, |value, byte| (value << 8) | u32::from(*byte))
             })
         };
+        // Transfers: a 24-bit flash address, the size (4 bytes for reads,
+        // 2 for writes), then the 32-bit address of the ARM9 buffer.
+        let transfer = || {
+            let size = 3..bytes.len().checked_sub(4)?;
+            Some((
+                field(0..3)?,
+                field(size)?,
+                field(bytes.len() - 4..bytes.len())?,
+            ))
+        };
         match command {
-            // Reads: a 24-bit flash address, the size, then the 32-bit
-            // destination; the size field is 4 bytes for 0x23, 2 for 0x25.
-            NVRAM_READ | NVRAM_READ_SHORT if bytes.len() >= 8 => {
-                let size_bytes = 3..bytes.len() - 4;
-                let (Some(_address), Some(size), Some(destination)) = (
-                    field(0..3),
-                    field(size_bytes),
-                    field(bytes.len() - 4..bytes.len()),
-                ) else {
+            firmware::READ | firmware::FAST_READ => {
+                let Some((address, size, destination)) = transfer() else {
                     self.stop(&format!("short firmware read request {bytes:02X?}"));
                 };
-                for offset in 0..size.min(0x10000) {
-                    self.write8(destination + offset, 0xFF);
+                for (offset, index) in self.firmware.range(address, size).enumerate() {
+                    let byte = self.firmware.data[index];
+                    self.write8(destination + offset as u32, u32::from(byte));
                 }
             }
-            // Other commands (write enable, status and so on) have no
-            // effect without a firmware image; report them as done.
+            firmware::PAGE_WRITE | firmware::PAGE_PROGRAM => {
+                let Some((address, size, source)) = transfer() else {
+                    self.stop(&format!("short firmware write request {bytes:02X?}"));
+                };
+                for (offset, index) in self.firmware.range(address, size).enumerate() {
+                    let byte = self.read8(source + offset as u32) as u8;
+                    let cell = &mut self.firmware.data[index];
+                    // Programming can only clear bits; a page write erases
+                    // first.
+                    *cell = if command == firmware::PAGE_PROGRAM {
+                        *cell & byte
+                    } else {
+                        byte
+                    };
+                }
+                self.flush_firmware();
+            }
+            firmware::PAGE_ERASE | firmware::SECTOR_ERASE => {
+                let address = field(0..3).unwrap_or(0);
+                self.firmware
+                    .erase(address, command == firmware::SECTOR_ERASE);
+                self.flush_firmware();
+            }
+            // The status register: never busy, writes enabled.
+            firmware::READ_STATUS => {
+                let destination = field(0..4).unwrap_or(0);
+                if destination != 0 {
+                    self.write8(destination, 0x02);
+                }
+            }
+            firmware::WRITE_ENABLE | firmware::WRITE_DISABLE => {}
             _ => self.record(Event::Unhandled {
                 tag: PXI_TAG_NVRAM,
                 command,
             }),
         }
         self.arm7_reply(PXI_TAG_NVRAM, command << 8, false);
+    }
+
+    fn flush_firmware(&mut self) {
+        if let Err(error) = self.firmware.flush() {
+            self.stop(&error);
+        }
     }
 
     /// Write the host's local date and time where the SDK reads the RTC.
@@ -805,10 +845,10 @@ impl Machine {
             let _ = writeln!(report, "  {}", describe(event));
         }
         report.push_str("IPC FIFO messages sent to the ARM7:\n");
-        for (word, lr) in &self.fifo_sent {
+        for ((word, lr), count) in runs(&self.fifo_sent) {
             let _ = writeln!(
                 report,
-                "  tag {:2} ({}) data 0x{:07X}{} (lr 0x{lr:08X})",
+                "  tag {:2} ({}) data 0x{:07X}{} (lr 0x{lr:08X}){}",
                 word & 0x1F,
                 pxi_tag_name(word & 0x1F),
                 word >> 6,
@@ -816,15 +856,17 @@ impl Machine {
                     " (error flag)"
                 } else {
                     ""
-                }
+                },
+                repeated(count)
             );
         }
         report.push_str("IPC FIFO replies from the ARM7 stand-in:\n");
-        for (tag, data) in &self.fifo_replies {
+        for ((tag, data), count) in runs(&self.fifo_replies) {
             let _ = writeln!(
                 report,
-                "  tag {tag:2} ({}) data 0x{data:07X}",
-                pxi_tag_name(*tag)
+                "  tag {tag:2} ({}) data 0x{data:07X}{}",
+                pxi_tag_name(tag),
+                repeated(count)
             );
         }
         report.push_str("I/O registers touched (address: reads/writes):\n");
@@ -851,6 +893,15 @@ impl Machine {
             "running thread (sp 0x{sp:08X}) stack code pointers: {}",
             chain.join(" ")
         );
+        let mut modules: Vec<(u16, u32)> =
+            self.overlays.iter().map(|(&id, (base, _))| (id, *base)).collect();
+        modules.sort_unstable();
+        let loaded: Vec<String> = modules
+            .into_iter()
+            .filter(|&(id, base)| self.overlay_loaded(id, base))
+            .map(|(id, base)| format!("ov{id:03} at 0x{base:08X}"))
+            .collect();
+        let _ = writeln!(report, "overlays in RAM: {}", loaded.join(", "));
         report.push_str("parked guest threads:\n");
         for line in super::threads::describe(&mut |address| self.read32(address)) {
             let _ = writeln!(report, "  {line}");
@@ -901,6 +952,26 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     } as u32;
     let year = year_of_era + era * 400 + i64::from(month <= 2);
     (year, month, day)
+}
+
+/// Consecutive equal items, counted.
+fn runs<T: Copy + PartialEq>(items: &[T]) -> Vec<(T, usize)> {
+    let mut runs: Vec<(T, usize)> = Vec::new();
+    for &item in items {
+        match runs.last_mut() {
+            Some((last, count)) if *last == item => *count += 1,
+            _ => runs.push((item, 1)),
+        }
+    }
+    runs
+}
+
+fn repeated(count: usize) -> String {
+    if count > 1 {
+        format!(" x{count}")
+    } else {
+        String::new()
+    }
 }
 
 /// NitroSDK PXI FIFO tags.
@@ -1435,6 +1506,7 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         backup_block: 0,
         backup_expects_block: false,
         backup: Backup::open(cache_root.join("save.bin")),
+        firmware: Firmware::open(cache_root.join("firmware.bin")),
         arm7_sync_output: 7,
         arm7_init_phase: 0,
         options,
@@ -1447,6 +1519,10 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
     machine.memory.main[load..load + arm9.len()].copy_from_slice(&arm9);
     let header_offset = Memory::main_offset(0x027F_FE00);
     machine.memory.main[header_offset..header_offset + header.len()].copy_from_slice(&header);
+    // The ARM7 boot code copies the user settings to shared RAM.
+    let settings = Memory::main_offset(USER_SETTINGS_COPY);
+    machine.memory.main[settings..settings + firmware::USER_SETTINGS_LENGTH]
+        .copy_from_slice(machine.firmware.user_settings());
     // Boot medium: card.
     machine.memory.main[Memory::main_offset(0x027F_FC40)] = 1;
     // The firmware records the boot card's chip ID; the SDK compares later
