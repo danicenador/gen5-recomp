@@ -11,6 +11,7 @@ use super::card::{self, Card};
 use super::cpu::{Banks, Cpu, MODE_IRQ, MODE_SVC, MODE_SYSTEM};
 use super::firmware::{self, Firmware};
 use super::gpu2d::{self, Frame};
+use super::input::Input;
 use super::io::{self, Effect, Io};
 use super::memory::Memory;
 use crate::Result;
@@ -22,6 +23,7 @@ use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 type GeneratedFunction = unsafe extern "C" fn(*mut Cpu);
 
@@ -54,6 +56,7 @@ struct Host {
     undefined: extern "C" fn(*mut Cpu, u32, u32),
     hle: extern "C" fn(*mut Cpu, u32),
     tick: extern "C" fn(*mut Cpu),
+    stack_mismatch: extern "C" fn(*mut Cpu, u32, u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +97,11 @@ enum Event {
         fields: u32,
     },
     FifoSend(u32),
+    StackMismatch {
+        function: u32,
+        entry_sp: u32,
+        sp: u32,
+    },
     Interpret {
         target: u32,
         lr: u32,
@@ -117,10 +125,12 @@ pub type FrameSink = Box<dyn FnMut(u64, &Frame) + Send>;
 pub struct Options {
     /// Stop after this many frames (vertical blanks).
     pub max_frames: u64,
-    /// Stop with a report after this much wall-clock time.
+    /// Stop with a report after this much wall-clock time (0: no limit).
     pub seconds: u64,
     /// Called with each frame at the start of vertical blank.
     pub on_frame: Option<FrameSink>,
+    /// Buttons and touch screen, read once per frame.
+    pub input: Option<Arc<Input>>,
 }
 
 pub struct Machine {
@@ -165,6 +175,9 @@ pub struct Machine {
     options: Options,
     /// The last frame handed to `Options::on_frame`.
     presented: u64,
+    /// GEN5_SP_LIMIT: stop when a call is made with the system-mode stack
+    /// pointer above this, to catch code that pops more than it pushed.
+    sp_limit: Option<u32>,
     _library: Library,
 }
 
@@ -191,6 +204,13 @@ const ARM7_BOOT_PROGRESS: u32 = 0x027F_FC28;
 const ARM7_INIT_SYNC: u32 = 0x027F_FFF0;
 /// Bit mask of PXI FIFO tags the ARM7 has registered handlers for.
 const ARM7_PXI_READY: u32 = 0x027F_FF8C;
+/// `OSSystemWork::vblankCount`, kept by the ARM7.
+const VBLANK_COUNT: u32 = 0x027F_FC3C;
+/// X and Y buttons, and the latest touch sample, from the ARM7.
+const BUTTON_XY: u32 = 0x027F_FFA8;
+const TOUCH_SAMPLE: u32 = 0x027F_FFAA;
+/// Touch panel command: take one sample now.
+const TP_SAMPLING: u32 = 0;
 /// Where the firmware's user settings are copied at boot.
 const USER_SETTINGS_COPY: u32 = 0x027F_FC80;
 const POLL_LIMIT: u64 = 20_000_000;
@@ -336,6 +356,14 @@ impl Machine {
             return;
         }
         self.presented = self.io.frame;
+        // The ARM7 counts vertical blanks for OS_GetVBlankCount.
+        let count = self.read32(VBLANK_COUNT);
+        self.write32(VBLANK_COUNT, count.wrapping_add(1));
+        if let Some(input) = &self.options.input {
+            let (keys, button_xy) = (input.keyinput(), input.button_xy());
+            self.io.set16(io::KEYINPUT, keys);
+            self.write16(BUTTON_XY, u32::from(button_xy));
+        }
         if let Some(on_frame) = &mut self.options.on_frame {
             let frame = gpu2d::render(&self.io, &self.memory);
             on_frame(self.presented, &frame);
@@ -497,13 +525,21 @@ impl Machine {
             PXI_TAG_SOUND => self.sound_message(data),
             PXI_TAG_TOUCHPANEL => {
                 // Touch panel packets are framed like PM's; commands are
-                // answered with the command and result 0. Sampled touch
-                // data would arrive as command 0x10; none is sent, which
-                // reads as "not touched".
+                // answered with the command and result 0. A sampling
+                // request leaves the current sample in shared RAM first.
                 if data & (1 << 25) != 0 {
                     self.arm7_tp_command = (data >> 8) & 0x7F;
                 }
                 if data & (1 << 24) != 0 {
+                    if self.arm7_tp_command == TP_SAMPLING {
+                        let sample = self
+                            .options
+                            .input
+                            .as_ref()
+                            .map_or(0, |input| input.touch_sample());
+                        self.write16(TOUCH_SAMPLE, sample & 0xFFFF);
+                        self.write16(TOUCH_SAMPLE + 2, sample >> 16);
+                    }
                     // Replies are framed as one-word packets (first and last
                     // bits set); the callback ignores them otherwise.
                     let reply = (1 << 25) | (1 << 24) | (self.arm7_tp_command << 8);
@@ -1096,6 +1132,13 @@ fn describe(event: &Event) -> String {
         } => format!(
             "card backup command {command} at 0x{offset:X} length 0x{length:X}: result {result}"
         ),
+        Event::StackMismatch {
+            function,
+            entry_sp,
+            sp,
+        } => format!(
+            "function 0x{function:08X} returned with sp 0x{sp:08X} (called with 0x{entry_sp:08X})"
+        ),
         Event::Interpret { target, lr } => {
             format!("interpret 0x{target:08X} (lr 0x{lr:08X})")
         }
@@ -1381,6 +1424,10 @@ extern "C" fn host_call(cpu: *mut Cpu, target: u32) {
     let machine = unsafe { machine(cpu) };
     machine.record(Event::Call { target, lr });
     machine.tick();
+    let sp = unsafe { (*cpu).r[13] };
+    if machine.sp_limit.is_some_and(|limit| sp > limit) && machine.banks.mode == MODE_SYSTEM {
+        machine.stop(&format!("system-mode sp 0x{sp:08X} above GEN5_SP_LIMIT"));
+    }
     call_target(cpu, target);
 }
 
@@ -1466,6 +1513,23 @@ extern "C" fn host_tick(cpu: *mut Cpu) {
     machine.arm7_tick();
     machine.tick();
     interrupt_if_enabled(cpu);
+}
+
+/// A generated function returned with sp moved. With GEN5_CHECK_SP set this
+/// stops with a report; otherwise it is only recorded.
+extern "C" fn host_stack_mismatch(cpu: *mut Cpu, function: u32, entry_sp: u32) {
+    let machine = unsafe { machine(cpu) };
+    let sp = unsafe { (*cpu).r[13] };
+    machine.record(Event::StackMismatch {
+        function,
+        entry_sp,
+        sp,
+    });
+    if std::env::var_os("GEN5_CHECK_SP").is_some() {
+        machine.stop(&format!(
+            "function 0x{function:08X} returned with sp 0x{sp:08X}, called with 0x{entry_sp:08X}"
+        ));
+    }
 }
 
 extern "C" fn host_exception_return(cpu: *mut Cpu, _target: u32) {
@@ -1582,6 +1646,9 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         arm7_init_phase: 0,
         options,
         presented: 0,
+        sp_limit: std::env::var("GEN5_SP_LIMIT")
+            .ok()
+            .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok()),
         _library: library,
     });
 
@@ -1632,6 +1699,7 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         undefined: host_undefined,
         hle: super::threads::host_hle,
         tick: host_tick,
+        stack_mismatch: host_stack_mismatch,
     };
     unsafe { set_host(&host) };
 
@@ -1649,6 +1717,9 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
     let watched = machine as *mut Machine as usize;
     let seconds = machine.options.seconds;
     std::thread::spawn(move || {
+        if seconds == 0 {
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_secs(seconds));
         // SAFETY: the machine is leaked, so the pointer stays valid; the
         // racy read is accepted for a diagnostic snapshot before exiting.

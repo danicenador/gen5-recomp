@@ -186,14 +186,29 @@ pub fn emit_function(analysis: &Analysis, module: &Module, function: &Function) 
         }
     }
 
-    // Insert labels where they are used.
+    // Insert labels where they are used, and check sp at returns other than
+    // those after a runtime routine that switches threads or modes.
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "void {}(Cpu *cpu) {{\n    uint32_t *r = cpu->r;\n    (void)r;",
+        "void {}(Cpu *cpu) {{\n    uint32_t *r = cpu->r;\n    const uint32_t entry_sp = r[13];\n    (void)r;\n    (void)entry_sp;",
         function_name(function.key())
     );
+    let checked_return = format!("RT_RETURN(0x{:08X}u);", function.address);
+    // Code inside its caller's frame (a shared epilogue) moves sp itself.
+    let epilogue =
+        super::analysis::inside_caller_frame(module, function.address, function.thumb);
+    let mut previous = "";
     for line in body.lines() {
+        let unchecked = epilogue
+            || previous.contains("rt_hle(")
+            || previous.contains("rt_exception_return(");
+        previous = line;
+        let line = if unchecked {
+            line.to_owned()
+        } else {
+            line.replace("return;", &checked_return)
+        };
         if let Some(rest) = line.strip_prefix("    /* ")
             && let Some(address) = rest
                 .get(..8)
@@ -203,11 +218,43 @@ pub fn emit_function(analysis: &Analysis, module: &Module, function: &Function) 
         {
             let _ = writeln!(out, "L_{address:08X}:;");
         }
-        out.push_str(line);
+        out.push_str(&line);
         out.push('\n');
     }
     out.push_str("}\n");
     out
+}
+
+impl Context<'_> {
+    /// A direct branch: a goto inside the function, otherwise a tail call or
+    /// a jump through the runtime.
+    fn branch(
+        &self,
+        code: &mut String,
+        ins: &Instruction,
+        target: u32,
+        labels: &mut BTreeSet<u32>,
+    ) {
+        if self.function.instructions.contains_key(&target)
+            && !self.is_tail_call_at(ins.address, target)
+        {
+            labels.insert(target);
+            if target <= ins.address {
+                code.push_str("    if (--cpu->budget == 0) rt_tick(cpu);\n");
+            }
+            let _ = writeln!(code, "    goto L_{target:08X};");
+        } else if let Some(call) = self.tail_call_at(ins.address) {
+            code.push_str(&self.call(call, None));
+            code.push_str("    return;\n");
+        } else {
+            let _ = writeln!(
+                code,
+                "    rt_jump(cpu, {}, {});\n    return;",
+                hex(target | u32::from(ins.thumb)),
+                hex(ins.address)
+            );
+        }
+    }
 }
 
 struct Context<'a> {
@@ -557,25 +604,21 @@ impl Context<'_> {
                 link: false,
                 ..
             } => {
-                if self.function.instructions.contains_key(&target)
-                    && !self.is_tail_call_at(ins.address, target)
-                {
-                    labels.insert(target);
-                    if target <= ins.address {
-                        code.push_str("    if (--cpu->budget == 0) rt_tick(cpu);\n");
-                    }
-                    let _ = writeln!(code, "    goto L_{target:08X};");
-                } else if let Some(call) = self.tail_call_at(ins.address) {
-                    code.push_str(&self.call(call, None));
-                    code.push_str("    return;\n");
-                } else {
-                    let _ = writeln!(
-                        code,
-                        "    rt_jump(cpu, {}, {});\n    return;",
-                        hex(target | u32::from(ins.thumb)),
-                        hex(ins.address)
-                    );
-                }
+                self.branch(code, ins, target, labels);
+                false
+            }
+            // A `bl` that analysis found to be a long branch (into a frame
+            // it did not build): set lr as the instruction does, then jump.
+            Op::Branch {
+                target, link: true, ..
+            } if !self
+                .function
+                .calls
+                .iter()
+                .any(|call| !call.tail && call.from == ins.address) =>
+            {
+                let _ = writeln!(code, "    r[14] = {};", hex(link_value));
+                self.branch(code, ins, target, labels);
                 false
             }
             Op::Branch {

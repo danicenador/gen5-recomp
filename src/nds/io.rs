@@ -25,12 +25,14 @@ pub const IF: u32 = 0x0400_0214;
 pub const DIVCNT: u32 = 0x0400_0280;
 pub const SQRTCNT: u32 = 0x0400_02B0;
 pub const POSTFLG: u32 = 0x0400_0300;
+pub const GXSTAT: u32 = 0x0400_0600;
 pub const IPCFIFORECV: u32 = 0x0410_0000;
 
 pub const IRQ_VBLANK: u32 = 1 << 0;
 pub const IRQ_TIMER0: u32 = 1 << 3;
 pub const IRQ_IPC_SYNC: u32 = 1 << 16;
 pub const IRQ_IPC_RECV: u32 = 1 << 18;
+pub const IRQ_GEOMETRY_FIFO: u32 = 1 << 21;
 
 const LINES: u32 = 263;
 const VISIBLE_LINES: u32 = 192;
@@ -168,6 +170,7 @@ impl Io {
         let elapsed = (self.line + LINES - previous) % LINES;
         self.advance_timers(elapsed * CYCLES_PER_LINE);
         let mut status = self.get16(DISPSTAT);
+        self.update_geometry_irq();
         let in_vblank = self.line >= VISIBLE_LINES && self.line != LINES - 1;
         status = (status & !1) | u16::from(in_vblank);
         let target = u32::from(status >> 8) | (u32::from(status & 0x80) << 1);
@@ -227,6 +230,12 @@ impl Io {
                 self.update_fifo_status();
                 return value;
             }
+            // The geometry engine is not emulated: it always reads idle,
+            // with an empty command FIFO and the stacks at level 0.
+            _ if (GXSTAT..GXSTAT + 4).contains(&aligned) => {
+                let value = (self.get32(GXSTAT) & 0xC000_0000) | (1 << 26) | (1 << 25);
+                return (value >> (8 * (address - GXSTAT))) & (u32::MAX >> (32 - 8 * size));
+            }
             _ if (TIMER_BASE..TIMER_BASE + 16).contains(&aligned) => {
                 let timer = self.timers[((aligned - TIMER_BASE) / 4) as usize];
                 let value = u32::from(timer.counter) | (u32::from(timer.control) << 16);
@@ -253,6 +262,7 @@ impl Io {
             let shift = (aligned - IF) * 8;
             let flags = self.get32(IF) & !(value << shift);
             self.set32(IF, flags);
+            self.update_geometry_irq();
             return None;
         }
         if aligned == IPCFIFOSEND {
@@ -305,7 +315,9 @@ impl Io {
             2 => self.set16(aligned, value as u16),
             _ => self.set32(aligned, value),
         }
-        if (0x0400_0000 + 0x280..0x0400_0000 + 0x2A0).contains(&aligned) {
+        if (GXSTAT..GXSTAT + 4).contains(&aligned) {
+            self.update_geometry_irq();
+        } else if (0x0400_0000 + 0x280..0x0400_0000 + 0x2A0).contains(&aligned) {
             self.divide();
         } else if (SQRTCNT..SQRTCNT + 0x10).contains(&aligned) {
             self.square_root();
@@ -318,6 +330,15 @@ impl Io {
             }
         }
         None
+    }
+
+    /// The geometry FIFO interrupt is level-triggered: with the FIFO always
+    /// empty, it stays raised while GXSTAT asks for "less than half full"
+    /// (1) or "empty" (2).
+    fn update_geometry_irq(&mut self) {
+        if matches!(self.get32(GXSTAT) >> 30, 1 | 2) {
+            self.raise(IRQ_GEOMETRY_FIFO);
+        }
     }
 
     fn update_fifo_status(&mut self) {

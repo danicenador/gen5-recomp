@@ -44,10 +44,25 @@ fn run() -> Result<(), String> {
                 })
                 .transpose()?
                 .unwrap_or(60);
+            // GEN5_INPUT=first-last:button+button,... holds buttons over frame
+            // ranges, for scripted runs.
+            let script = std::env::var("GEN5_INPUT")
+                .map(|spec| parse_input_script(&spec))
+                .unwrap_or(Ok(Vec::new()))?;
+            let input = std::sync::Arc::new(gen5::nds::input::Input::default());
+            let scripted = input.clone();
             // Optionally save both screens every 30 frames and at the end.
-            let on_frame = args.get(4).map(|directory| {
-                let directory = std::path::PathBuf::from(directory);
+            let directory = args.get(4).map(std::path::PathBuf::from);
+            let on_frame = Some(
                 Box::new(move |number: u64, frame: &gen5::nds::gpu2d::Frame| {
+                    let held = script
+                        .iter()
+                        .filter(|(range, _)| range.contains(&(number + 1)))
+                        .fold(0, |buttons, (_, held)| buttons | held);
+                    scripted.set_buttons(held);
+                    let Some(directory) = &directory else {
+                        return;
+                    };
                     if !number.is_multiple_of(30) && number != max_frames {
                         return;
                     }
@@ -55,13 +70,13 @@ fn run() -> Result<(), String> {
                     pixels.extend_from_slice(&frame.bottom);
                     let image = gen5::nds::gpu2d::png(256, 384, &pixels);
                     let path = directory.join(format!("frame-{number:05}.png"));
-                    if let Err(error) = std::fs::create_dir_all(&directory)
+                    if let Err(error) = std::fs::create_dir_all(directory)
                         .and_then(|()| std::fs::write(&path, image))
                     {
                         eprintln!("could not write {}: {error}", path.display());
                     }
-                }) as gen5::nds::machine::FrameSink
-            });
+                }) as gen5::nds::machine::FrameSink,
+            );
             gen5::nds::machine::boot(
                 Path::new(&args[1]),
                 Path::new(&args[2]),
@@ -69,8 +84,12 @@ fn run() -> Result<(), String> {
                     max_frames,
                     seconds: 20,
                     on_frame,
+                    input: Some(input),
                 },
             )
+        }
+        Some("run") if args.len() == 3 => {
+            gen5::runtime::play_recompiled(Path::new(&args[1]), Path::new(&args[2]))
         }
         Some("disasm") if args.len() == 4 => {
             let module = args[2].parse::<ModuleId>()?;
@@ -221,6 +240,39 @@ fn inspect(path: &Path) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// `first-last:button+button,...` into frame ranges and held buttons.
+fn parse_input_script(spec: &str) -> Result<Vec<(std::ops::RangeInclusive<u64>, u32)>, String> {
+    use gen5::nds::input;
+    spec.split(',')
+        .map(|entry| {
+            let invalid = || format!("invalid GEN5_INPUT entry '{entry}'");
+            let (frames, buttons) = entry.split_once(':').ok_or_else(invalid)?;
+            let (first, last) = frames.split_once('-').unwrap_or((frames, frames));
+            let first = first.trim().parse::<u64>().map_err(|_| invalid())?;
+            let last = last.trim().parse::<u64>().map_err(|_| invalid())?;
+            let mut held = 0;
+            for name in buttons.split('+') {
+                held |= match name.trim().to_ascii_lowercase().as_str() {
+                    "a" => input::A,
+                    "b" => input::B,
+                    "x" => input::X,
+                    "y" => input::Y,
+                    "l" => input::L,
+                    "r" => input::R,
+                    "start" => input::START,
+                    "select" => input::SELECT,
+                    "up" => input::UP,
+                    "down" => input::DOWN,
+                    "left" => input::LEFT,
+                    "right" => input::RIGHT,
+                    _ => return Err(invalid()),
+                };
+            }
+            Ok((first..=last, held))
+        })
+        .collect()
 }
 
 fn parse_address(text: &str) -> Result<u32, String> {
@@ -606,7 +658,8 @@ fn print_usage() {
          gen5 analyze <import-cache-directory>\n\
          gen5 codegen <import-cache-directory>\n\
          gen5 build <import-cache-directory> [c-compiler]\n\
-         gen5 boot <import-cache-directory> <rom.nds> [frames]\n\
+         gen5 boot <import-cache-directory> <rom.nds> [frames [png-directory]]\n\
+         gen5 run <import-cache-directory> <rom.nds>\n\
          gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 map-preview <import-cache-directory> [zone-index] [output.svg]\n\
