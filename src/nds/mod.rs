@@ -8,6 +8,7 @@
 //! - `vram`: the VRAM banks and their VRAMCNT mapping.
 //! - `io`: I/O registers (display timing, interrupts, DMA, math, IPC).
 //! - `gpu2d`: the two 2D engines, rendering a frame for each screen.
+//! - `input`: buttons and touch screen shared with the window.
 //! - `interpreter`: fallback for code without a recompiled function.
 //! - `threads`: NitroSDK threads as host threads taking turns.
 //! - `machine`: boot, call dispatch across overlays, interrupts, BIOS calls.
@@ -17,6 +18,7 @@ pub mod card;
 pub mod cpu;
 pub mod firmware;
 pub mod gpu2d;
+pub mod input;
 mod interpreter;
 pub mod io;
 pub mod machine;

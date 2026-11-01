@@ -213,6 +213,57 @@ fn flow(ins: &Instruction, previous: Option<&Instruction>) -> Flow {
     }
 }
 
+/// Code that works in a stack frame it did not build: before any push it
+/// tears the frame down (`add sp` or a pop) or reads deep into it (a load or
+/// address at sp + 0x20 or more, past any plausible stack arguments).
+/// Compilers reach such code, a shared epilogue or the far side of a long
+/// loop, with a Thumb `bl` used as a long branch: the "call" is a jump.
+pub fn inside_caller_frame(module: &Module, target: u32, thumb: bool) -> bool {
+    if !module.contains(target) {
+        return false;
+    }
+    let mut address = target;
+    for _ in 0..8 {
+        let Some(ins) = decode_at(module, address, thumb) else {
+            return false;
+        };
+        match ins.op {
+            Op::DataProc {
+                op: DpOp::Add,
+                rd: SP,
+                rn: SP,
+                operand: Operand::Imm { .. },
+                ..
+            } => return true,
+            Op::Multiple {
+                load: true,
+                rn: SP,
+                writeback: true,
+                ..
+            } => return true,
+            Op::Multiple { rn: SP, .. } => return false,
+            _ if ins.written_registers() & (1 << SP.0) != 0 => return false,
+            Op::Memory {
+                rn: SP,
+                offset: Offset::Imm(offset),
+                ..
+            } if offset >= 0x20 => return true,
+            Op::DataProc {
+                op: DpOp::Add,
+                rn: SP,
+                operand: Operand::Imm { value, .. },
+                ..
+            } if value >= 0x20 => return true,
+            _ => {}
+        }
+        if !matches!(flow(&ins, None), Flow::Continue) {
+            return false;
+        }
+        address = ins.end();
+    }
+    false
+}
+
 pub fn decode_at(module: &Module, address: u32, thumb: bool) -> Option<Instruction> {
     if thumb {
         if address & 1 != 0 {
@@ -316,7 +367,18 @@ pub fn analyze_function(
             }
 
             let next = ins.end();
-            match flow(&ins, history.last()) {
+            let flow = match flow(&ins, history.last()) {
+                Flow::Call { target, thumb: target_thumb }
+                    if target_thumb == thumb && inside_caller_frame(module, target, thumb) =>
+                {
+                    Flow::Jump {
+                        target,
+                        conditional: false,
+                    }
+                }
+                flow => flow,
+            };
+            match flow {
                 Flow::Continue => {}
                 Flow::Call { target, thumb } => function.calls.push(CallSite {
                     from: address,
@@ -1095,6 +1157,18 @@ mod tests {
                 .iter()
                 .any(|call| call.tail && call.target == 0x0200_0006)
         );
+    }
+
+    #[test]
+    fn treats_bl_into_shared_epilogue_as_jump() {
+        // 0x00: push {r4, lr} ; 0x02: sub sp, #8 ; 0x04: bl 0x0A ;
+        // 0x08: bx lr (not reached) ; 0x0A: add sp, #8 ; 0x0C: pop {r4, pc}
+        let program = program(&[0xB510, 0xB082, 0xF000, 0xF801, 0x4770, 0xB002, 0xBD10]);
+        let known: HashSet<_> = [key(0x0200_0000)].into();
+        let function = analyze_function(&program, key(0x0200_0000), true, &known);
+        assert!(function.calls.is_empty());
+        assert!(function.instructions.contains_key(&0x0200_000C));
+        assert!(!function.instructions.contains_key(&0x0200_0008));
     }
 
     fn arm_program(words: &[u32]) -> Program {

@@ -138,8 +138,19 @@ Rust model of the DS hardware:
 
 ```text
 cargo run --release -- build ".gen5-cache/pokemon-white-2/95AB5437"
-cargo run --release -- boot ".gen5-cache/pokemon-white-2/95AB5437" "roms/Pokemon White Version 2.nds" 60
+cargo run --release -- run ".gen5-cache/pokemon-white-2/95AB5437" "roms/Pokemon White Version 2.nds"
+cargo run --release -- boot ".gen5-cache/pokemon-white-2/95AB5437" "roms/Pokemon White Version 2.nds" 600 frames
 ```
+
+`run` opens a window with both screens stacked, paced to the DS's 59.83
+frames per second. Keys: arrows for the D-pad, X = A, Z = B, S = X, A = Y,
+Q = L, W = R, Enter = Start, Right Shift or Backspace = Select, and the
+mouse on the lower screen as the stylus. Escape quits.
+
+`boot` runs headless for a number of frames and ends with a report; with a
+directory it also saves both screens as PNG every 30 frames.
+`GEN5_INPUT=first-last:button+button,...` holds buttons over frame ranges,
+for example `GEN5_INPUT=1300-1305:start,1500-1506:start`.
 
 `build` compiles `recomp/*.c` with gcc in parallel into
 `recomp/build/game.dll`, reusing objects whose sources have not changed.
@@ -151,6 +162,14 @@ The `nds` module provides:
 - `memory`: the ARM9 address space as 4 KiB page tables over host buffers.
   It covers main RAM and its mirrors, ITCM and DTCM (placed through CP15),
   shared WRAM, palette, VRAM and OAM.
+- `vram`: the nine VRAM banks, mapped by VRAMCNT into the BG, OBJ and LCDC
+  regions, extended palettes and texture slots.
+- `gpu2d`: both 2D engines, rendered once per frame at vblank: text,
+  affine, extended and bitmap backgrounds, sprites, windows, blending and
+  master brightness. The 3D engine is not emulated: its layer is not drawn,
+  and its status always reads idle with an empty command FIFO.
+- `input`: buttons and touch screen, shared between the window and the
+  machine.
 - `io`: I/O registers. Display timing advances when the game polls it, and
   there are vblank and interrupt flags, immediate DMA, the divider and
   square-root units, and IPCSYNC and the IPC FIFO.
@@ -171,13 +190,17 @@ the PXI start-up handshake, and serves the ARM7 services the game asks for
 over the IPC FIFO, as decoded from the ARM9's callbacks:
 
 - PM (power management) and the touch panel: framed command packets
-  answered with a result. No touch data is sent, which reads as "not
-  touched".
+  answered with a result. Touch samples come from the window's stylus.
 - RTC: the host's date and time, as BCD in shared RAM.
-- NVRAM (firmware flash): reads return erased flash, since there is no
-  firmware image.
+- NVRAM (firmware flash): a 256 KiB image of a freshly set up DS (English,
+  three empty Wi-Fi Connection slots), kept in `firmware.bin` in the cache.
+  The user settings are also copied to shared RAM at boot. DWC writes its
+  user ID there.
 - Card backup (save memory): identify, read, write, program, verify and
   erase on 512 KiB of FLASH, kept in `save.bin` in the cache.
+- Sound: each command list is acknowledged in the driver's shared work
+  area, so the game does not wait on it, but nothing is played.
+- The vblank counter, and the X and Y buttons in shared RAM.
 
 NitroSDK threads run as host threads that take turns. The SDK's
 `OS_SaveContext` and `OS_LoadContext`, and the thread switch at the end of
@@ -188,14 +211,12 @@ display time and raise interrupts. Generated loops call `rt_tick` after a
 budget of backward branches, so a busy-wait still lets time pass and takes
 interrupts. The report covers the IPC traffic, the stand-in's replies, the
 running thread's call chain and every parked thread. `GEN5_DUMP` adds memory
-dumps.
+dumps. Every generated function checks on return that it left `sp` as it
+found it; `GEN5_CHECK_SP=1` stops on the first one that did not.
 
-White 2 now gets through every service request at startup, including save
-detection. It runs its frame loop, with vblank and timer interrupts and
-thread switches, and its overlay code polls the buttons and touch screen.
-The loop runs far more often than once per frame (about 368 touch requests
-per frame), so frame pacing is not right yet. Nothing is drawn yet: display
-output is the next step.
+White 2 now boots, plays its whole opening, shows the title screen and
+opens the main menu (New Game, Mystery Gift, ...). The 3D layer (the title's
+Kyurem) is missing, and there is no sound.
 
 ## BW2 map preview
 
@@ -276,8 +297,9 @@ future work.
 The steps below come from the hand-written field prototype. The plan from here
 is recompilation: export the code (done), disassembly and function discovery
 (done), the code generator (done), a first runtime and the ARM7 services used
-at startup (done). Next are frame pacing and display output, aiming first
-to show White 2's title screen.
+at startup (done), and 2D display output with a playable window (done; White
+2 reaches its main menu). Next are starting a new game, the 3D engine and
+sound.
 
 1. ROM explorer and validated import cache.
 2. Decode and render a multi-cell BW2 map with original model textures.

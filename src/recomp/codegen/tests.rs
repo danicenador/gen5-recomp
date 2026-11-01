@@ -32,6 +32,7 @@ void rt_write_psr(Cpu *c, uint32_t s, uint32_t f, uint32_t v) { (void)c; (void)s
 void rt_exception_return(Cpu *c, uint32_t t) { (void)c; printf("eret %u\n", t); }
 void rt_undefined(Cpu *c, uint32_t a, uint32_t r) { (void)c; (void)r; printf("undefined %u\n", a); }
 void rt_tick(Cpu *c) { c->budget = 1000; }
+void rt_stack_mismatch(Cpu *c, uint32_t f, uint32_t sp) { (void)c; printf("stack mismatch %u %u\n", f, sp); }
 "#;
 
 /// Compile the function at BASE with gcc, run it after the `setup` C

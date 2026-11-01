@@ -56,6 +56,11 @@ void rt_undefined(Cpu *cpu, uint32_t address, uint32_t raw);
 void rt_tick(Cpu *cpu);
 /* An SDK routine the runtime implements (see recomp::hle). */
 void rt_hle(Cpu *cpu, uint32_t id);
+/* A function is returning with a different sp than it was called with. */
+void rt_stack_mismatch(Cpu *cpu, uint32_t function, uint32_t entry_sp);
+
+/* Every return checks that the function left sp as it found it. */
+#define RT_RETURN(function)                                                      do {                                                                             if (cpu->r[13] != entry_sp) rt_stack_mismatch(cpu, function, entry_sp);         return;                                                                  } while (0)
 
 static inline uint32_t read8(Cpu *cpu, uint32_t a) {
     uint8_t *page = cpu->read_pages[a >> GEN5_PAGE_SHIFT];

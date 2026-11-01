@@ -27,6 +27,7 @@ typedef struct Gen5Host {
     void (*undefined)(Cpu *cpu, uint32_t address, uint32_t raw);
     void (*hle)(Cpu *cpu, uint32_t id);
     void (*tick)(Cpu *cpu);
+    void (*stack_mismatch)(Cpu *cpu, uint32_t function, uint32_t entry_sp);
 } Gen5Host;
 
 static Gen5Host host;
@@ -65,3 +66,6 @@ void rt_exception_return(Cpu *cpu, uint32_t target) { host.exception_return(cpu,
 void rt_undefined(Cpu *cpu, uint32_t address, uint32_t raw) { host.undefined(cpu, address, raw); }
 void rt_hle(Cpu *cpu, uint32_t id) { host.hle(cpu, id); }
 void rt_tick(Cpu *cpu) { host.tick(cpu); }
+void rt_stack_mismatch(Cpu *cpu, uint32_t function, uint32_t entry_sp) {
+    host.stack_mismatch(cpu, function, entry_sp);
+}
