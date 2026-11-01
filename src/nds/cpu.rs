@@ -15,6 +15,8 @@ pub struct Cpu {
     pub read_pages: *mut *mut u8,
     pub write_pages: *mut *mut u8,
     pub runtime: *mut c_void,
+    /// Loop budget; see `rt_tick`.
+    pub budget: u32,
 }
 
 pub const MODE_USER: u32 = 0x10;
@@ -120,6 +122,15 @@ impl Banks {
         self.mode = mode;
     }
 
+    /// A mode's stack pointer, banked or current.
+    pub fn banked_sp(&self, cpu: &Cpu, mode: u32) -> u32 {
+        if bank(mode) == bank(self.mode) {
+            cpu.r[13]
+        } else {
+            self.sp_lr[bank(mode)][0]
+        }
+    }
+
     /// Set a mode's banked stack pointer without switching to it.
     pub fn set_banked_sp(&mut self, cpu: &mut Cpu, mode: u32, sp: u32) {
         if bank(mode) == bank(self.mode) {
@@ -169,6 +180,7 @@ mod tests {
             read_pages: std::ptr::null_mut(),
             write_pages: std::ptr::null_mut(),
             runtime: std::ptr::null_mut(),
+            budget: 0,
         }
     }
 

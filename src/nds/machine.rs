@@ -6,6 +6,7 @@
 //! in `Cpu::runtime`. Functions that call into generated code take the CPU
 //! pointer and only borrow the machine between those calls.
 
+use super::backup::{self, Backup};
 use super::card::{self, Card};
 use super::cpu::{Banks, Cpu, MODE_IRQ, MODE_SVC, MODE_SYSTEM};
 use super::io::{self, Effect, Io};
@@ -49,6 +50,8 @@ struct Host {
     write_psr: extern "C" fn(*mut Cpu, u32, u32, u32),
     exception_return: extern "C" fn(*mut Cpu, u32),
     undefined: extern "C" fn(*mut Cpu, u32, u32),
+    hle: extern "C" fn(*mut Cpu, u32),
+    tick: extern "C" fn(*mut Cpu),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +96,17 @@ enum Event {
         target: u32,
         lr: u32,
     },
+    /// A request the ARM7 stand-in acknowledged without doing anything.
+    Unhandled {
+        tag: u32,
+        command: u32,
+    },
+    Backup {
+        command: u32,
+        offset: u32,
+        length: u32,
+        result: u32,
+    },
 }
 
 pub struct Options {
@@ -115,9 +129,25 @@ pub struct Machine {
     events: VecDeque<Event>,
     calls: u64,
     poll: (u32, u64),
+    /// Set by the IRQ handler's thread switch; done after the interrupt.
+    pub(super) pending_switch: Option<u32>,
+    /// Runtime callbacks since boot; display time advances with them.
+    activity: u64,
     card: Card,
     /// Every word the ARM9 sent through the IPC FIFO, for reports.
-    fifo_sent: Vec<u32>,
+    fifo_sent: Vec<(u32, u32)>,
+    /// Replies the ARM7 stand-in sent, as (tag, data), for reports.
+    fifo_replies: Vec<(u32, u32)>,
+    /// Command of the PM packet being received.
+    arm7_pm_command: u32,
+    arm7_tp_command: u32,
+    /// Firmware flash packet being received.
+    nvram_command: u32,
+    nvram_bytes: Vec<u8>,
+    /// The shared card backup command block, set by the INIT request.
+    backup_block: u32,
+    backup_expects_block: bool,
+    backup: Backup,
     /// The ARM7 stand-in's IPCSYNC output nibble.
     arm7_sync_output: u32,
     /// Progress through the shared-RAM init handshake at 0x027FFFF0.
@@ -126,7 +156,22 @@ pub struct Machine {
     _library: Library,
 }
 
-const EVENT_HISTORY: usize = 48;
+const EVENT_HISTORY: usize = 400;
+const ACTIVITY_PER_LINE: u64 = 32;
+/// Backward branches between `rt_tick` calls.
+const LOOP_BUDGET: u32 = 2000;
+const PXI_TAG_PM: u32 = 8;
+const PXI_TAG_TOUCHPANEL: u32 = 6;
+const PXI_TAG_NVRAM: u32 = 4;
+const PXI_TAG_RTC: u32 = 5;
+const NVRAM_READ: u32 = 0x23;
+const NVRAM_READ_SHORT: u32 = 0x25;
+/// Where the ARM7 leaves the RTC date and time (BCD) for the SDK.
+const RTC_DATE: u32 = 0x027F_FDE8;
+const RTC_TIME: u32 = 0x027F_FDEC;
+/// Card backup requests travel on the FS tag.
+const PXI_TAG_FS: u32 = 11;
+
 /// Shared-RAM words of the ARM9/ARM7 boot handshake.
 const ARM7_BOOT_COUNTER: u32 = 0x027F_FC26;
 const ARM7_BOOT_PROGRESS: u32 = 0x027F_FC28;
@@ -228,6 +273,7 @@ impl Machine {
             return word;
         }
         if Self::is_io(address) {
+            self.tick();
             let value = self.io.read(address, size);
             if self.poll.0 == address {
                 self.poll.1 += 1;
@@ -252,6 +298,20 @@ impl Machine {
             };
         }
         0
+    }
+
+    /// Advance display time with runtime activity, so code that busy-waits
+    /// without polling the display still sees lines and frames go by.
+    pub(super) fn tick(&mut self) {
+        self.activity += 1;
+        if self.activity.is_multiple_of(ACTIVITY_PER_LINE) {
+            let frame = self.io.frame;
+            self.io.set_line(self.io.line + 1);
+            if self.io.frame != frame && self.io.frame >= self.options.max_frames {
+                let frames = self.io.frame;
+                self.stop(&format!("reached frame {frames}"));
+            }
+        }
     }
 
     fn write_slow(&mut self, address: u32, size: u32, value: u32) {
@@ -372,7 +432,241 @@ impl Machine {
     }
 
     fn arm7_fifo(&mut self, word: u32) {
-        self.fifo_sent.push(word);
+        let lr = self.cpu().r[14];
+        self.fifo_sent.push((word, lr));
+        let tag = word & 0x1F;
+        let data = word >> 6;
+        match tag {
+            PXI_TAG_PM => {
+                // Power management packets: bit 25 marks the first word
+                // (command in bits 8-14), bit 24 the last. The ARM7 answers
+                // with the command and a result byte, 0 for success.
+                if data & (1 << 25) != 0 {
+                    self.arm7_pm_command = (data >> 8) & 0x7F;
+                }
+                if data & (1 << 24) != 0 {
+                    self.arm7_reply(PXI_TAG_PM, self.arm7_pm_command << 8, false);
+                }
+            }
+            PXI_TAG_FS => self.card_backup_message(data),
+            PXI_TAG_TOUCHPANEL => {
+                // Touch panel packets are framed like PM's; commands are
+                // answered with the command and result 0. Sampled touch
+                // data would arrive as command 0x10; none is sent, which
+                // reads as "not touched".
+                if data & (1 << 25) != 0 {
+                    self.arm7_tp_command = (data >> 8) & 0x7F;
+                }
+                if data & (1 << 24) != 0 {
+                    // Replies are framed as one-word packets (first and last
+                    // bits set); the callback ignores them otherwise.
+                    let reply = (1 << 25) | (1 << 24) | (self.arm7_tp_command << 8);
+                    self.arm7_reply(PXI_TAG_TOUCHPANEL, reply, false);
+                }
+            }
+            PXI_TAG_RTC => {
+                // RTC commands are single words; the ARM7 refreshes the
+                // date and time in shared RAM and answers with the command
+                // and result 0.
+                self.write_rtc_time();
+                let command = (data >> 8) & 0x7F;
+                self.arm7_reply(PXI_TAG_RTC, command << 8, false);
+            }
+            PXI_TAG_NVRAM => {
+                // Firmware flash packets: bit 25 marks the first word (command
+                // in bits 8-15, then one argument byte), later words carry two
+                // bytes each, and bit 24 marks the last word.
+                if data & (1 << 25) != 0 {
+                    self.nvram_command = (data >> 8) & 0xFF;
+                    self.nvram_bytes = vec![data as u8];
+                } else {
+                    self.nvram_bytes.push((data >> 8) as u8);
+                    self.nvram_bytes.push(data as u8);
+                }
+                if data & (1 << 24) != 0 {
+                    self.nvram_request();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run a complete firmware flash request. There is no firmware image:
+    /// reads return erased flash (0xFF).
+    fn nvram_request(&mut self) {
+        let bytes = std::mem::take(&mut self.nvram_bytes);
+        let command = self.nvram_command;
+        let field = |range: std::ops::Range<usize>| {
+            bytes.get(range).map(|slice| {
+                slice
+                    .iter()
+                    .fold(0_u32, |value, byte| (value << 8) | u32::from(*byte))
+            })
+        };
+        match command {
+            // Reads: a 24-bit flash address, the size, then the 32-bit
+            // destination; the size field is 4 bytes for 0x23, 2 for 0x25.
+            NVRAM_READ | NVRAM_READ_SHORT if bytes.len() >= 8 => {
+                let size_bytes = 3..bytes.len() - 4;
+                let (Some(_address), Some(size), Some(destination)) = (
+                    field(0..3),
+                    field(size_bytes),
+                    field(bytes.len() - 4..bytes.len()),
+                ) else {
+                    self.stop(&format!("short firmware read request {bytes:02X?}"));
+                };
+                for offset in 0..size.min(0x10000) {
+                    self.write8(destination + offset, 0xFF);
+                }
+            }
+            // Other commands (write enable, status and so on) have no
+            // effect without a firmware image; report them as done.
+            _ => self.record(Event::Unhandled {
+                tag: PXI_TAG_NVRAM,
+                command,
+            }),
+        }
+        self.arm7_reply(PXI_TAG_NVRAM, command << 8, false);
+    }
+
+    /// Write the host's local date and time where the SDK reads the RTC.
+    fn write_rtc_time(&mut self) {
+        let bcd = |value: u32| ((value / 10) << 4) | (value % 10);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let days = now / 86_400;
+        let seconds = (now % 86_400) as u32;
+        let (year, month, day) = civil_from_days(days as i64);
+        let date = bcd((year % 100) as u32) | (bcd(month) << 8) | (bcd(day) << 16);
+        let time = bcd(seconds / 3600) | (bcd(seconds / 60 % 60) << 8) | (bcd(seconds % 60) << 16);
+        self.write32(RTC_DATE, date);
+        self.write32(RTC_TIME, time);
+    }
+
+    /// Card backup (save memory) requests, which the ARM7 serves over SPI.
+    /// The ARM9 sends a command number; INIT is followed by the address of
+    /// the shared command block, whose first word receives the result.
+    fn card_backup_message(&mut self, data: u32) {
+        if self.backup_expects_block {
+            self.backup_expects_block = false;
+            self.backup_block = data;
+            let size = self.read32(data + backup::ARG_TOTAL_SIZE);
+            self.backup.ensure_size(size as usize);
+            self.finish_backup_command(backup::REQ_INIT, backup::RESULT_SUCCESS);
+            return;
+        }
+        if data == backup::REQ_INIT {
+            self.backup_expects_block = true;
+            return;
+        }
+        let result = self.run_backup_command(data);
+        self.finish_backup_command(data, result);
+    }
+
+    fn run_backup_command(&mut self, command: u32) -> u32 {
+        let block = self.backup_block;
+        let source = self.read32(block + backup::ARG_SOURCE);
+        let destination = self.read32(block + backup::ARG_DESTINATION);
+        let length = self.read32(block + backup::ARG_LENGTH);
+        let mut changed = false;
+        let result = match command {
+            backup::REQ_IDENTIFY => backup::RESULT_SUCCESS,
+            backup::REQ_READ_ID => {
+                // A Macronix FLASH ID; games only check that reads work.
+                self.write32(block + backup::ARG_ID, 0x0013_20C2);
+                backup::RESULT_SUCCESS
+            }
+            backup::REQ_READ_BACKUP => match self.backup.range(source, length) {
+                Some(range) => {
+                    let bytes = self.backup.data[range].to_vec();
+                    for (index, byte) in bytes.into_iter().enumerate() {
+                        self.write8(destination + index as u32, u32::from(byte));
+                    }
+                    backup::RESULT_SUCCESS
+                }
+                None => backup::RESULT_FAILURE,
+            },
+            backup::REQ_WRITE_BACKUP | backup::REQ_PROGRAM_BACKUP => {
+                match self.backup.range(destination, length) {
+                    Some(range) => {
+                        let program = command == backup::REQ_PROGRAM_BACKUP;
+                        for (index, offset) in range.enumerate() {
+                            let byte = self.read8(source + index as u32) as u8;
+                            let slot = &mut self.backup.data[offset];
+                            // Programming FLASH can only clear bits.
+                            *slot = if program { *slot & byte } else { byte };
+                        }
+                        changed = true;
+                        backup::RESULT_SUCCESS
+                    }
+                    None => backup::RESULT_FAILURE,
+                }
+            }
+            backup::REQ_VERIFY_BACKUP => match self.backup.range(destination, length) {
+                Some(range) => {
+                    let matches = range.enumerate().all(|(index, offset)| {
+                        self.read8(source + index as u32) as u8 == self.backup.data[offset]
+                    });
+                    if matches {
+                        backup::RESULT_SUCCESS
+                    } else {
+                        backup::RESULT_FAILURE
+                    }
+                }
+                None => backup::RESULT_FAILURE,
+            },
+            backup::REQ_ERASE_PAGE_BACKUP
+            | backup::REQ_ERASE_SECTOR_BACKUP
+            | backup::REQ_ERASE_SUBSECTOR_BACKUP => {
+                changed = true;
+                if self.backup.erase(destination, length) {
+                    backup::RESULT_SUCCESS
+                } else {
+                    backup::RESULT_FAILURE
+                }
+            }
+            backup::REQ_ERASE_CHIP_BACKUP => {
+                changed = true;
+                self.backup.data.fill(0xFF);
+                backup::RESULT_SUCCESS
+            }
+            _ => {
+                let words: Vec<String> = (0..8)
+                    .map(|index| format!("{:08X}", self.read32(block + 4 * index)))
+                    .collect();
+                self.stop(&format!(
+                    "unhandled card backup command {command} (block 0x{block:08X}: {})",
+                    words.join(" ")
+                ));
+            }
+        };
+        self.record(Event::Backup {
+            command,
+            offset: if command == backup::REQ_READ_BACKUP {
+                source
+            } else {
+                destination
+            },
+            length,
+            result,
+        });
+        if changed && let Err(error) = self.backup.flush() {
+            self.stop(&error);
+        }
+        result
+    }
+
+    fn finish_backup_command(&mut self, command: u32, result: u32) {
+        self.write32(self.backup_block + backup::ARG_RESULT, result);
+        self.arm7_reply(PXI_TAG_FS, command, true);
+    }
+
+    /// Queue a PXI message from the ARM7 to the ARM9.
+    fn arm7_reply(&mut self, tag: u32, data: u32, flag: bool) {
+        self.fifo_replies.push((tag, data));
+        let flag = if flag { 0x20 } else { 0 };
+        self.io.push_from_arm7((data << 6) | flag | tag);
     }
 
     /// Let the ARM7 make progress while the ARM9 waits on it. At boot, the
@@ -511,10 +805,10 @@ impl Machine {
             let _ = writeln!(report, "  {}", describe(event));
         }
         report.push_str("IPC FIFO messages sent to the ARM7:\n");
-        for word in &self.fifo_sent {
+        for (word, lr) in &self.fifo_sent {
             let _ = writeln!(
                 report,
-                "  tag {:2} ({}) data 0x{:07X}{}",
+                "  tag {:2} ({}) data 0x{:07X}{} (lr 0x{lr:08X})",
                 word & 0x1F,
                 pxi_tag_name(word & 0x1F),
                 word >> 6,
@@ -525,6 +819,14 @@ impl Machine {
                 }
             );
         }
+        report.push_str("IPC FIFO replies from the ARM7 stand-in:\n");
+        for (tag, data) in &self.fifo_replies {
+            let _ = writeln!(
+                report,
+                "  tag {tag:2} ({}) data 0x{data:07X}",
+                pxi_tag_name(*tag)
+            );
+        }
         report.push_str("I/O registers touched (address: reads/writes):\n");
         for (address, access) in &self.io.touched {
             let _ = writeln!(
@@ -533,9 +835,72 @@ impl Machine {
                 access.reads, access.writes
             );
         }
+        // The running thread's call chain, from its system-mode stack.
+        let sp = {
+            let cpu = unsafe { &*self.cpu };
+            self.banks.banked_sp(cpu, super::cpu::MODE_SYSTEM)
+        };
+        let chain: Vec<String> = (0..128)
+            .map(|slot| self.read32(sp.wrapping_add(4 * slot)))
+            .filter(|&word| (0x0200_4000..0x0230_0000).contains(&word))
+            .take(20)
+            .map(|word| format!("{word:08X}"))
+            .collect();
+        let _ = writeln!(
+            report,
+            "running thread (sp 0x{sp:08X}) stack code pointers: {}",
+            chain.join(" ")
+        );
+        report.push_str("parked guest threads:\n");
+        for line in super::threads::describe(&mut |address| self.read32(address)) {
+            let _ = writeln!(report, "  {line}");
+        }
+        // GEN5_DUMP=address:length[,address:length...] dumps memory words.
+        if let Ok(spec) = std::env::var("GEN5_DUMP") {
+            for range in spec.split(',') {
+                let parse =
+                    |text: &str| u32::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok();
+                let Some((start, length)) = range
+                    .split_once(':')
+                    .and_then(|(start, length)| Some((parse(start)?, parse(length)?)))
+                else {
+                    continue;
+                };
+                let _ = writeln!(report, "memory 0x{start:08X}:");
+                for row in (0..length).step_by(16) {
+                    let _ = write!(report, "  {:08X}:", start + row);
+                    for word in (row..(row + 16).min(length)).step_by(4) {
+                        let value = self.read32(start + word);
+                        let _ = write!(report, " {value:08X}");
+                    }
+                    report.push('\n');
+                }
+            }
+        }
         print!("{report}");
         std::process::exit(0);
     }
+}
+
+/// (year, month, day) for days since 1970-01-01 (Howard Hinnant's
+/// civil-from-days algorithm). The date is UTC, which is close enough for
+/// the game's clock.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u32;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    } as u32;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 /// NitroSDK PXI FIFO tags.
@@ -579,6 +944,18 @@ fn describe(event: &Event) -> String {
         } => format!("cp15 c{crn},c{crm},{opc2} = 0x{value:08X}"),
         Event::Psr { value, fields } => format!("msr fields {fields:X} = 0x{value:08X}"),
         Event::FifoSend(word) => format!("ipc fifo send 0x{word:08X}"),
+        Event::Unhandled { tag, command } => format!(
+            "ARM7 stand-in acknowledged {} command 0x{command:02X} without action",
+            pxi_tag_name(tag)
+        ),
+        Event::Backup {
+            command,
+            offset,
+            length,
+            result,
+        } => format!(
+            "card backup command {command} at 0x{offset:X} length 0x{length:X}: result {result}"
+        ),
         Event::Interpret { target, lr } => {
             format!("interpret 0x{target:08X} (lr 0x{lr:08X})")
         }
@@ -641,6 +1018,9 @@ fn deliver_interrupts(cpu: *mut Cpu) -> bool {
     let cpu = unsafe { &mut *cpu };
     machine.banks.leave(cpu);
     [cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[12]] = saved;
+    if let Some(info) = machine.pending_switch.take() {
+        super::threads::reschedule_after_irq(cpu, info);
+    }
     true
 }
 
@@ -844,17 +1224,22 @@ extern "C" fn host_read32(cpu: *mut Cpu, address: u32) -> u32 {
 }
 extern "C" fn host_write8(cpu: *mut Cpu, address: u32, value: u32) {
     unsafe { machine(cpu) }.write_slow(address, 1, value & 0xFF);
+    interrupt_if_enabled(cpu);
 }
 extern "C" fn host_write16(cpu: *mut Cpu, address: u32, value: u32) {
     unsafe { machine(cpu) }.write_slow(address, 2, value & 0xFFFF);
+    interrupt_if_enabled(cpu);
 }
 extern "C" fn host_write32(cpu: *mut Cpu, address: u32, value: u32) {
     unsafe { machine(cpu) }.write_slow(address, 4, value);
+    interrupt_if_enabled(cpu);
 }
 
 extern "C" fn host_call(cpu: *mut Cpu, target: u32) {
     let lr = unsafe { (*cpu).r[14] };
-    unsafe { machine(cpu) }.record(Event::Call { target, lr });
+    let machine = unsafe { machine(cpu) };
+    machine.record(Event::Call { target, lr });
+    machine.tick();
     call_target(cpu, target);
 }
 
@@ -914,11 +1299,32 @@ pub(super) extern "C" fn host_read_psr(cpu: *mut Cpu, spsr: u32) -> u32 {
 pub(super) extern "C" fn host_write_psr(cpu: *mut Cpu, spsr: u32, fields: u32, value: u32) {
     let machine = unsafe { machine(cpu) };
     machine.record(Event::Psr { value, fields });
+    machine.tick();
     if spsr != 0 {
         machine.banks.set_spsr(value, fields);
     } else {
         machine.banks.set_cpsr(unsafe { &mut *cpu }, value, fields);
+        interrupt_if_enabled(cpu);
     }
+}
+
+/// Take a pending interrupt now if the CPU accepts interrupts. Called where
+/// the game re-enables them, which is where hardware would take one.
+fn interrupt_if_enabled(cpu: *mut Cpu) {
+    let machine = unsafe { machine(cpu) };
+    if !machine.banks.irq_disabled && machine.io.pending() != 0 {
+        deliver_interrupts(cpu);
+    }
+}
+
+/// A loop ran out of budget: let time pass, let the ARM7 act, and take a
+/// pending interrupt.
+extern "C" fn host_tick(cpu: *mut Cpu) {
+    let machine = unsafe { machine(cpu) };
+    unsafe { (*cpu).budget = LOOP_BUDGET };
+    machine.arm7_tick();
+    machine.tick();
+    interrupt_if_enabled(cpu);
 }
 
 extern "C" fn host_exception_return(cpu: *mut Cpu, _target: u32) {
@@ -1002,6 +1408,7 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         read_pages: std::ptr::null_mut(),
         write_pages: std::ptr::null_mut(),
         runtime: std::ptr::null_mut(),
+        budget: LOOP_BUDGET,
     }));
     let mut machine = Box::new(Machine {
         cpu,
@@ -1016,8 +1423,18 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         events: VecDeque::new(),
         calls: 0,
         poll: (0, 0),
+        activity: 0,
+        pending_switch: None,
         card,
         fifo_sent: Vec::new(),
+        fifo_replies: Vec::new(),
+        arm7_pm_command: 0,
+        arm7_tp_command: 0,
+        nvram_command: 0,
+        nvram_bytes: Vec::new(),
+        backup_block: 0,
+        backup_expects_block: false,
+        backup: Backup::open(cache_root.join("save.bin")),
         arm7_sync_output: 7,
         arm7_init_phase: 0,
         options,
@@ -1032,6 +1449,12 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
     machine.memory.main[header_offset..header_offset + header.len()].copy_from_slice(&header);
     // Boot medium: card.
     machine.memory.main[Memory::main_offset(0x027F_FC40)] = 1;
+    // The firmware records the boot card's chip ID; the SDK compares later
+    // reads against it to detect a pulled-out card.
+    for address in [0x027F_F800, 0x027F_FC00] {
+        let offset = Memory::main_offset(address);
+        machine.memory.main[offset..offset + 4].copy_from_slice(&card::CHIP_ID.to_le_bytes());
+    }
 
     {
         let cpu = unsafe { &mut *cpu };
@@ -1059,6 +1482,8 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         write_psr: host_write_psr,
         exception_return: host_exception_return,
         undefined: host_undefined,
+        hle: super::threads::host_hle,
+        tick: host_tick,
     };
     unsafe { set_host(&host) };
 
@@ -1084,6 +1509,11 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
             "wall-clock limit of {seconds}s (likely a loop in recompiled code that never calls the runtime)"
         ));
     });
-    call_target(cpu, entry);
-    machine.stop("the entry function returned");
+    let cpu_address = cpu as usize;
+    super::threads::run_boot(move || {
+        let cpu = cpu_address as *mut Cpu;
+        call_target(cpu, entry);
+        unsafe { get(cpu) }.stop("the entry function returned");
+    });
+    Ok(())
 }
