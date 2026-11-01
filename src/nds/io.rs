@@ -27,11 +27,14 @@ pub const POSTFLG: u32 = 0x0400_0300;
 pub const IPCFIFORECV: u32 = 0x0410_0000;
 
 pub const IRQ_VBLANK: u32 = 1 << 0;
+pub const IRQ_TIMER0: u32 = 1 << 3;
 pub const IRQ_IPC_SYNC: u32 = 1 << 16;
 pub const IRQ_IPC_RECV: u32 = 1 << 18;
 
 const LINES: u32 = 263;
 const VISIBLE_LINES: u32 = 192;
+/// ARM9 bus cycles (33.51 MHz) per scanline.
+const CYCLES_PER_LINE: u32 = 2130;
 
 pub enum Effect {
     /// A DMA channel was enabled with immediate start timing.
@@ -55,7 +58,44 @@ pub struct Io {
     /// Words from the ARM7 waiting in the receive FIFO.
     pub fifo_recv: VecDeque<u32>,
     pub touched: BTreeMap<u32, Access>,
-    timer_ticks: [u32; 4],
+    timers: [Timer; 4],
+}
+
+/// A hardware timer: a 16-bit up-counter that reloads on overflow.
+#[derive(Debug, Default, Clone, Copy)]
+struct Timer {
+    counter: u16,
+    reload: u16,
+    control: u16,
+    /// Cycles not yet worth a tick at the current prescaler.
+    remainder: u32,
+}
+
+impl Timer {
+    fn enabled(&self) -> bool {
+        self.control & 0x80 != 0
+    }
+
+    fn cascade(&self) -> bool {
+        self.control & 0x04 != 0
+    }
+
+    fn prescaler(&self) -> u32 {
+        [1, 64, 256, 1024][usize::from(self.control & 3)]
+    }
+
+    /// Count `ticks`, returning how many times the counter overflowed.
+    fn count(&mut self, ticks: u64) -> u64 {
+        let period = 0x1_0000 - u64::from(self.reload);
+        let position = u64::from(self.counter) + ticks;
+        if position < 0x1_0000 {
+            self.counter = position as u16;
+            return 0;
+        }
+        let past = position - 0x1_0000;
+        self.counter = (u64::from(self.reload) + past % period) as u16;
+        1 + past / period
+    }
 }
 
 impl Io {
@@ -66,7 +106,7 @@ impl Io {
             frame: 0,
             fifo_recv: VecDeque::new(),
             touched: BTreeMap::new(),
-            timer_ticks: [0; 4],
+            timers: [Timer::default(); 4],
         };
         io.set16(KEYINPUT, 0x03FF);
         io.set16(IPCFIFOCNT, 0x0101);
@@ -124,6 +164,8 @@ impl Io {
     pub fn set_line(&mut self, line: u32) {
         let previous = self.line;
         self.line = line % LINES;
+        let elapsed = (self.line + LINES - previous) % LINES;
+        self.advance_timers(elapsed * CYCLES_PER_LINE);
         let mut status = self.get16(DISPSTAT);
         let in_vblank = self.line >= VISIBLE_LINES && self.line != LINES - 1;
         status = (status & !1) | u16::from(in_vblank);
@@ -136,6 +178,30 @@ impl Io {
             if status & 0x08 != 0 {
                 self.raise(IRQ_VBLANK);
             }
+        }
+    }
+
+    /// Run the timers for `cycles` ARM9 bus cycles (33.5 MHz).
+    fn advance_timers(&mut self, cycles: u32) {
+        let mut overflows = 0;
+        for index in 0..4 {
+            let mut timer = self.timers[index];
+            if !timer.enabled() {
+                overflows = 0;
+                continue;
+            }
+            let ticks = if timer.cascade() && index > 0 {
+                overflows
+            } else {
+                let total = timer.remainder + cycles;
+                timer.remainder = total % timer.prescaler();
+                u64::from(total / timer.prescaler())
+            };
+            overflows = timer.count(ticks);
+            if overflows > 0 && timer.control & 0x40 != 0 {
+                self.raise(IRQ_TIMER0 << index);
+            }
+            self.timers[index] = timer;
         }
     }
 
@@ -160,15 +226,13 @@ impl Io {
                 self.update_fifo_status();
                 return value;
             }
-            _ if (TIMER_BASE..TIMER_BASE + 16).contains(&aligned) && aligned & 3 == 0 => {
-                let index = ((aligned - TIMER_BASE) / 4) as usize;
-                self.timer_ticks[index] = self.timer_ticks[index].wrapping_add(64);
-                let counter = self.timer_ticks[index] as u16;
-                let control = self.get16(aligned + 2);
-                return if size == 4 {
-                    u32::from(counter) | (u32::from(control) << 16)
-                } else {
-                    u32::from(counter)
+            _ if (TIMER_BASE..TIMER_BASE + 16).contains(&aligned) => {
+                let timer = self.timers[((aligned - TIMER_BASE) / 4) as usize];
+                let value = u32::from(timer.counter) | (u32::from(timer.control) << 16);
+                return match (size, aligned & 2) {
+                    (4, _) => value,
+                    (_, 0) => value & 0xFFFF,
+                    _ => value >> 16,
                 };
             }
             _ => {}
@@ -192,6 +256,27 @@ impl Io {
         }
         if aligned == IPCFIFOSEND {
             return Some(Effect::FifoSend(value));
+        }
+        if (TIMER_BASE..TIMER_BASE + 16).contains(&aligned) {
+            let index = ((aligned - TIMER_BASE) / 4) as usize;
+            let (reload, control) = match (size, aligned & 2) {
+                (4, _) => (Some(value as u16), Some((value >> 16) as u16)),
+                (_, 0) => (Some(value as u16), None),
+                _ => (None, Some(value as u16)),
+            };
+            let timer = &mut self.timers[index];
+            if let Some(reload) = reload {
+                timer.reload = reload;
+            }
+            if let Some(control) = control {
+                // Starting a timer loads the reload value.
+                if control & 0x80 != 0 && !timer.enabled() {
+                    timer.counter = timer.reload;
+                    timer.remainder = 0;
+                }
+                timer.control = control & 0xC7;
+            }
+            return None;
         }
         if aligned == IPCSYNC && size >= 2 || address == IPCSYNC + 1 {
             let value = if address == IPCSYNC + 1 {
@@ -318,6 +403,19 @@ mod tests {
         assert_eq!(io.frame, 1);
         io.write(IF, 4, IRQ_VBLANK);
         assert_eq!(io.get32(IF), 0);
+    }
+
+    #[test]
+    fn timer_overflows_raise_interrupts_and_reload() {
+        let mut io = Io::new();
+        // Timer 1: reload 0xFF00, prescaler 1, interrupt, enabled.
+        io.write(TIMER_BASE + 4, 4, 0x00C0_FF00);
+        assert_eq!(io.read(TIMER_BASE + 4, 2), 0xFF00);
+        io.advance_timers(0x100);
+        assert_eq!(io.get32(IF) & (IRQ_TIMER0 << 1), IRQ_TIMER0 << 1);
+        assert_eq!(io.read(TIMER_BASE + 4, 2), 0xFF00);
+        io.advance_timers(0x10);
+        assert_eq!(io.read(TIMER_BASE + 4, 2), 0xFF10);
     }
 
     #[test]

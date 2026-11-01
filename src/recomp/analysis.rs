@@ -86,6 +86,9 @@ pub struct Function {
     /// `pc` writes that are neither returns nor recognized jump tables.
     pub indirect_jumps: Vec<u32>,
     pub indirect_calls: Vec<u32>,
+    /// `ldr lr, =return; bx rN`: indirect calls that return to a given
+    /// address rather than the next instruction, as (call, return).
+    pub calls_with_return: Vec<(u32, u32)>,
     /// Addresses of words read through PC-relative loads.
     pub literals: BTreeSet<u32>,
     /// Entry points of other functions this one runs straight into.
@@ -244,6 +247,7 @@ pub fn analyze_function(
         jump_tables: Vec::new(),
         indirect_jumps: Vec::new(),
         indirect_calls: Vec::new(),
+        calls_with_return: Vec::new(),
         literals: BTreeSet::new(),
         falls_into: Vec::new(),
         problems: Vec::new(),
@@ -352,7 +356,10 @@ pub fn analyze_function(
                 }
                 Flow::IndirectJump { conditional } => {
                     history.push(ins);
-                    if let Some((target, target_thumb)) = constant_jump(module, &history) {
+                    if let Some(continuation) = explicit_return(module, &history) {
+                        function.calls_with_return.push((address, continuation));
+                        worklist.push((continuation, Vec::new()));
+                    } else if let Some((target, target_thumb)) = constant_jump(module, &history) {
                         tail_call(&mut function, address, target, target_thumb);
                     } else if popped_return(&history) {
                         // `pop {..., rN}; bx rN`: an interworking return.
@@ -471,6 +478,24 @@ fn constant_jump(module: &Module, history: &[Instruction]) -> Option<(u32, bool)
     }
 }
 
+/// For a register jump after `ldr lr, =address` (same state, same module),
+/// the address the callee returns to.
+fn explicit_return(module: &Module, history: &[Instruction]) -> Option<u32> {
+    let (jump, earlier) = history.split_last()?;
+    if !matches!(
+        jump.op,
+        Op::BranchExchange { link: false, .. } | Op::DataProc { op: DpOp::Mov, .. }
+    ) || matches!(jump.op, Op::BranchExchange { rm: LR, .. })
+    {
+        return None;
+    }
+    let writer = last_writer(earlier, LR)?;
+    let value = module.u32_at(writer.pc_relative_address()?)?;
+    let address = value & !1;
+    let same_state = (value & 1 != 0) == jump.thumb;
+    (same_state && module.contains(address) && address != jump.end()).then_some(address)
+}
+
 /// The most recent instruction in `history` that wrote `reg`.
 fn last_writer(history: &[Instruction], reg: arm::Reg) -> Option<&Instruction> {
     history
@@ -514,16 +539,30 @@ fn popped_return(history: &[Instruction]) -> bool {
     )
 }
 
-/// The bound of a switch: `cmp reg, #n` (n + 1 cases), searched backwards.
+/// The number of cases of a switch, searched backwards: `cmp reg, #n` gives
+/// n + 1 cases, and a later `subs index, reg, #base` (a switch whose cases
+/// start at `base`) gives n - base + 1.
 fn switch_bound(history: &[Instruction]) -> Option<u32> {
-    history.iter().rev().find_map(|ins| match ins.op {
-        Op::DataProc {
-            op: DpOp::Cmp,
-            operand: Operand::Imm { value, .. },
-            ..
-        } if value < MAX_JUMP_TABLE_ENTRIES => Some(value + 1),
-        _ => None,
-    })
+    let mut base = 0;
+    for ins in history.iter().rev() {
+        match ins.op {
+            Op::DataProc {
+                op: DpOp::Cmp,
+                operand: Operand::Imm { value, .. },
+                ..
+            } if value >= base && value - base < MAX_JUMP_TABLE_ENTRIES => {
+                return Some(value - base + 1);
+            }
+            Op::DataProc {
+                op: DpOp::Sub,
+                set_flags: true,
+                operand: Operand::Imm { value, .. },
+                ..
+            } if base == 0 => base = value,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Recognize the compiler's switch dispatch ending at `history.last()`.
@@ -1005,6 +1044,16 @@ mod tests {
         assert_eq!(function.calls.len(), 1);
         assert_eq!(function.calls[0].target, 0x0200_0010);
         assert!(function.calls[0].thumb);
+    }
+
+    #[test]
+    fn switch_bound_accounts_for_case_base() {
+        let decode = |half| arm::decode_thumb(0x0200_0000, half, None);
+        // cmp r0, #0x63 ; adds r1, r0, #0 ; subs r1, #0x60
+        let history = [decode(0x2863), decode(0x1C01), decode(0x3960)];
+        assert_eq!(switch_bound(&history), Some(4));
+        // cmp r0, #2 alone: three cases
+        assert_eq!(switch_bound(&[decode(0x2802)]), Some(3));
     }
 
     #[test]

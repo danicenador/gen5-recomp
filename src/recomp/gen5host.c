@@ -25,6 +25,8 @@ typedef struct Gen5Host {
     void (*write_psr)(Cpu *cpu, uint32_t spsr, uint32_t fields, uint32_t value);
     void (*exception_return)(Cpu *cpu, uint32_t target);
     void (*undefined)(Cpu *cpu, uint32_t address, uint32_t raw);
+    void (*hle)(Cpu *cpu, uint32_t id);
+    void (*tick)(Cpu *cpu);
 } Gen5Host;
 
 static Gen5Host host;
@@ -61,3 +63,5 @@ void rt_write_psr(Cpu *cpu, uint32_t spsr, uint32_t fields, uint32_t value) {
 }
 void rt_exception_return(Cpu *cpu, uint32_t target) { host.exception_return(cpu, target); }
 void rt_undefined(Cpu *cpu, uint32_t address, uint32_t raw) { host.undefined(cpu, address, raw); }
+void rt_hle(Cpu *cpu, uint32_t id) { host.hle(cpu, id); }
+void rt_tick(Cpu *cpu) { host.tick(cpu); }

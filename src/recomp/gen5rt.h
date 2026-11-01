@@ -22,6 +22,10 @@ typedef struct Cpu {
     uint8_t **read_pages;
     uint8_t **write_pages;
     void *runtime;
+    /* Counts down at backward branches; at zero the code calls rt_tick so
+     * loops that never reach the runtime still let time pass and take
+     * interrupts. */
+    uint32_t budget;
 } Cpu;
 
 #define GEN5_PAGE_SHIFT 12
@@ -48,6 +52,10 @@ void rt_write_psr(Cpu *cpu, uint32_t spsr, uint32_t fields, uint32_t value);
 /* `movs pc, lr` / `subs pc, lr, #4` / `ldm ... {..., pc}^`. */
 void rt_exception_return(Cpu *cpu, uint32_t target);
 void rt_undefined(Cpu *cpu, uint32_t address, uint32_t raw);
+/* Called from loops when the budget runs out. */
+void rt_tick(Cpu *cpu);
+/* An SDK routine the runtime implements (see recomp::hle). */
+void rt_hle(Cpu *cpu, uint32_t id);
 
 static inline uint32_t read8(Cpu *cpu, uint32_t a) {
     uint8_t *page = cpu->read_pages[a >> GEN5_PAGE_SHIFT];

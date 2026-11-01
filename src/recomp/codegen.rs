@@ -122,6 +122,13 @@ pub fn generate(program: &Program, analysis: &Analysis, out_dir: &Path) -> Resul
 
 /// Translate one function to C.
 pub fn emit_function(analysis: &Analysis, module: &Module, function: &Function) -> String {
+    if let Some(hle) = super::hle::detect(module, function.address, function.thumb) {
+        return format!(
+            "void {}(Cpu *cpu) {{\n    /* {hle:?}: implemented by the runtime. */\n    rt_hle(cpu, {});\n}}\n",
+            function_name(function.key()),
+            hle as u32
+        );
+    }
     let instructions: Vec<&Instruction> = function.instructions.values().collect();
     let mut labels: BTreeSet<u32> = BTreeSet::new();
     let mut body = String::new();
@@ -134,6 +141,13 @@ pub fn emit_function(analysis: &Analysis, module: &Module, function: &Function) 
     for (index, ins) in instructions.iter().enumerate() {
         let next_emitted = instructions.get(index + 1).map(|next| next.address);
         let _ = writeln!(body, "    /* {:08X}: {ins} */", ins.address);
+        if let Some(hle) = super::hle::detect_inline(module, ins.address, ins.thumb) {
+            let _ = writeln!(
+                body,
+                "    /* {hle:?}: implemented by the runtime. */\n    rt_hle(cpu, {});\n    return;",
+                hle as u32
+            );
+        }
         let mut code = String::new();
         let falls_through = context.emit_instruction(&mut code, ins, &mut labels);
         if ins.cond != Cond::Al && !code.is_empty() {
@@ -368,6 +382,10 @@ impl Context<'_> {
                     if set_flags {
                         code.push_str("    rt_exception_return(cpu, res);\n    return;\n");
                         false
+                    } else if ins.thumb {
+                        // A Thumb data-processing write to pc stays in Thumb.
+                        code.push_str("    res |= 1u;\n");
+                        self.pc_write(code, ins, "res", labels)
                     } else {
                         self.pc_write(code, ins, "res", labels)
                     }
@@ -543,6 +561,9 @@ impl Context<'_> {
                     && !self.is_tail_call_at(ins.address, target)
                 {
                     labels.insert(target);
+                    if target <= ins.address {
+                        code.push_str("    if (--cpu->budget == 0) rt_tick(cpu);\n");
+                    }
                     let _ = writeln!(code, "    goto L_{target:08X};");
                 } else if let Some(call) = self.tail_call_at(ins.address) {
                     code.push_str(&self.call(call, None));
@@ -777,6 +798,18 @@ impl Context<'_> {
             let _ = writeln!(code, "    (void){value};");
             code.push_str(&self.call(call, None));
             code.push_str("    return;\n");
+            false
+        } else if let Some(&(_, continuation)) = function
+            .calls_with_return
+            .iter()
+            .find(|(call, _)| *call == ins.address)
+        {
+            // lr already holds the return address.
+            labels.insert(continuation);
+            let _ = writeln!(
+                code,
+                "    rt_call(cpu, {value});\n    goto L_{continuation:08X};"
+            );
             false
         } else if function.indirect_calls.contains(&ins.address) {
             // `mov lr, pc` already set the return address.

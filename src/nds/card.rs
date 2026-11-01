@@ -17,7 +17,7 @@ pub const ROMCTRL_READY: u32 = 1 << 23;
 pub const ROMCTRL_BUSY: u32 = 1 << 31;
 
 /// 1 Gbit-class Macronix mask ROM; only the low byte is checked by games.
-const CHIP_ID: u32 = 0x0000_7FC2;
+pub const CHIP_ID: u32 = 0x0000_7FC2;
 
 pub struct Card {
     rom: File,

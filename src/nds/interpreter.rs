@@ -120,6 +120,7 @@ pub fn run(cpu_ptr: *mut Cpu, target: u32) {
             // Interpreted code is often a loop waiting on the ARM7.
             if steps.is_multiple_of(256) {
                 machine.arm7_tick();
+                machine.tick();
             }
             fetch(machine, pc, thumb)
         };

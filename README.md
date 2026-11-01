@@ -167,15 +167,35 @@ The `nds` module provides:
   Calls from it go back to native code.
 
 The ARM7 is not run. A stand-in answers the shared-RAM boot handshakes and
-the PXI start-up handshake, and reports every PXI service as registered.
+the PXI start-up handshake, and serves the ARM7 services the game asks for
+over the IPC FIFO, as decoded from the ARM9's callbacks:
 
-White 2 currently runs crt0 and NitroSDK initialization: TCM setup, both
-boot handshakes, PXI, OS, threads, cache maintenance and card ID reads. It
-then sends its first service requests to the ARM7 (CTRDG, CARD and OS) and
-idles waiting for replies. When the game cannot continue, `boot` stops with
-a report: the reason, the registers, recent runtime events, the decoded IPC
-messages and every I/O register touched. A watchdog reports loops in
-recompiled code that never reach the runtime.
+- PM (power management) and the touch panel: framed command packets
+  answered with a result. No touch data is sent, which reads as "not
+  touched".
+- RTC: the host's date and time, as BCD in shared RAM.
+- NVRAM (firmware flash): reads return erased flash, since there is no
+  firmware image.
+- Card backup (save memory): identify, read, write, program, verify and
+  erase on 512 KiB of FLASH, kept in `save.bin` in the cache.
+
+NitroSDK threads run as host threads that take turns. The SDK's
+`OS_SaveContext` and `OS_LoadContext`, and the thread switch at the end of
+its IRQ handler, are recognised by instruction pattern (`recomp::hle`) and
+implemented by the runtime (`nds::threads`), because a context switch jumps
+to a saved `pc` that generated C cannot reach. Hardware timers count with
+display time and raise interrupts. Generated loops call `rt_tick` after a
+budget of backward branches, so a busy-wait still lets time pass and takes
+interrupts. The report covers the IPC traffic, the stand-in's replies, the
+running thread's call chain and every parked thread. `GEN5_DUMP` adds memory
+dumps.
+
+White 2 now gets through every service request at startup, including save
+detection. It runs its frame loop, with vblank and timer interrupts and
+thread switches, and its overlay code polls the buttons and touch screen.
+The loop runs far more often than once per frame (about 368 touch requests
+per frame), so frame pacing is not right yet. Nothing is drawn yet: display
+output is the next step.
 
 ## BW2 map preview
 
@@ -255,9 +275,9 @@ future work.
 
 The steps below come from the hand-written field prototype. The plan from here
 is recompilation: export the code (done), disassembly and function discovery
-(done), the code generator (done), and a first runtime (done). Next are the
-ARM7 services that answer the game's IPC requests, then display output,
-aiming first to boot White 2 to its title screen.
+(done), the code generator (done), a first runtime and the ARM7 services used
+at startup (done). Next are frame pacing and display output, aiming first
+to show White 2's title screen.
 
 1. ROM explorer and validated import cache.
 2. Decode and render a multi-cell BW2 map with original model textures.

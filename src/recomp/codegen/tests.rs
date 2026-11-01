@@ -31,6 +31,7 @@ uint32_t rt_read_psr(Cpu *c, uint32_t s) { (void)c; (void)s; return 0; }
 void rt_write_psr(Cpu *c, uint32_t s, uint32_t f, uint32_t v) { (void)c; (void)s; (void)f; (void)v; }
 void rt_exception_return(Cpu *c, uint32_t t) { (void)c; printf("eret %u\n", t); }
 void rt_undefined(Cpu *c, uint32_t a, uint32_t r) { (void)c; (void)r; printf("undefined %u\n", a); }
+void rt_tick(Cpu *c) { c->budget = 1000; }
 "#;
 
 /// Compile the function at BASE with gcc, run it after the `setup` C
@@ -69,6 +70,7 @@ fn run(name: &str, code: &[u8], thumb: bool, setup: &str) -> Option<HashMap<Stri
          static const uint8_t code[] = {{{bytes}}};\n\
          memcpy(ram, code, sizeof code);\n\
          Cpu cpu = {{0}};\n\
+         cpu.budget = 1000;\n\
          cpu.read_pages = pages;\n\
          cpu.write_pages = pages;\n\
          uint32_t *r = cpu.r;\n\

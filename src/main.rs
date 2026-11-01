@@ -339,15 +339,32 @@ fn build(cache_root: &Path, compiler: &str) -> Result<(), String> {
 }
 
 fn disasm(cache_root: &Path, module: ModuleId, address: u32) -> Result<(), String> {
-    let (_, analysis) = run_analysis(cache_root)?;
-    let function = analysis
+    let (program, analysis) = run_analysis(cache_root)?;
+    let Some(function) = analysis
         .functions
         .values()
         .filter(|function| function.module == module)
         .find(|function| {
-            function.address == address || function.instructions.contains_key(&address)
+            function.address == address & !1 || function.instructions.contains_key(&address)
         })
-        .ok_or_else(|| format!("no discovered function in {module} contains 0x{address:08X}"))?;
+    else {
+        // Not part of a discovered function: decode linearly, in Thumb
+        // when bit 0 of the address is set.
+        let code = program
+            .module(module)
+            .ok_or_else(|| format!("no module {module}"))?;
+        println!("{module}:0x{address:08X} is not in a discovered function; linear decode:");
+        let thumb = address & 1 != 0;
+        let mut at = address & !1;
+        for _ in 0..48 {
+            let Some(ins) = recomp_analysis::decode_at(code, at, thumb) else {
+                break;
+            };
+            println!("  {:08X}: {ins}", ins.address);
+            at = ins.end();
+        }
+        return Ok(());
+    };
     println!(
         "{}:0x{:08X} ({}, {} instructions, found via {:?})",
         function.module,
