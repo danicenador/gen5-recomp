@@ -178,6 +178,29 @@ helper copies its input file into the run directory before starting.
 `GEN5_BOOT_FPS` optionally caps headless frame progression for live diagnosis
 (0, the default, runs as fast as possible); windowed play keeps its normal pacing.
 
+`./scripts/white2/replay.ps1 -Inputs scripts/white2/field.inputs -Frames 52000`
+replays the first controllable-field checkpoint from a fresh save: finish the
+introduction, move out of the bedroom, complete Mom's conversation, leave home,
+walk down and sideways in Aspertia, and re-enter home. Inspect these screenshots
+in the printed run directory (the helper's default 120-frame interval):
+
+| Frame | Expected visual checkpoint |
+|---|---|
+| 13680 | Player in the bedroom |
+| 21000 | Player has moved toward the living room |
+| 22320 | Mom's opening conversation |
+| 24960 | Conversation finished; Mom moves away |
+| 40560 | Player outside the house in Aspertia |
+| 45120 | Player has walked down toward the fence |
+| 45360 | Player has walked left along the street |
+| 49320 | Player has re-entered the house |
+| 52000 | Interior after returning home |
+
+These scripts use the locally imported English White 2 ROM with CRC `95AB5437`
+and its generated game library. They preserve the normal in-game story and map
+transitions; no memory edits or event skips are used. Audio is still silent,
+and some geometry/shadow and lower-screen rendering artifacts remain.
+
 `build` compiles `recomp/*.c` with gcc in parallel into
 `recomp/build/game.dll`, reusing objects whose sources have not changed.
 `gen5host.c` forwards every `rt_*` hook to callbacks the runtime registers,
@@ -257,8 +280,11 @@ dumps. Every generated function checks on return that it left `sp` as it
 found it; `GEN5_CHECK_SP=1` stops on the first one that did not.
 
 White 2 boots, plays its opening, shows the title screen, opens the main
-menu (New Game, Mystery Gift, ...) and starts Professor Juniper's New Game
-introduction. The title screen now renders Kyurem on its lower screen through
+menu (New Game, Mystery Gift, ...) and completes Professor Juniper's New Game
+introduction and character creation. The original game reaches the player's
+bedroom, accepts field movement, runs Mom's opening conversation, and supports
+leaving home, moving through Aspertia and re-entering the house. The title screen
+renders Kyurem on its lower screen through
 the 3D engine and display capture. Sound is still acknowledged without playback.
 
 The 3D path has 16 focused regression tests covering command decoding, matrix
@@ -348,9 +374,10 @@ The steps below come from the hand-written field prototype. The plan from here
 is recompilation: export the code (done), disassembly and function discovery
 (done), the code generator (done), a first runtime and the ARM7 services used
 at startup (done), and 2D display output with a playable window (done; White
-2 reaches its New Game introduction). The initial 3D renderer and display
-capture now show the title's Kyurem. Next are progressing New Game into the
-playable field, filling the remaining graphics gaps, and sound.
+2 reaches its controllable opening field). The initial 3D renderer and display
+capture now show the title's Kyurem. New Game through the opening field and
+house transitions is verified. Next are obtaining the starter, completing the
+first rival battle, validating save/reload, filling graphics gaps, and sound.
 
 1. ROM explorer and validated import cache.
 2. Decode and render a multi-cell BW2 map with original model textures.
