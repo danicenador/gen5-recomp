@@ -49,6 +49,16 @@ fn run() -> Result<(), String> {
             let script = std::env::var("GEN5_INPUT")
                 .map(|spec| parse_input_script(&spec))
                 .unwrap_or(Ok(Vec::new()))?;
+            let touch_script = std::env::var("GEN5_TOUCH")
+                .map(|spec| parse_touch_script(&spec))
+                .unwrap_or(Ok(Vec::new()))?;
+            let screenshot_every = std::env::var("GEN5_SCREEN_EVERY")
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "invalid GEN5_SCREEN_EVERY".to_owned())
+                })
+                .unwrap_or(Ok(30))?;
             let input = std::sync::Arc::new(gen5::nds::input::Input::default());
             let scripted = input.clone();
             // Optionally save both screens every 30 frames and at the end.
@@ -60,10 +70,19 @@ fn run() -> Result<(), String> {
                         .filter(|(range, _)| range.contains(&(number + 1)))
                         .fold(0, |buttons, (_, held)| buttons | held);
                     scripted.set_buttons(held);
+                    scripted.set_touch(
+                        touch_script
+                            .iter()
+                            .rev()
+                            .find(|(range, _)| range.contains(&(number + 1)))
+                            .map(|(_, point)| *point),
+                    );
                     let Some(directory) = &directory else {
                         return;
                     };
-                    if !number.is_multiple_of(30) && number != max_frames {
+                    if number != max_frames
+                        && (screenshot_every == 0 || !number.is_multiple_of(screenshot_every))
+                    {
                         return;
                     }
                     let mut pixels = frame.top.clone();
@@ -252,12 +271,16 @@ fn inspect(path: &Path) -> Result<(), String> {
 fn parse_input_script(spec: &str) -> Result<Vec<(std::ops::RangeInclusive<u64>, u32)>, String> {
     use gen5::nds::input;
     spec.split(',')
+        .filter(|entry| !entry.trim().is_empty())
         .map(|entry| {
             let invalid = || format!("invalid GEN5_INPUT entry '{entry}'");
             let (frames, buttons) = entry.split_once(':').ok_or_else(invalid)?;
             let (first, last) = frames.split_once('-').unwrap_or((frames, frames));
             let first = first.trim().parse::<u64>().map_err(|_| invalid())?;
             let last = last.trim().parse::<u64>().map_err(|_| invalid())?;
+            if first == 0 || last < first {
+                return Err(invalid());
+            }
             let mut held = 0;
             for name in buttons.split('+') {
                 held |= match name.trim().to_ascii_lowercase().as_str() {
@@ -279,6 +302,59 @@ fn parse_input_script(spec: &str) -> Result<Vec<(std::ops::RangeInclusive<u64>, 
             Ok((first..=last, held))
         })
         .collect()
+}
+
+/// `first-last:x:y,...`; coordinates are pixels on the 256 x 192 touch screen.
+fn parse_touch_script(
+    spec: &str,
+) -> Result<Vec<(std::ops::RangeInclusive<u64>, (u8, u8))>, String> {
+    spec.split(',')
+        .filter(|entry| !entry.trim().is_empty())
+        .map(|entry| {
+            let invalid = || format!("invalid GEN5_TOUCH entry '{entry}'");
+            let mut parts = entry.split(':');
+            let frames = parts.next().ok_or_else(invalid)?;
+            let (first, last) = frames.split_once('-').unwrap_or((frames, frames));
+            let first = first.trim().parse::<u64>().map_err(|_| invalid())?;
+            let last = last.trim().parse::<u64>().map_err(|_| invalid())?;
+            let x = parts
+                .next()
+                .ok_or_else(invalid)?
+                .trim()
+                .parse::<u8>()
+                .map_err(|_| invalid())?;
+            let y = parts
+                .next()
+                .ok_or_else(invalid)?
+                .trim()
+                .parse::<u8>()
+                .map_err(|_| invalid())?;
+            if first == 0 || last < first || y >= 192 || parts.next().is_some() {
+                return Err(invalid());
+            }
+            Ok((first..=last, (x, y)))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    #[test]
+    fn replay_ranges_and_touch_coordinates_are_validated() {
+        assert!(parse_input_script("").unwrap().is_empty());
+        assert!(parse_input_script("20-10:a").is_err());
+        assert!(parse_input_script("0:a").is_err());
+        assert!(parse_input_script("10:unknown").is_err());
+        assert_eq!(
+            parse_touch_script("10-15:255:191").unwrap(),
+            vec![(10..=15, (255, 191))]
+        );
+        for invalid in ["0:0:0", "15-10:0:0", "10:256:0", "10:0:192", "10:0:0:1"] {
+            assert!(parse_touch_script(invalid).is_err(), "{invalid}");
+        }
+    }
 }
 
 fn parse_address(text: &str) -> Result<u32, String> {

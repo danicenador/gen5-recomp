@@ -162,6 +162,14 @@ baseline to frame 2300. Each invocation creates a separate state directory,
 screenshots and report under `.gen5-cache/checkpoints/`. Reaching the requested
 frame is checked automatically; gameplay checkpoints require visual inspection.
 
+`./scripts/white2/replay.ps1 -Inputs scripts/white2/introduction.inputs -Frames 9600`
+continues through character creation into the Aspertia opening scene. It selects
+the boy and uses `AAAAAAA` for the player and rival names. `-ScreenshotEvery`
+sets the screenshot interval (120 frames by default; 0 saves only the last
+frame). `-Touches path` accepts a second input file with `first-last:x:y`
+entries for bottom-screen taps. The equivalent CLI environment variable is
+`GEN5_TOUCH`; `GEN5_SCREEN_EVERY` sets its screenshot interval (default 30).
+
 `build` compiles `recomp/*.c` with gcc in parallel into
 `recomp/build/game.dll`, reusing objects whose sources have not changed.
 `gen5host.c` forwards every `rt_*` hook to callbacks the runtime registers,
