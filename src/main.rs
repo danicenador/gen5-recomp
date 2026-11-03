@@ -82,7 +82,13 @@ fn run() -> Result<(), String> {
                 Path::new(&args[2]),
                 gen5::nds::machine::Options {
                     max_frames,
-                    seconds: 20,
+                    seconds: std::env::var("GEN5_BOOT_SECONDS")
+                        .map(|value| {
+                            value
+                                .parse::<u64>()
+                                .map_err(|_| "invalid GEN5_BOOT_SECONDS".to_owned())
+                        })
+                        .unwrap_or(Ok(20))?,
                     on_frame,
                     input: Some(input),
                 },
