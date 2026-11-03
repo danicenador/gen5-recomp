@@ -934,8 +934,11 @@ impl Machine {
         let mode = self.banks.mode;
         let calls = self.calls;
         let frame = self.io.frame;
-        let _ = writeln!(report, "3D: {} buffer swaps, {} polygons submitted",
-            self.io.geometry.swaps, self.io.geometry.submitted_polygons);
+        let _ = writeln!(
+            report,
+            "3D: {} buffer swaps, {} polygons submitted",
+            self.io.geometry.swaps, self.io.geometry.submitted_polygons
+        );
         let cpu = self.cpu();
         let _ = writeln!(
             report,
@@ -1001,8 +1004,11 @@ impl Machine {
             "running thread (sp 0x{sp:08X}) stack code pointers: {}",
             chain.join(" ")
         );
-        let mut modules: Vec<(u16, u32)> =
-            self.overlays.iter().map(|(&id, (base, _))| (id, *base)).collect();
+        let mut modules: Vec<(u16, u32)> = self
+            .overlays
+            .iter()
+            .map(|(&id, (base, _))| (id, *base))
+            .collect();
         modules.sort_unstable();
         let loaded: Vec<String> = modules
             .into_iter()
@@ -1550,6 +1556,16 @@ pub(super) extern "C" fn host_undefined(cpu: *mut Cpu, address: u32, raw: u32) {
 
 /// Load the game library and run the game from its ARM9 entry point.
 pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
+    // Keep test playthroughs independent of the player's save and firmware.
+    let state_root = std::env::var_os("GEN5_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| cache_root.to_owned());
+    fs::create_dir_all(&state_root).map_err(|error| {
+        format!(
+            "could not create state directory '{}': {error}",
+            state_root.display()
+        )
+    })?;
     let card = Card::open(rom)?;
     let code_dir = cache_root.join("code");
     let manifest_text = fs::read_to_string(code_dir.join("code.json"))
@@ -1643,8 +1659,8 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         backup_block: 0,
         backup_expects_block: false,
         sound_shared_work: 0,
-        backup: Backup::open(cache_root.join("save.bin")),
-        firmware: Firmware::open(cache_root.join("firmware.bin")),
+        backup: Backup::open(state_root.join("save.bin")),
+        firmware: Firmware::open(state_root.join("firmware.bin")),
         arm7_sync_output: 7,
         arm7_init_phase: 0,
         options,

@@ -152,6 +152,16 @@ directory it also saves both screens as PNG every 30 frames.
 `GEN5_INPUT=first-last:button+button,...` holds buttons over frame ranges,
 for example `GEN5_INPUT=1300-1305:start,1500-1506:start`.
 
+For isolated playthroughs, set `GEN5_STATE_DIR` to a separate directory; both
+`save.bin` and `firmware.bin` will be read and written there, while imported
+code and assets stay in the original cache. `GEN5_BOOT_SECONDS` changes the
+headless watchdog (default 20 seconds; 0 disables it).
+
+From PowerShell, `./scripts/white2/replay.ps1` replays the fresh-game Juniper
+baseline to frame 2300. Each invocation creates a separate state directory,
+screenshots and report under `.gen5-cache/checkpoints/`. Reaching the requested
+frame is checked automatically; gameplay checkpoints require visual inspection.
+
 `build` compiles `recomp/*.c` with gcc in parallel into
 `recomp/build/game.dll`, reusing objects whose sources have not changed.
 `gen5host.c` forwards every `rt_*` hook to callbacks the runtime registers,
