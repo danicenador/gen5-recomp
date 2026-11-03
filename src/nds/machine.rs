@@ -129,6 +129,11 @@ pub struct Options {
     pub seconds: u64,
     /// Called with each frame at the start of vertical blank.
     pub on_frame: Option<FrameSink>,
+    /// Render every Nth frame, plus the final frame; 0 renders only the final frame.
+    /// Display capture still runs every frame because the game can read its output.
+    pub render_every: u64,
+    /// Headless input scheduling, independent of screenshot rendering.
+    pub on_vblank: Option<Box<dyn FnMut(u64) + Send>>,
     /// Buttons and touch screen, read once per frame.
     pub input: Option<Arc<Input>>,
 }
@@ -365,7 +370,13 @@ impl Machine {
             self.write16(BUTTON_XY, u32::from(button_xy));
         }
         gpu2d::capture(&mut self.io, &mut self.memory);
-        if let Some(on_frame) = &mut self.options.on_frame {
+        if let Some(on_vblank) = &mut self.options.on_vblank {
+            on_vblank(self.presented);
+        }
+        let render = self.presented == self.options.max_frames
+            || self.options.render_every != 0
+                && self.presented.is_multiple_of(self.options.render_every);
+        if render && let Some(on_frame) = &mut self.options.on_frame {
             let frame = gpu2d::render(&self.io, &self.memory);
             on_frame(self.presented, &frame);
         }
@@ -1743,9 +1754,7 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         // SAFETY: the machine is leaked, so the pointer stays valid; the
         // racy read is accepted for a diagnostic snapshot before exiting.
         let machine = unsafe { &mut *(watched as *mut Machine) };
-        machine.stop(&format!(
-            "wall-clock limit of {seconds}s (likely a loop in recompiled code that never calls the runtime)"
-        ));
+        machine.stop(&format!("wall-clock limit of {seconds}s"));
     });
     let cpu_address = cpu as usize;
     super::threads::run_boot(move || {
