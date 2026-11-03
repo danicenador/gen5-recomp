@@ -166,8 +166,24 @@ The `nds` module provides:
   regions, extended palettes and texture slots.
 - `gpu2d`: both 2D engines, rendered once per frame at vblank: text,
   affine, extended and bitmap backgrounds, sprites, windows, blending and
-  master brightness. The 3D engine is not emulated: its layer is not drawn,
-  and its status always reads idle with an empty command FIFO.
+  master brightness. Engine A's BG0 can composite the 3D layer, including
+  its alpha, scrolling, window masks and priority.
+- `gpu3d`: a software geometry engine and rasterizer. Packed FIFO commands,
+  direct command ports and geometry FIFO DMA feed the matrix stacks,
+  lighting, vertex lists and frame swaps. The rasterizer clips polygons,
+  interpolates colors and texture coordinates with perspective correction,
+  samples all seven texture formats from mapped VRAM (including compressed
+  4x4 textures), and applies depth tests and alpha blending. Matrix and
+  geometry-test results are readable by the game. Commands run synchronously
+  except buffer swaps, which wait for vblank; FIFO timing is approximate.
+  Fog, edge marking, antialiasing, wireframe, shadow polygons, rear-plane
+  bitmaps and automatic translucent Y sorting remain
+  unsupported. Lighting and depth are functional approximations rather than
+  hardware-exact arithmetic.
+- `gpu2d::capture`: frame-based display capture into LCDC VRAM, from engine A,
+  the 3D output, another VRAM bank, or a blend of both sources. Captures wrap
+  within the destination bank and finish without a window or screenshot sink.
+  Main-memory display FIFO capture is not implemented.
 - `input`: buttons and touch screen, shared between the window and the
   machine.
 - `io`: I/O registers. Display timing advances when the game polls it, and
@@ -214,9 +230,17 @@ running thread's call chain and every parked thread. `GEN5_DUMP` adds memory
 dumps. Every generated function checks on return that it left `sp` as it
 found it; `GEN5_CHECK_SP=1` stops on the first one that did not.
 
-White 2 now boots, plays its whole opening, shows the title screen and
-opens the main menu (New Game, Mystery Gift, ...). The 3D layer (the title's
-Kyurem) is missing, and there is no sound.
+White 2 boots, plays its opening, shows the title screen, opens the main
+menu (New Game, Mystery Gift, ...) and starts Professor Juniper's New Game
+introduction. The title screen now renders Kyurem on its lower screen through
+the 3D engine and display capture. Sound is still acknowledged without playback.
+
+The 3D path has 16 focused regression tests covering command decoding, matrix
+stacks, vblank swaps, lighting, texture sampling, perspective interpolation,
+clipping, strip winding, depth, blending and display capture. A White 2 headless
+run with `GEN5_INPUT=1300-1305:start` renders Kyurem at frame 1600. Adding
+`1500-1506:start,1650-1656:a,1900-1906:a,2100-2106:a` reaches Juniper's dialogue
+at frame 2300. These are visual smoke checks, not full-game compatibility tests.
 
 ## BW2 map preview
 
@@ -298,8 +322,9 @@ The steps below come from the hand-written field prototype. The plan from here
 is recompilation: export the code (done), disassembly and function discovery
 (done), the code generator (done), a first runtime and the ARM7 services used
 at startup (done), and 2D display output with a playable window (done; White
-2 reaches its main menu). Next are starting a new game, the 3D engine and
-sound.
+2 reaches its New Game introduction). The initial 3D renderer and display
+capture now show the title's Kyurem. Next are progressing New Game into the
+playable field, filling the remaining graphics gaps, and sound.
 
 1. ROM explorer and validated import cache.
 2. Decode and render a multi-cell BW2 map with original model textures.

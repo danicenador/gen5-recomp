@@ -55,6 +55,7 @@ pub struct Access {
 }
 
 pub struct Io {
+    pub geometry: super::gpu3d::Geometry,
     regs: Vec<u8>,
     pub line: u32,
     pub frame: u64,
@@ -104,6 +105,7 @@ impl Timer {
 impl Io {
     pub fn new() -> Self {
         let mut io = Self {
+            geometry: super::gpu3d::Geometry::default(),
             regs: vec![0; IO_SIZE],
             line: 0,
             frame: 0,
@@ -178,6 +180,7 @@ impl Io {
         self.set16(DISPSTAT, status);
         self.set16(VCOUNT, self.line as u16);
         if previous < VISIBLE_LINES && self.line >= VISIBLE_LINES {
+            self.geometry.vblank();
             self.frame += 1;
             if status & 0x08 != 0 {
                 self.raise(IRQ_VBLANK);
@@ -220,6 +223,9 @@ impl Io {
     pub fn read(&mut self, address: u32, size: u32) -> u32 {
         let aligned = address & !(size - 1);
         self.touched.entry(aligned).or_default().reads += 1;
+        if let Some(value) = self.geometry.read(aligned) {
+            return (value >> (8 * (address & 3))) & (u32::MAX >> (32 - 8 * size));
+        }
         match aligned {
             // Polling the display status lets time move forward.
             DISPSTAT | VCOUNT => {
@@ -230,10 +236,9 @@ impl Io {
                 self.update_fifo_status();
                 return value;
             }
-            // The geometry engine is not emulated: it always reads idle,
-            // with an empty command FIFO and the stacks at level 0.
+            // Commands execute synchronously; report the real matrix stacks.
             _ if (GXSTAT..GXSTAT + 4).contains(&aligned) => {
-                let value = (self.get32(GXSTAT) & 0xC000_0000) | (1 << 26) | (1 << 25);
+                let value = (self.get32(GXSTAT) & 0xC000_0000) | self.geometry.status();
                 return (value >> (8 * (address - GXSTAT))) & (u32::MAX >> (32 - 8 * size));
             }
             _ if (TIMER_BASE..TIMER_BASE + 16).contains(&aligned) => {
@@ -257,6 +262,13 @@ impl Io {
     pub fn write(&mut self, address: u32, size: u32, value: u32) -> Option<Effect> {
         let aligned = address & !(size - 1);
         self.touched.entry(aligned).or_default().writes += 1;
+        if (0x0400_0400..=0x0400_05c8).contains(&aligned) && size == 4 {
+            self.geometry.write(aligned, value);
+            return None;
+        }
+        if aligned == GXSTAT && value & (1 << 15) != 0 {
+            self.geometry.reset_stack_error();
+        }
         if aligned == IF || aligned == IF + 2 && size == 2 {
             // Writing 1 acknowledges an interrupt.
             let shift = (aligned - IF) * 8;
@@ -324,8 +336,9 @@ impl Io {
         } else if (DMA_BASE..DMA_BASE + 48).contains(&aligned) {
             let channel = ((aligned - DMA_BASE) / 12) as usize;
             let control = self.get16(DMA_BASE + 12 * channel as u32 + 10);
-            // Enabled with start timing "immediately".
-            if control & 0x8000 != 0 && (control >> 11) & 7 == 0 {
+            // Immediate or geometry FIFO DMA. The synchronous geometry
+            // engine can consume the entire transfer without FIFO stalls.
+            if control & 0x8000 != 0 && matches!((control >> 11) & 7, 0 | 7) {
                 return Some(Effect::Dma(channel));
             }
         }
