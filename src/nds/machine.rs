@@ -364,6 +364,7 @@ impl Machine {
             self.io.set16(io::KEYINPUT, keys);
             self.write16(BUTTON_XY, u32::from(button_xy));
         }
+        gpu2d::capture(&mut self.io, &mut self.memory);
         if let Some(on_frame) = &mut self.options.on_frame {
             let frame = gpu2d::render(&self.io, &self.memory);
             on_frame(self.presented, &frame);
@@ -933,6 +934,8 @@ impl Machine {
         let mode = self.banks.mode;
         let calls = self.calls;
         let frame = self.io.frame;
+        let _ = writeln!(report, "3D: {} buffer swaps, {} polygons submitted",
+            self.io.geometry.swaps, self.io.geometry.submitted_polygons);
         let cpu = self.cpu();
         let _ = writeln!(
             report,

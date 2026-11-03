@@ -1,8 +1,8 @@
 //! The two 2D graphics engines. Each frame is rendered at the start of
 //! vertical blank from the registers, palettes, OAM and VRAM as they are
 //! then; mid-frame register changes (scroll effects from HBlank DMA) are not
-//! seen. The 3D layer (engine A's BG0 in 3D mode) is not rendered yet and
-//! shows as transparent. Behaviour per GBATEK.
+//! seen. Engine A's BG0 can use the geometry engine's rendered 3D layer.
+//! Behaviour per GBATEK.
 
 use super::io::Io;
 use super::memory::Memory;
@@ -33,11 +33,22 @@ impl Frame {
 
 pub fn render(io: &Io, memory: &Memory) -> Frame {
     let power = io.get16(POWCNT1);
+    let three_d = if power & (1 << 3) != 0 {
+        io.geometry.render(io, &memory.vram)
+    } else {
+        vec![super::gpu3d::Pixel::default(); WIDTH * HEIGHT]
+    };
     let engine = |b: bool, bit: u16| {
         if power & bit == 0 {
             return vec![0; WIDTH * HEIGHT * 4];
         }
-        Engine { io, memory, b }.render()
+        Engine {
+            io,
+            memory,
+            b,
+            three_d: &three_d,
+        }
+        .render()
     };
     let a = engine(false, 1 << 1);
     let b = engine(true, 1 << 9);
@@ -47,6 +58,95 @@ pub fn render(io: &Io, memory: &Memory) -> Frame {
     } else {
         Frame { top: b, bottom: a }
     }
+}
+
+/// Complete one frame's display capture even when no screen sink is attached.
+/// Capture observes engine A before master brightness and writes physical
+/// LCDC banks; software can remap the result into either engine next frame.
+pub fn capture(io: &mut Io, memory: &mut Memory) {
+    const CAPTURE: u32 = 0x0400_0064;
+    let control = io.get32(CAPTURE);
+    if control & 0x8000_0000 == 0 {
+        return;
+    }
+    let bank = ((control >> 16) & 3) as usize;
+    let bank_control = memory.vram.control[bank];
+    if bank_control & 0x87 != 0x80 {
+        io.set32(CAPTURE, control & !0x8000_0000);
+        return;
+    }
+    let (width, height) =
+        [(128, 128), (256, 64), (256, 128), (256, 192)][((control >> 20) & 3) as usize];
+    let mode = (control >> 29) & 3;
+    let three_d = if mode != 1 {
+        io.geometry.render(io, &memory.vram)
+    } else {
+        Vec::new()
+    };
+    let mut source_a = vec![0u16; WIDTH * HEIGHT];
+    if mode != 1 {
+        if control & (1 << 24) != 0 {
+            for (out, p) in source_a.iter_mut().zip(&three_d) {
+                *out = p.color | if p.alpha != 0 { 0x8000 } else { 0 };
+            }
+        } else {
+            let engine = Engine {
+                io,
+                memory,
+                b: false,
+                three_d: &three_d,
+            };
+            if io.get32(0x0400_0000) & 0x80 != 0 {
+                source_a.fill(0xffff);
+            } else {
+                for (line, row) in source_a.chunks_mut(WIDTH).enumerate() {
+                    engine.render_line(io.get32(0x0400_0000), line, row);
+                    for c in row {
+                        *c |= 0x8000;
+                    }
+                }
+            }
+        }
+    }
+    let dispcnt = io.get32(0x0400_0000);
+    let read_bank = ((dispcnt >> 18) & 3) as usize * 0x20000;
+    let read_offset = if (dispcnt >> 16) & 3 == 2 {
+        0
+    } else {
+        ((control >> 26) & 3) as usize * 0x8000
+    };
+    let write_offset = ((control >> 18) & 3) as usize * 0x8000;
+    let eva = (control & 31).min(16);
+    let evb = ((control >> 8) & 31).min(16);
+    let mut output = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            let a = source_a[y * WIDTH + x];
+            // Main-memory display FIFO capture is not implemented yet.
+            let b = if control & (1 << 25) == 0 {
+                memory.vram.read16(
+                    Region::Lcdc,
+                    read_bank + ((read_offset + (y * width + x) * 2) & 0x1ffff),
+                )
+            } else {
+                0
+            };
+            output.push(match mode {
+                0 => a,
+                1 => b,
+                _ => {
+                    let fa = if a & 0x8000 != 0 { eva } else { 0 };
+                    let fb = if b & 0x8000 != 0 { evb } else { 0 };
+                    mix(a, b, fa, fb) | if fa != 0 || fb != 0 { 0x8000 } else { 0 }
+                }
+            });
+        }
+    }
+    for (i, color) in output.into_iter().enumerate() {
+        let at = bank * 0x20000 + ((write_offset + i * 2) & 0x1ffff);
+        memory.vram.banks[at..at + 2].copy_from_slice(&color.to_le_bytes());
+    }
+    io.set32(CAPTURE, control & !0x8000_0000);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,6 +171,7 @@ struct Layer {
     color: u16,
     layer: usize,
     semi: bool,
+    three_d_alpha: Option<u8>,
 }
 
 struct Engine<'a> {
@@ -78,6 +179,7 @@ struct Engine<'a> {
     memory: &'a Memory,
     /// Engine B (sub) rather than A (main).
     b: bool,
+    three_d: &'a [super::gpu3d::Pixel],
 }
 
 impl Engine<'_> {
@@ -159,8 +261,8 @@ impl Engine<'_> {
         let factor = u32::from(bright & 0x1F).min(16);
         let mut rgba = Vec::with_capacity(WIDTH * HEIGHT * 4);
         for color in colors {
-            let mut channels = [color & 0x1F, (color >> 5) & 0x1F, (color >> 10) & 0x1F]
-                .map(u32::from);
+            let mut channels =
+                [color & 0x1F, (color >> 5) & 0x1F, (color >> 10) & 0x1F].map(u32::from);
             match bright >> 14 {
                 1 => channels = channels.map(|c| c + (31 - c) * factor / 16),
                 2 => channels = channels.map(|c| c - c * factor / 16),
@@ -208,7 +310,19 @@ impl Engine<'_> {
                     let kind = self.bg_kind(dispcnt, index);
                     self.affine_line(dispcnt, index, control, kind, line, &mut bgs[index]);
                 }
-                BgKind::ThreeD | BgKind::Off => enabled[index] = false,
+                BgKind::ThreeD => {
+                    let scroll = usize::from(self.reg16(0x10) & 0x1ff);
+                    for (x, color) in bgs[index].iter_mut().enumerate() {
+                        let sx = (x + scroll) & 0x1ff;
+                        if sx < WIDTH {
+                            let pixel = self.three_d[line * WIDTH + sx];
+                            if pixel.alpha != 0 {
+                                *color = Some(pixel.color);
+                            }
+                        }
+                    }
+                }
+                BgKind::Off => enabled[index] = false,
             }
         }
         let mut objs: [Option<ObjPixel>; WIDTH] = [None; WIDTH];
@@ -244,6 +358,7 @@ impl Engine<'_> {
                         color: obj.color,
                         layer: LAYER_OBJ,
                         semi: obj.semi,
+                        three_d_alpha: None,
                     });
                 }
                 for index in 0..4 {
@@ -256,6 +371,14 @@ impl Engine<'_> {
                             color,
                             layer: index,
                             semi: false,
+                            three_d_alpha: if index == 0
+                                && self.bg_kind(dispcnt, 0) == BgKind::ThreeD
+                            {
+                                let sx = (x + usize::from(self.reg16(0x10) & 0x1ff)) & 0x1ff;
+                                Some(self.three_d[line * WIDTH + sx].alpha)
+                            } else {
+                                None
+                            },
                         });
                     }
                 }
@@ -264,20 +387,35 @@ impl Engine<'_> {
                 color: backdrop,
                 layer: LAYER_BACKDROP,
                 semi: false,
+                three_d_alpha: None,
             };
             let first = top[0].unwrap_or(backdrop_layer);
             let second = top[1].unwrap_or(backdrop_layer);
             let is_second = blend & (0x100 << second.layer) != 0;
             let is_first = blend & (1 << first.layer) != 0;
-            out[x] = if first.semi && is_second && top[0].is_some() {
+            out[x] = if let Some(alpha) = first.three_d_alpha
+                && alpha < 31
+                && is_second
+                && mask & 0x20 != 0
+            {
+                let a = u32::from(alpha) + 1;
+                let c1 = first.color;
+                let c2 = second.color;
+                let mut result = 0;
+                for shift in [0, 5, 10] {
+                    let c = (u32::from((c1 >> shift) & 31) * a
+                        + u32::from((c2 >> shift) & 31) * (32 - a))
+                        / 32;
+                    result |= (c as u16) << shift;
+                }
+                result
+            } else if first.semi && is_second && top[0].is_some() {
                 mix(first.color, second.color, eva, evb)
             } else if mask & 0x20 == 0 || !is_first {
                 first.color
             } else {
                 match (blend >> 6) & 3 {
-                    1 if is_second && top[0].is_some() => {
-                        mix(first.color, second.color, eva, evb)
-                    }
+                    1 if is_second && top[0].is_some() => mix(first.color, second.color, eva, evb),
                     2 => map_channels(first.color, |c| c + (31 - c) * evy / 16),
                     3 => map_channels(first.color, |c| c - c * evy / 16),
                     _ => first.color,
@@ -363,7 +501,8 @@ impl Engine<'_> {
         for (x, pixel) in out.iter_mut().enumerate() {
             let sx = (x + hofs) % width;
             let block = sx / 256 + if width == 512 { (y / 256) * 2 } else { y / 256 };
-            let entry_at = screen_base + block * 0x800 + ((y % 256) / 8) * 64 + ((sx % 256) / 8) * 2;
+            let entry_at =
+                screen_base + block * 0x800 + ((y % 256) / 8) * 64 + ((sx % 256) / 8) * 2;
             let entry = vram.read16(region, entry_at);
             let tile = usize::from(entry & 0x3FF);
             let mut tx = sx % 8;
@@ -443,7 +582,8 @@ impl Engine<'_> {
                 let color = usize::from(vram.read8(region, bitmap_base + py * width + px));
                 (color != 0).then(|| self.palette(color))
             } else if kind == BgKind::Affine {
-                let tile = usize::from(vram.read8(region, screen_base + (py / 8) * (width / 8) + px / 8));
+                let tile =
+                    usize::from(vram.read8(region, screen_base + (py / 8) * (width / 8) + px / 8));
                 let color =
                     usize::from(vram.read8(region, char_base + tile * 64 + (py % 8) * 8 + px % 8));
                 (color != 0).then(|| self.palette(color))

@@ -18,6 +18,7 @@ pub mod card;
 pub mod cpu;
 pub mod firmware;
 pub mod gpu2d;
+pub mod gpu3d;
 pub mod input;
 mod interpreter;
 pub mod io;
