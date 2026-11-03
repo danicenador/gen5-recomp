@@ -46,9 +46,17 @@ fn run() -> Result<(), String> {
                 .unwrap_or(60);
             // GEN5_INPUT=first-last:button+button,... holds buttons over frame
             // ranges, for scripted runs.
-            let script = std::env::var("GEN5_INPUT")
+            let mut script = std::env::var("GEN5_INPUT")
                 .map(|spec| parse_input_script(&spec))
                 .unwrap_or(Ok(Vec::new()))?;
+            let input_file = std::env::var_os("GEN5_INPUT_FILE").map(PathBuf::from);
+            let mut input_text = String::new();
+            if let Some(path) = &input_file {
+                input_text = std::fs::read_to_string(path).map_err(|error| {
+                    format!("could not read input script '{}': {error}", path.display())
+                })?;
+                script = parse_input_file(&input_text)?;
+            }
             let touch_script = std::env::var("GEN5_TOUCH")
                 .map(|spec| parse_touch_script(&spec))
                 .unwrap_or(Ok(Vec::new()))?;
@@ -60,42 +68,87 @@ fn run() -> Result<(), String> {
                 })
                 .unwrap_or(Ok(30))?;
             let input = std::sync::Arc::new(gen5::nds::input::Input::default());
+            input.set_buttons(
+                script
+                    .iter()
+                    .filter(|(range, _)| range.contains(&1))
+                    .fold(0, |buttons, (_, held)| buttons | held),
+            );
+            input.set_touch(
+                touch_script
+                    .iter()
+                    .rev()
+                    .find(|(range, _)| range.contains(&1))
+                    .map(|(_, point)| *point),
+            );
             let scripted = input.clone();
-            // Optionally save both screens every 30 frames and at the end.
-            let directory = args.get(4).map(std::path::PathBuf::from);
-            let on_frame = Some(
-                Box::new(move |number: u64, frame: &gen5::nds::gpu2d::Frame| {
-                    let held = script
-                        .iter()
-                        .filter(|(range, _)| range.contains(&(number + 1)))
-                        .fold(0, |buttons, (_, held)| buttons | held);
-                    scripted.set_buttons(held);
-                    scripted.set_touch(
-                        touch_script
-                            .iter()
-                            .rev()
-                            .find(|(range, _)| range.contains(&(number + 1)))
-                            .map(|(_, point)| *point),
-                    );
-                    let Some(directory) = &directory else {
-                        return;
-                    };
-                    if number != max_frames
-                        && (screenshot_every == 0 || !number.is_multiple_of(screenshot_every))
-                    {
-                        return;
+            let fps = std::env::var("GEN5_BOOT_FPS")
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| "invalid GEN5_BOOT_FPS".to_owned())
+                })
+                .unwrap_or(Ok(0))?;
+            let interval =
+                (fps != 0).then(|| std::time::Duration::from_secs_f64(1.0 / f64::from(fps)));
+            let mut next = std::time::Instant::now();
+            let on_vblank = Some(Box::new(move |number: u64| {
+                if let Some(interval) = interval {
+                    next += interval;
+                    let now = std::time::Instant::now();
+                    if next > now {
+                        std::thread::sleep(next - now);
+                    } else if now - next > interval * 6 {
+                        next = now;
                     }
+                }
+                // Reload at a frame boundary so a long diagnostic playthrough
+                // can be extended without restarting the introduction.
+                if number.is_multiple_of(60)
+                    && let Some(path) = &input_file
+                {
+                    match std::fs::read_to_string(path) {
+                        Ok(text) if text != input_text => {
+                            match parse_input_file(&text) {
+                                Ok(updated) => {
+                                    script = updated;
+                                    eprintln!("input script reloaded at frame {number}");
+                                }
+                                Err(error) => eprintln!("{error}; keeping previous inputs"),
+                            }
+                            input_text = text;
+                        }
+                        Err(error) => eprintln!("could not reload input script: {error}"),
+                        _ => {}
+                    }
+                }
+                let held = script
+                    .iter()
+                    .filter(|(range, _)| range.contains(&(number + 1)))
+                    .fold(0, |buttons, (_, held)| buttons | held);
+                scripted.set_buttons(held);
+                scripted.set_touch(
+                    touch_script
+                        .iter()
+                        .rev()
+                        .find(|(range, _)| range.contains(&(number + 1)))
+                        .map(|(_, point)| *point),
+                );
+            }) as Box<dyn FnMut(u64) + Send>);
+            let directory = args.get(4).map(std::path::PathBuf::from);
+            let on_frame = directory.map(|directory| {
+                Box::new(move |number: u64, frame: &gen5::nds::gpu2d::Frame| {
                     let mut pixels = frame.top.clone();
                     pixels.extend_from_slice(&frame.bottom);
                     let image = gen5::nds::gpu2d::png(256, 384, &pixels);
                     let path = directory.join(format!("frame-{number:05}.png"));
-                    if let Err(error) = std::fs::create_dir_all(directory)
+                    if let Err(error) = std::fs::create_dir_all(&directory)
                         .and_then(|()| std::fs::write(&path, image))
                     {
                         eprintln!("could not write {}: {error}", path.display());
                     }
-                }) as gen5::nds::machine::FrameSink,
-            );
+                }) as gen5::nds::machine::FrameSink
+            });
             gen5::nds::machine::boot(
                 Path::new(&args[1]),
                 Path::new(&args[2]),
@@ -109,6 +162,8 @@ fn run() -> Result<(), String> {
                         })
                         .unwrap_or(Ok(20))?,
                     on_frame,
+                    render_every: screenshot_every,
+                    on_vblank,
                     input: Some(input),
                 },
             )
@@ -268,6 +323,15 @@ fn inspect(path: &Path) -> Result<(), String> {
 }
 
 /// `first-last:button+button,...` into frame ranges and held buttons.
+fn parse_input_file(text: &str) -> Result<Vec<(std::ops::RangeInclusive<u64>, u32)>, String> {
+    let entries: Vec<_> = text
+        .lines()
+        .map(|line| line.split('#').next().unwrap().trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    parse_input_script(&entries.join(","))
+}
+
 fn parse_input_script(spec: &str) -> Result<Vec<(std::ops::RangeInclusive<u64>, u32)>, String> {
     use gen5::nds::input;
     spec.split(',')
@@ -343,6 +407,10 @@ mod replay_tests {
 
     #[test]
     fn replay_ranges_and_touch_coordinates_are_validated() {
+        assert_eq!(
+            parse_input_file("# comment\n10-15:a # hold\n\n").unwrap(),
+            vec![(10..=15, gen5::nds::input::A)]
+        );
         assert!(parse_input_script("").unwrap().is_empty());
         assert!(parse_input_script("20-10:a").is_err());
         assert!(parse_input_script("0:a").is_err());

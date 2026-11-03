@@ -41,6 +41,8 @@ pub fn play_recompiled(cache_root: &Path, rom: &Path) -> Result<()> {
         max_frames: u64::MAX,
         seconds: 0,
         on_frame: Some(on_frame),
+        render_every: 1,
+        on_vblank: None,
         input: Some(input.clone()),
     };
     let (cache_root, rom): (PathBuf, PathBuf) = (cache_root.into(), rom.into());

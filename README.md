@@ -164,11 +164,19 @@ frame is checked automatically; gameplay checkpoints require visual inspection.
 
 `./scripts/white2/replay.ps1 -Inputs scripts/white2/introduction.inputs -Frames 9600`
 continues through character creation into the Aspertia opening scene. It selects
-the boy and uses `AAAAAAA` for the player and rival names. `-ScreenshotEvery`
+the boy and uses `AAAAAAA` for the player and `HughAAA` for the rival. `-ScreenshotEvery`
 sets the screenshot interval (120 frames by default; 0 saves only the last
 frame). `-Touches path` accepts a second input file with `first-last:x:y`
 entries for bottom-screen taps. The equivalent CLI environment variable is
 `GEN5_TOUCH`; `GEN5_SCREEN_EVERY` sets its screenshot interval (default 30).
+
+Headless input runs every frame independently of screenshot rendering; display
+capture also continues every frame. `GEN5_INPUT_FILE` selects a button script
+with one entry per line and `#` comments, replacing `GEN5_INPUT`. It reloads
+every 60 frames so a diagnostic run can be extended in progress. The replay
+helper copies its input file into the run directory before starting.
+`GEN5_BOOT_FPS` optionally caps headless frame progression for live diagnosis
+(0, the default, runs as fast as possible); windowed play keeps its normal pacing.
 
 `build` compiles `recomp/*.c` with gcc in parallel into
 `recomp/build/game.dll`, reusing objects whose sources have not changed.

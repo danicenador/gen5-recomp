@@ -3,7 +3,7 @@ param(
     [UInt64]$Frames = 2300,
     [string]$Cache = '.gen5-cache/pokemon-white-2/95AB5437',
     [string]$Rom = 'roms/Pokemon White Version 2.nds',
-    [UInt64]$Seconds = 180,
+    [UInt64]$Seconds = 600,
     [string]$Touches,
     [UInt64]$ScreenshotEvery = 120
 )
@@ -11,12 +11,13 @@ $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '../..')
 $run = Join-Path '.gen5-cache/checkpoints' ([guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $run | Out-Null
-$names = 'GEN5_INPUT', 'GEN5_TOUCH', 'GEN5_STATE_DIR', 'GEN5_BOOT_SECONDS', 'GEN5_SCREEN_EVERY'
+$names = 'GEN5_INPUT', 'GEN5_INPUT_FILE', 'GEN5_TOUCH', 'GEN5_STATE_DIR', 'GEN5_BOOT_SECONDS', 'GEN5_SCREEN_EVERY'
 $previous = @{}
 foreach ($name in $names) { $previous[$name] = [Environment]::GetEnvironmentVariable($name) }
 try {
-    $entries = Get-Content -LiteralPath $Inputs | ForEach-Object { ($_ -split '#', 2)[0].Trim() } | Where-Object { $_ }
-    $env:GEN5_INPUT = $entries -join ','
+    Copy-Item -LiteralPath $Inputs -Destination (Join-Path $run 'replay.inputs')
+    $env:GEN5_INPUT = ''
+    $env:GEN5_INPUT_FILE = [IO.Path]::GetFullPath((Join-Path $run 'replay.inputs'))
     $env:GEN5_TOUCH = ''
     if ($Touches) {
         $env:GEN5_TOUCH = (Get-Content -LiteralPath $Touches | ForEach-Object { ($_ -split '#', 2)[0].Trim() } | Where-Object { $_ }) -join ','
