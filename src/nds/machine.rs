@@ -374,6 +374,15 @@ impl Machine {
         }
         gpu2d::capture(&mut self.io, &mut self.memory);
         self.advance_sound();
+        // GEN5_STOP_FILE: stop with a report once this file exists, to see
+        // what a long-running session is doing.
+        if self.presented.is_multiple_of(60)
+            && let Some(path) = std::env::var_os("GEN5_STOP_FILE")
+            && Path::new(&path).exists()
+        {
+            let _ = fs::remove_file(&path);
+            self.stop("stop file found");
+        }
         if let Some(on_vblank) = &mut self.options.on_vblank {
             on_vblank(self.presented);
         }

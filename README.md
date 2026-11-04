@@ -177,6 +177,10 @@ every 60 frames so a diagnostic run can be extended in progress. The replay
 helper copies its input file into the run directory before starting.
 `GEN5_BOOT_FPS` optionally caps headless frame progression for live diagnosis
 (0, the default, runs as fast as possible); windowed play keeps its normal pacing.
+`GEN5_AUDIO_WAV=path` records a headless run's sound as a 16-bit stereo WAV
+at the DS mixer rate. `GEN5_SOUND=off` acknowledges sound commands without
+playing them, to rule sound in or out when diagnosing. `GEN5_STOP_FILE=path`
+ends a run with the full report as soon as that file exists.
 
 `./scripts/white2/replay.ps1 -Inputs scripts/white2/field.inputs -Frames 52000`
 replays the first controllable-field checkpoint from a fresh save: finish the
@@ -198,8 +202,8 @@ in the printed run directory (the helper's default 120-frame interval):
 
 These scripts use the locally imported English White 2 ROM with CRC `95AB5437`
 and its generated game library. They preserve the normal in-game story and map
-transitions; no memory edits or event skips are used. Audio is still silent,
-and some geometry/shadow and lower-screen rendering artifacts remain.
+transitions; no memory edits or event skips are used. Some geometry/shadow
+rendering artifacts remain.
 
 `build` compiles `recomp/*.c` with gcc in parallel into
 `recomp/build/game.dll`, reusing objects whose sources have not changed.
@@ -222,12 +226,15 @@ The `nds` module provides:
   lighting, vertex lists and frame swaps. The rasterizer clips polygons,
   interpolates colors and texture coordinates with perspective correction,
   samples all seven texture formats from mapped VRAM (including compressed
-  4x4 textures), and applies depth tests and alpha blending. Matrix and
+  4x4 textures), and applies depth tests and alpha blending. Like the
+  hardware, polygon RAM (2048 polygons, 6144 vertices) only keeps polygons
+  that survive frustum, far-plane and facing tests, so wide scenes such as
+  the opening flyover keep their distant map blocks; polygons are drawn in
+  the hardware's Y order. Matrix and
   geometry-test results are readable by the game. Commands run synchronously
   except buffer swaps, which wait for vblank; FIFO timing is approximate.
-  Fog, edge marking, antialiasing, wireframe, shadow polygons, rear-plane
-  bitmaps and automatic translucent Y sorting remain
-  unsupported. Lighting and depth are functional approximations rather than
+  Fog, edge marking, antialiasing, wireframe, shadow polygons and rear-plane
+  bitmaps remain unsupported. Lighting and depth are functional approximations rather than
   hardware-exact arithmetic.
 - `gpu2d::capture`: frame-based display capture into LCDC VRAM, from engine A,
   the 3D output, another VRAM bank, or a blend of both sources. Captures wrap
@@ -263,8 +270,15 @@ over the IPC FIFO, as decoded from the ARM9's callbacks:
   user ID there.
 - Card backup (save memory): identify, read, write, program, verify and
   erase on 512 KiB of FLASH, kept in `save.bin` in the cache.
-- Sound: each command list is acknowledged in the driver's shared work
-  area, so the game does not wait on it, but nothing is played.
+- Sound (`nds::sound`): a port of the NitroSDK's ARM7 sound driver runs the
+  ARM9's command lists: sequences with their instrument banks and wave
+  archives, envelopes, sweeps, LFOs, channel allocation and stealing,
+  locked channels for direct PCM (cries), alarms, the shared work area's
+  player and channel status, and `SND_ReadDriverInfo`. Its 5.2 ms interval
+  and the mixer follow display time. The mixer models the 16 hardware
+  channels (PCM8, PCM16, IMA-ADPCM, square waves and noise) at 32.73 kHz;
+  windowed play sends it to the default output device through `cpal`.
+  Sound capture (reverb) is not emulated.
 - The vblank counter, and the X and Y buttons in shared RAM.
 
 NitroSDK threads run as host threads that take turns. The SDK's
@@ -285,7 +299,7 @@ introduction and character creation. The original game reaches the player's
 bedroom, accepts field movement, runs Mom's opening conversation, and supports
 leaving home, moving through Aspertia and re-entering the house. The title screen
 renders Kyurem on its lower screen through
-the 3D engine and display capture. Sound is still acknowledged without playback.
+the 3D engine and display capture. Music and sound effects play.
 
 The 3D path has 16 focused regression tests covering command decoding, matrix
 stacks, vblank swaps, lighting, texture sampling, perspective interpolation,
