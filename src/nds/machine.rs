@@ -970,8 +970,13 @@ impl Machine {
         let frame = self.io.frame;
         let _ = writeln!(
             report,
-            "3D: {} buffer swaps, {} polygons submitted",
-            self.io.geometry.swaps, self.io.geometry.submitted_polygons
+            "3D: {} buffer swaps, {} polygons submitted (at most {} in one list), peak {} polygons / {} vertices kept, {} lists overflowed",
+            self.io.geometry.swaps,
+            self.io.geometry.submitted_polygons,
+            self.io.geometry.peak_submitted,
+            self.io.geometry.peak_polygons,
+            self.io.geometry.peak_vertices,
+            self.io.geometry.overflowed_lists
         );
         let cpu = self.cpu();
         let _ = writeln!(
