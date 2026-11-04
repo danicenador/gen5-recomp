@@ -21,7 +21,12 @@ const WFC_SLOTS: usize = 0x3_FA00;
 /// Wireless calibration data in the header: CRC, length, then the data.
 const WIFI_CRC: usize = 0x2A;
 const WIFI_LENGTH: usize = 0x138;
-const MAC: [u8; 6] = [0x00, 0x09, 0xBF, 0x12, 0x34, 0x56];
+/// A MAC address in Nintendo's range. Black 2 and White 2 refuse to run
+/// parts of the game on a console whose MAC is all zeros or the well-known
+/// emulator default below, which earlier firmware images used.
+const MAC: [u8; 6] = [0x00, 0x09, 0xBF, 0x4E, 0x2A, 0x71];
+const EMULATOR_MAC: [u8; 6] = [0x00, 0x09, 0xBF, 0x12, 0x34, 0x56];
+const MAC_OFFSET: usize = 0x36;
 
 /// NitroSDK NVRAM PXI commands (SPI flash instructions).
 pub const WRITE_ENABLE: u32 = 0x20;
@@ -62,11 +67,19 @@ fn put16(data: &mut [u8], offset: usize, value: u16) {
 impl Firmware {
     /// Open the firmware file, or build a fresh one if there is none.
     pub fn open(path: PathBuf) -> Self {
-        let data = fs::read(&path)
+        let mut data = fs::read(&path)
             .ok()
             .filter(|data| data.len() == SIZE)
             .unwrap_or_else(fresh);
+        if data[MAC_OFFSET..MAC_OFFSET + 6] == EMULATOR_MAC {
+            set_mac(&mut data, MAC);
+        }
         Self { data, path }
+    }
+
+    /// The console's MAC address, which the ARM7 copies to shared RAM.
+    pub fn mac(&self) -> [u8; 6] {
+        std::array::from_fn(|index| self.data[MAC_OFFSET + index])
     }
 
     /// The current user settings, as the ARM7 copies them to shared RAM.
@@ -114,6 +127,13 @@ impl Firmware {
     }
 }
 
+/// Store `mac` in the wireless calibration block and update its CRC.
+fn set_mac(data: &mut [u8], mac: [u8; 6]) {
+    data[MAC_OFFSET..MAC_OFFSET + 6].copy_from_slice(&mac);
+    let crc = crc16(0, &data[WIFI_CRC + 2..WIFI_CRC + 2 + WIFI_LENGTH]);
+    put16(data, WIFI_CRC, crc);
+}
+
 /// A freshly set up DS: English, no nickname, no Wi-Fi connections.
 fn fresh() -> Vec<u8> {
     let mut data = vec![0xFF; SIZE];
@@ -123,9 +143,7 @@ fn fresh() -> Vec<u8> {
     data[0x1D] = 0xFF;
     put16(&mut data, 0x20, (USER_SETTINGS / 8) as u16);
     put16(&mut data, WIFI_CRC + 2, WIFI_LENGTH as u16);
-    data[0x36..0x3C].copy_from_slice(&MAC);
-    let crc = crc16(0, &data[WIFI_CRC + 2..WIFI_CRC + 2 + WIFI_LENGTH]);
-    put16(&mut data, WIFI_CRC, crc);
+    set_mac(&mut data, MAC);
 
     // Wi-Fi Connection slots: not configured, no user ID yet.
     for slot in 0..3 {
@@ -179,6 +197,22 @@ mod tests {
         assert_eq!(settings[0x64] & 7, 1);
         let slot = &firmware.data[WFC_SLOTS..WFC_SLOTS + 0x100];
         assert_eq!(crc16(0, &slot[..0xFE]), u16::from_le_bytes([slot[0xFE], slot[0xFF]]));
+    }
+
+    #[test]
+    fn emulator_default_mac_is_replaced() {
+        let path = std::env::temp_dir().join("gen5-firmware-mac-test.bin");
+        let mut data = fresh();
+        set_mac(&mut data, EMULATOR_MAC);
+        fs::write(&path, &data).unwrap();
+        let firmware = Firmware::open(path.clone());
+        let _ = fs::remove_file(path);
+        assert_eq!(firmware.mac(), MAC);
+        let stored = u16::from_le_bytes([firmware.data[WIFI_CRC], firmware.data[WIFI_CRC + 1]]);
+        assert_eq!(
+            crc16(0, &firmware.data[WIFI_CRC + 2..WIFI_CRC + 2 + WIFI_LENGTH]),
+            stored
+        );
     }
 
     #[test]

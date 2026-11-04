@@ -224,6 +224,8 @@ const TOUCH_SAMPLE: u32 = 0x027F_FFAA;
 const TP_SAMPLING: u32 = 0;
 /// Where the firmware's user settings are copied at boot.
 const USER_SETTINGS_COPY: u32 = 0x027F_FC80;
+/// Where the ARM7 leaves the console's MAC address.
+const MAC_ADDRESS_COPY: u32 = 0x027F_FCF4;
 const POLL_LIMIT: u64 = 20_000_000;
 const WAIT_LIMIT_FRAMES: u64 = 600;
 
@@ -242,6 +244,11 @@ pub(super) unsafe fn get<'a>(cpu: *mut Cpu) -> &'a mut Machine {
 }
 
 impl Machine {
+    /// The current display frame.
+    pub(super) fn frame(&self) -> u64 {
+        self.io.frame
+    }
+
     fn record(&mut self, event: Event) {
         if matches!(
             event,
@@ -396,7 +403,35 @@ impl Machine {
             if (first..=last).contains(&self.presented) {
                 self.io.geometry.trace_next = true;
             }
-            if let Some(text) = self.io.geometry.traced.take() {
+            if let Some(mut text) = self.io.geometry.traced.take() {
+                // The palettes the kept polygons use, as the rasterizer reads them.
+                let mut palettes = std::collections::BTreeSet::new();
+                for line in text.lines().filter(|line| line.starts_with("kept")) {
+                    let field = |name: &str| {
+                        let at = line.find(name)? + name.len();
+                        u32::from_str_radix(line.get(at..at + 8)?.trim_end_matches(':').trim(), 16)
+                            .ok()
+                    };
+                    if let (Some(texture), Some(palette)) = (field("tex "), field("pal ")) {
+                        palettes.insert(((texture >> 26) & 7, palette));
+                    }
+                }
+                for (format, palette) in palettes {
+                    if format == 0 || format == 7 {
+                        continue;
+                    }
+                    let base = palette as usize * if format == 2 { 8 } else { 16 };
+                    let colors: Vec<String> = (0..16)
+                        .map(|index| {
+                            let color = self.memory.vram.read16(
+                                super::vram::Region::TexturePalette,
+                                base + index * 2,
+                            );
+                            format!("{color:04X}")
+                        })
+                        .collect();
+                    let _ = writeln!(text, "palette {palette:04X} format {format}: {}", colors.join(" "));
+                }
                 let path = if first == last {
                     path.to_owned()
                 } else {
@@ -1784,6 +1819,9 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
     let settings = Memory::main_offset(USER_SETTINGS_COPY);
     machine.memory.main[settings..settings + firmware::USER_SETTINGS_LENGTH]
         .copy_from_slice(machine.firmware.user_settings());
+    // ...and the console's MAC address, which OS_GetMacAddress reads.
+    let mac = Memory::main_offset(MAC_ADDRESS_COPY);
+    machine.memory.main[mac..mac + 6].copy_from_slice(&machine.firmware.mac());
     // Boot medium: card.
     machine.memory.main[Memory::main_offset(0x027F_FC40)] = 1;
     // The firmware records the boot card's chip ID; the SDK compares later

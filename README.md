@@ -185,7 +185,8 @@ line includes the largest polygon list kept and any lists that overflowed
 polygon or vertex RAM. `GEN5_SCREEN_RANGE=first-last:every` adds denser
 screenshots in one stretch of a run. `GEN5_3D_TRACE=frame:path` writes every
 polygon of the 3D list that follows that frame to `path`: whether it was kept
-or culled (and why), its attributes and screen coordinates, plus box tests.
+or culled (and why), its attributes and screen coordinates, plus box tests;
+`first-last:path` writes one `path.frame` file per list in that range.
 
 `./scripts/white2/replay.ps1 -Inputs scripts/white2/field.inputs -Frames 52000`
 replays the first controllable-field checkpoint from a fresh save: finish the
@@ -252,7 +253,9 @@ The `nds` module provides:
   square-root units, and IPCSYNC and the IPC FIFO.
 - `card`: game card reads (`0xB7` data blocks and `0xB8` chip ID) from the
   ROM file, including card-triggered DMA and the transfer-complete
-  interrupt.
+  interrupt. Like a retail card, addresses wrap at the chip size from the
+  header and reads below 0x8000 return data from 0x8000; Black 2 and
+  White 2's anti-piracy code checks both.
 - `cpu`: banked registers, CPSR and SPSR, and exception entry and return.
 - `machine`: boot as the firmware leaves memory, CP15, BIOS calls (waits,
   division, copies, CRC, LZ77 and RLE), and interrupt delivery through the
@@ -260,7 +263,10 @@ The `nds` module provides:
   code is currently in RAM.
 - `interpreter`: runs code with no recompiled function, such as routines the
   game copies to ITCM before running them, or jumps into a function's middle.
-  Calls from it go back to native code.
+  Calls from it go back to native code. Black 2 and White 2 keep some overlay
+  functions encrypted and decrypt them in RAM before calling them; calls to
+  callees that do not decode cleanly go through the runtime, which sees the
+  decrypted code in RAM and interprets it.
 
 The ARM7 is not run. A stand-in answers the shared-RAM boot handshakes and
 the PXI start-up handshake, and serves the ARM7 services the game asks for
@@ -271,8 +277,10 @@ over the IPC FIFO, as decoded from the ARM9's callbacks:
 - RTC: the host's date and time, as BCD in shared RAM.
 - NVRAM (firmware flash): a 256 KiB image of a freshly set up DS (English,
   three empty Wi-Fi Connection slots), kept in `firmware.bin` in the cache.
-  The user settings are also copied to shared RAM at boot. DWC writes its
-  user ID there.
+  The user settings and the console's MAC address are also copied to shared
+  RAM at boot. DWC writes its user ID there. The MAC is in Nintendo's range;
+  Black 2 and White 2 blank the screen on a console whose MAC is all zeros or
+  a common emulator default, so images with that default are updated.
 - Card backup (save memory): identify, read, write, program, verify and
   erase on 512 KiB of FLASH, kept in `save.bin` in the cache.
 - Sound (`nds::sound`): a port of the NitroSDK's ARM7 sound driver runs the
