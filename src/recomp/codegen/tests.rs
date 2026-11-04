@@ -269,3 +269,46 @@ fn unknown_callee_goes_through_runtime() {
     assert_eq!(s["call"], 0x0200_0010);
     assert_eq!(s["r14"], 0x0200_0004);
 }
+
+#[test]
+fn callee_with_decode_problems_goes_through_runtime() {
+    // bl 0x02000010 ; bx lr ; ... ; 0x10: bx lr
+    let code = arm(&[0xEB00_0002, BX_LR, 0, 0, BX_LR]);
+    let program = Program {
+        entry: BASE,
+        modules: vec![Module {
+            id: ModuleId::Main,
+            base: BASE,
+            bytes: code,
+            bss_size: 0,
+            sinit: None,
+        }],
+    };
+    let caller = FunctionKey {
+        module: ModuleId::Main,
+        address: BASE,
+    };
+    let callee = FunctionKey {
+        module: ModuleId::Main,
+        address: BASE + 0x10,
+    };
+    let emit = |problem: bool| {
+        let mut target = analyze_function(&program, callee, false, &HashSet::new());
+        if problem {
+            target.problems.push("undefined instruction".to_owned());
+        }
+        let analysis = Analysis {
+            functions: BTreeMap::from([
+                (caller, analyze_function(&program, caller, false, &HashSet::new())),
+                (callee, target),
+            ]),
+            ..Analysis::default()
+        };
+        emit_function(&analysis, &program.modules[0], &analysis.functions[&caller])
+    };
+    let direct = format!("{}(cpu);", function_name(callee));
+    assert!(emit(false).contains(&direct));
+    let source = emit(true);
+    assert!(!source.contains(&direct), "{source}");
+    assert!(source.contains("rt_call(cpu, 0x02000010u)"), "{source}");
+}

@@ -768,10 +768,14 @@ impl Context<'_> {
                     module: *module,
                     address: call.target,
                 };
+                // A callee that does not decode cleanly is usually code the
+                // game decrypts in RAM before calling it (Black 2 and White 2
+                // encrypt some overlay functions). The runtime call checks
+                // RAM and interprets what is really there.
                 self.analysis
                     .functions
                     .get(&key)
-                    .filter(|callee| callee.thumb == call.thumb)
+                    .filter(|callee| callee.thumb == call.thumb && callee.problems.is_empty())
                     .map(|_| key)
             }
             Resolution::Ambiguous(_) | Resolution::Outside => None,

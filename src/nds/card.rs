@@ -22,20 +22,30 @@ pub const CHIP_ID: u32 = 0x0000_7FC2;
 pub struct Card {
     rom: File,
     rom_size: u64,
+    /// The mask ROM's capacity: addresses wrap at this size, as the chip
+    /// ignores the address lines above it.
+    chip_size: u64,
     pending: VecDeque<u32>,
 }
 
 impl Card {
     pub fn open(path: &Path) -> Result<Self> {
-        let rom = File::open(path)
+        let mut rom = File::open(path)
             .map_err(|error| format!("could not open ROM '{}': {error}", path.display()))?;
         let rom_size = rom
             .metadata()
             .map_err(|error| format!("could not read ROM size: {error}"))?
             .len();
+        // Header byte 0x14: device capacity, 128 KiB << n.
+        let mut capacity = [0u8; 1];
+        rom.seek(SeekFrom::Start(0x14))
+            .and_then(|_| rom.read_exact(&mut capacity))
+            .map_err(|error| format!("could not read the ROM header: {error}"))?;
+        let chip_size = (0x2_0000u64 << capacity[0].min(15)).max(rom_size.next_power_of_two());
         Ok(Self {
             rom,
             rom_size,
+            chip_size,
             pending: VecDeque::new(),
         })
     }
@@ -55,6 +65,9 @@ impl Card {
                     u32::from_be_bytes([command[1], command[2], command[3], command[4]]);
                 // The secure area cannot be read in this mode; retail cards
                 // return data from 0x8000 onward instead.
+                // Black 2 and White 2 check both behaviours with a read of
+                // 0x20001000, which a flash cartridge answers differently.
+                address = (u64::from(address) % self.chip_size) as u32;
                 if address < 0x8000 {
                     address = 0x8000 + (address & 0x1FF);
                 }

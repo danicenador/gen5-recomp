@@ -125,6 +125,7 @@ pub fn run(cpu_ptr: *mut Cpu, target: u32) {
             fetch(machine, pc, thumb)
         };
         let cpu = unsafe { &mut *cpu_ptr };
+        trace(cpu_ptr, &ins);
         let next = if condition(cpu, ins.cond) {
             execute(cpu_ptr, &ins)
         } else {
@@ -141,6 +142,39 @@ pub fn run(cpu_ptr: *mut Cpu, target: u32) {
             }
         }
     }
+}
+
+/// GEN5_INTERP_TRACE=frame:path logs interpreted instructions, with the
+/// registers before each one, from that frame on (at most a million lines).
+fn trace(cpu_ptr: *mut Cpu, ins: &Instruction) {
+    use std::io::Write;
+    use std::sync::Mutex;
+    static TRACE: std::sync::OnceLock<Option<(u64, Mutex<(std::io::BufWriter<std::fs::File>, u32)>)>> =
+        std::sync::OnceLock::new();
+    let Some((from, out)) = TRACE.get_or_init(|| {
+        let spec = std::env::var("GEN5_INTERP_TRACE").ok()?;
+        let (frame, path) = spec.split_once(':')?;
+        let file = std::fs::File::create(path).ok()?;
+        Some((frame.parse().ok()?, Mutex::new((std::io::BufWriter::new(file), 0))))
+    }) else {
+        return;
+    };
+    if unsafe { machine::get(cpu_ptr) }.frame() < *from {
+        return;
+    }
+    let mut out = out.lock().unwrap();
+    if out.1 >= 1_000_000 {
+        return;
+    }
+    out.1 += 1;
+    let cpu = unsafe { &*cpu_ptr };
+    let r = &cpu.r;
+    let _ = writeln!(
+        out.0,
+        "{:08X} {:40} r0={:08X} r1={:08X} r2={:08X} r3={:08X} r4={:08X} r12={:08X} sp={:08X} lr={:08X}",
+        ins.address, ins.to_string(), r[0], r[1], r[2], r[3], r[4], r[12], r[13], r[14]
+    );
+    let _ = out.0.flush();
 }
 
 fn fetch(machine: &mut Machine, pc: u32, thumb: bool) -> Instruction {
