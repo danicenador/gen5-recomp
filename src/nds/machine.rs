@@ -152,6 +152,9 @@ pub struct Machine {
     functions: HashMap<u32, Vec<Target>>,
     overlays: HashMap<u16, (u32, Vec<u8>)>,
     events: VecDeque<Event>,
+    /// Calls, jumps and interpreter entries only, which the full history
+    /// loses among interrupt and PSR events.
+    control: VecDeque<Event>,
     calls: u64,
     poll: (u32, u64),
     /// Set by the IRQ handler's thread switch; done after the interrupt.
@@ -240,6 +243,15 @@ pub(super) unsafe fn get<'a>(cpu: *mut Cpu) -> &'a mut Machine {
 
 impl Machine {
     fn record(&mut self, event: Event) {
+        if matches!(
+            event,
+            Event::Call { .. } | Event::Jump { .. } | Event::Interpret { .. }
+        ) {
+            if self.control.len() == EVENT_HISTORY {
+                self.control.pop_front();
+            }
+            self.control.push_back(event);
+        }
         if self.events.len() == EVENT_HISTORY {
             self.events.pop_front();
         }
@@ -374,14 +386,22 @@ impl Machine {
         }
         gpu2d::capture(&mut self.io, &mut self.memory);
         self.advance_sound();
-        // GEN5_3D_TRACE=frame[:path] describes the 3D list started after
-        // that frame: every polygon, whether it was kept, and box tests.
+        // GEN5_3D_TRACE=first[-last][:path] describes the 3D lists started
+        // after those frames: every polygon, whether it was kept, and box
+        // tests. A range writes one file per list, with the frame appended.
         if let Ok(spec) = std::env::var("GEN5_3D_TRACE") {
-            let (frame, path) = spec.split_once(':').unwrap_or((&spec, "3d-trace.txt"));
-            if frame.parse() == Ok(self.presented) {
+            let (frames, path) = spec.split_once(':').unwrap_or((&spec, "3d-trace.txt"));
+            let (first, last) = frames.split_once('-').unwrap_or((frames, frames));
+            let (first, last) = (first.parse().unwrap_or(0), last.parse().unwrap_or(0));
+            if (first..=last).contains(&self.presented) {
                 self.io.geometry.trace_next = true;
             }
             if let Some(text) = self.io.geometry.traced.take() {
+                let path = if first == last {
+                    path.to_owned()
+                } else {
+                    format!("{path}.{}", self.presented)
+                };
                 let _ = std::fs::write(path, text);
             }
         }
@@ -1016,6 +1036,11 @@ impl Machine {
         }
         report.push_str("recent events (oldest first):\n");
         for event in &self.events {
+            let _ = writeln!(report, "  {}", describe(event));
+        }
+        report.push_str("recent calls, jumps and interpreter entries (oldest first):
+");
+        for event in &self.control {
             let _ = writeln!(report, "  {}", describe(event));
         }
         report.push_str("IPC FIFO messages sent to the ARM7:\n");
@@ -1721,6 +1746,7 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         functions,
         overlays,
         events: VecDeque::new(),
+        control: VecDeque::new(),
         calls: 0,
         poll: (0, 0),
         activity: 0,
