@@ -180,7 +180,12 @@ helper copies its input file into the run directory before starting.
 `GEN5_AUDIO_WAV=path` records a headless run's sound as a 16-bit stereo WAV
 at the DS mixer rate. `GEN5_SOUND=off` acknowledges sound commands without
 playing them, to rule sound in or out when diagnosing. `GEN5_STOP_FILE=path`
-ends a run with the full report as soon as that file exists.
+ends a run with the full report as soon as that file exists; the report's 3D
+line includes the largest polygon list kept and any lists that overflowed
+polygon or vertex RAM. `GEN5_SCREEN_RANGE=first-last:every` adds denser
+screenshots in one stretch of a run. `GEN5_3D_TRACE=frame:path` writes every
+polygon of the 3D list that follows that frame to `path`: whether it was kept
+or culled (and why), its attributes and screen coordinates, plus box tests.
 
 `./scripts/white2/replay.ps1 -Inputs scripts/white2/field.inputs -Frames 52000`
 replays the first controllable-field checkpoint from a fresh save: finish the

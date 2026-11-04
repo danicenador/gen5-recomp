@@ -152,6 +152,10 @@ pub struct Geometry {
     /// The most polygons one list submitted, culled ones included.
     pub peak_submitted: u64,
     list_start: u64,
+    /// GEN5_3D_TRACE: describe every polygon and box test of the next list.
+    pub trace_next: bool,
+    trace: Option<String>,
+    pub traced: Option<String>,
 }
 
 impl Default for Geometry {
@@ -208,6 +212,9 @@ impl Default for Geometry {
             overflowed: false,
             peak_submitted: 0,
             list_start: 0,
+            trace_next: false,
+            trace: None,
+            traced: None,
         }
     }
 }
@@ -289,6 +296,12 @@ impl Geometry {
             self.overflowed_lists += u64::from(std::mem::take(&mut self.overflowed));
             self.displayed = std::mem::take(&mut self.building);
             self.vertex_count = 0;
+            if let Some(text) = self.trace.take() {
+                self.traced = Some(text);
+            }
+            if std::mem::take(&mut self.trace_next) {
+                self.trace = Some(String::new());
+            }
             self.swaps += 1;
             self.drain_commands();
             while self.swap.is_none() {
@@ -513,7 +526,9 @@ impl Geometry {
         // only polygons that survive culling and clipping are stored: a
         // wide scene submits far more than it keeps.
         self.submitted_polygons += 1;
-        let stored = if self.visible(&vertices) {
+        let verdict = self.visible(&vertices);
+        let mut traced = None;
+        let stored = if verdict.is_ok() {
             let shared = if self.strip_stored && matches!(primitive, 2 | 3) {
                 count - 2
             } else {
@@ -523,7 +538,7 @@ impl Geometry {
             if fits {
                 self.vertex_count += shared;
                 self.building.push(Polygon {
-                    vertices,
+                    vertices: if self.trace.is_some() { vertices.clone() } else { std::mem::take(&mut vertices) },
                     attr: self.attr,
                     texture: self.texture,
                     palette: self.palette,
@@ -531,10 +546,34 @@ impl Geometry {
                 });
             }
             self.overflowed |= !fits;
+            if !fits {
+                traced = Some("full");
+            }
             fits
         } else {
             false
         };
+        if let Some(trace) = &mut self.trace {
+            use std::fmt::Write;
+            let status = verdict.err().or(traced).unwrap_or("kept");
+            let _ = write!(
+                trace,
+                "{status:6} attr {:08X} tex {:08X} pal {:04X}:",
+                self.attr, self.texture, self.palette
+            );
+            for v in &vertices {
+                let w = v.clip[3];
+                let _ = write!(
+                    trace,
+                    " ({:.1},{:.1} z{:.3} w{:.3})",
+                    (v.clip[0] / w + 1.0) * 128.0,
+                    (1.0 - v.clip[1] / w) * 96.0,
+                    v.clip[2] / w,
+                    w
+                );
+            }
+            trace.push('\n');
+        }
         self.strip_stored = stored;
         match primitive {
             2 => {
@@ -551,12 +590,12 @@ impl Geometry {
     /// Whether the hardware would store this polygon: it is not entirely
     /// outside one clip plane, it does not cross the far plane unless the
     /// polygon asks for that, and its facing is drawn.
-    fn visible(&self, vertices: &[Vertex]) -> bool {
+    fn visible(&self, vertices: &[Vertex]) -> Result<(), &'static str> {
         if (0..6).any(|plane| vertices.iter().all(|v| plane_distance(v.clip, plane) < 0.0)) {
-            return false;
+            return Err("out");
         }
         if self.attr & (1 << 12) == 0 && vertices.iter().any(|v| v.clip[2] > v.clip[3]) {
-            return false;
+            return Err("far");
         }
         if vertices.iter().all(|v| v.clip[3] > 0.0) {
             // Facing, in the same screen orientation the rasterizer uses
@@ -573,11 +612,11 @@ impl Geometry {
             if area != 0.0 {
                 let front = area < 0.0;
                 if self.attr & (if front { 1 << 7 } else { 1 << 6 }) == 0 {
-                    return false;
+                    return Err("facing");
                 }
             }
         }
-        true
+        Ok(())
     }
 
     fn execute(&mut self, cmd: u8, p: &[u32]) {
@@ -695,6 +734,10 @@ impl Geometry {
                     .collect();
                 self.box_result =
                     !(0..6).any(|plane| corners.iter().all(|c| plane_distance(*c, plane) < 0.0));
+                if let Some(trace) = &mut self.trace {
+                    use std::fmt::Write;
+                    let _ = writeln!(trace, "box    {values:?} -> {}", self.box_result);
+                }
             }
             0x71 => {
                 self.position_result = transform(

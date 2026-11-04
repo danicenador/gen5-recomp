@@ -374,6 +374,17 @@ impl Machine {
         }
         gpu2d::capture(&mut self.io, &mut self.memory);
         self.advance_sound();
+        // GEN5_3D_TRACE=frame[:path] describes the 3D list started after
+        // that frame: every polygon, whether it was kept, and box tests.
+        if let Ok(spec) = std::env::var("GEN5_3D_TRACE") {
+            let (frame, path) = spec.split_once(':').unwrap_or((&spec, "3d-trace.txt"));
+            if frame.parse() == Ok(self.presented) {
+                self.io.geometry.trace_next = true;
+            }
+            if let Some(text) = self.io.geometry.traced.take() {
+                let _ = std::fs::write(path, text);
+            }
+        }
         // GEN5_STOP_FILE: stop with a report once this file exists, to see
         // what a long-running session is doing.
         if self.presented.is_multiple_of(60)
@@ -386,7 +397,20 @@ impl Machine {
         if let Some(on_vblank) = &mut self.options.on_vblank {
             on_vblank(self.presented);
         }
+        // GEN5_SCREEN_RANGE=first-last:every adds denser screenshots in one
+        // stretch of a long run.
+        static RANGE: std::sync::OnceLock<Option<(u64, u64, u64)>> = std::sync::OnceLock::new();
+        let range = RANGE.get_or_init(|| {
+            let spec = std::env::var("GEN5_SCREEN_RANGE").ok()?;
+            let (frames, every) = spec.split_once(':')?;
+            let (first, last) = frames.split_once('-')?;
+            Some((first.parse().ok()?, last.parse().ok()?, every.parse().ok()?))
+        });
+        let in_range = range.is_some_and(|(first, last, every)| {
+            (first..=last).contains(&self.presented) && self.presented.is_multiple_of(every.max(1))
+        });
         let render = self.presented == self.options.max_frames
+            || in_range
             || self.options.render_every != 0
                 && self.presented.is_multiple_of(self.options.render_every);
         if render && let Some(on_frame) = &mut self.options.on_frame {
