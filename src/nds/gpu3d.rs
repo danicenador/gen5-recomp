@@ -108,6 +108,12 @@ pub struct Geometry {
     deferred: VecDeque<(u32, u32)>,
     swap: Option<u32>,
     render_w: bool,
+    /// SWAP_BUFFERS bit 0: translucent polygons keep submission order
+    /// instead of being sorted by Y.
+    manual_sort: bool,
+    /// Whether the previous polygon of the current strip was stored, so the
+    /// next one shares its vertices in vertex RAM.
+    strip_stored: bool,
     building: Vec<Polygon>,
     displayed: Vec<Polygon>,
     vertices: Vec<Vertex>,
@@ -156,6 +162,8 @@ impl Default for Geometry {
             deferred: VecDeque::new(),
             swap: None,
             render_w: false,
+            manual_sort: false,
+            strip_stored: false,
             building: Vec::new(),
             displayed: Vec::new(),
             vertices: Vec::new(),
@@ -257,6 +265,7 @@ impl Geometry {
     pub fn vblank(&mut self) {
         if let Some(flags) = self.swap.take() {
             self.render_w = flags & 2 != 0;
+            self.manual_sort = flags & 1 != 0;
             self.displayed = std::mem::take(&mut self.building);
             self.vertex_count = 0;
             self.swaps += 1;
@@ -463,7 +472,6 @@ impl Geometry {
             color: self.color,
             uv: self.uv,
         });
-        self.vertex_count = (self.vertex_count + 1).min(6144);
         let count = if primitive == 1 || primitive == 3 {
             4
         } else {
@@ -480,16 +488,32 @@ impl Geometry {
         if primitive == 3 {
             vertices.swap(2, 3);
         }
-        if self.building.len() < 2048 {
-            self.building.push(Polygon {
-                vertices,
-                attr: self.attr,
-                texture: self.texture,
-                palette: self.palette,
-                viewport: self.viewport,
-            });
-            self.submitted_polygons += 1;
-        }
+        // Polygon and vertex RAM hold 2048 polygons and 6144 vertices, but
+        // only polygons that survive culling and clipping are stored: a
+        // wide scene submits far more than it keeps.
+        self.submitted_polygons += 1;
+        let stored = if self.visible(&vertices) {
+            let shared = if self.strip_stored && matches!(primitive, 2 | 3) {
+                count - 2
+            } else {
+                count
+            };
+            let fits = self.building.len() < 2048 && self.vertex_count + shared <= 6144;
+            if fits {
+                self.vertex_count += shared;
+                self.building.push(Polygon {
+                    vertices,
+                    attr: self.attr,
+                    texture: self.texture,
+                    palette: self.palette,
+                    viewport: self.viewport,
+                });
+            }
+            fits
+        } else {
+            false
+        };
+        self.strip_stored = stored;
         match primitive {
             2 => {
                 self.vertices.remove(0);
@@ -500,6 +524,38 @@ impl Geometry {
             _ => self.vertices.clear(),
         }
         self.strip_index += 1;
+    }
+
+    /// Whether the hardware would store this polygon: it is not entirely
+    /// outside one clip plane, it does not cross the far plane unless the
+    /// polygon asks for that, and its facing is drawn.
+    fn visible(&self, vertices: &[Vertex]) -> bool {
+        if (0..6).any(|plane| vertices.iter().all(|v| plane_distance(v.clip, plane) < 0.0)) {
+            return false;
+        }
+        if self.attr & (1 << 12) == 0 && vertices.iter().any(|v| v.clip[2] > v.clip[3]) {
+            return false;
+        }
+        if vertices.iter().all(|v| v.clip[3] > 0.0) {
+            // Facing, in the same screen orientation the rasterizer uses
+            // (y grows downwards).
+            let screen: Vec<[f64; 2]> = vertices
+                .iter()
+                .map(|v| [v.clip[0] / v.clip[3], -v.clip[1] / v.clip[3]])
+                .collect();
+            let mut area = 0.0;
+            for i in 0..screen.len() {
+                let (a, b) = (screen[i], screen[(i + 1) % screen.len()]);
+                area += a[0] * b[1] - b[0] * a[1];
+            }
+            if area != 0.0 {
+                let front = area < 0.0;
+                if self.attr & (if front { 1 << 7 } else { 1 << 6 }) == 0 {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn execute(&mut self, cmd: u8, p: &[u32]) {
@@ -580,6 +636,7 @@ impl Geometry {
             }
             0x40 => {
                 self.primitive = Some(v & 3);
+                self.strip_stored = false;
                 self.vertices.clear();
                 self.strip_index = 0;
                 self.attr = self.next_attr;
@@ -661,12 +718,23 @@ impl Geometry {
         // Opaque polygons precede translucent ones. Preserve submission order
         // within each group; hardware's automatic Y sort is not modeled yet.
         for translucent in [false, true] {
-            for polygon in &self.displayed {
-                let alpha = (polygon.attr >> 16) & 31;
-                let format = (polygon.texture >> 26) & 7;
-                if (alpha < 31 || format == 1 || format == 6) != translucent {
-                    continue;
-                }
+            let mut group: Vec<&Polygon> = self
+                .displayed
+                .iter()
+                .filter(|polygon| {
+                    let alpha = (polygon.attr >> 16) & 31;
+                    let format = (polygon.texture >> 26) & 7;
+                    (alpha < 31 || format == 1 || format == 6) == translucent
+                })
+                .collect();
+            // The hardware sorts opaque polygons, and translucent ones
+            // unless SWAP_BUFFERS asked for manual order, by their lowest
+            // then highest screen Y. The sort is stable, like submission
+            // order within equal keys.
+            if !translucent || !self.manual_sort {
+                group.sort_by_cached_key(|polygon| sort_key(polygon));
+            }
+            for polygon in group {
                 let vertices = clip_polygon(&polygon.vertices);
                 if vertices.len() < 3 {
                     continue;
@@ -687,6 +755,22 @@ impl Geometry {
         }
         pixels
     }
+}
+
+/// The hardware's Y sort key: the bottom-most, then the top-most vertex.
+fn sort_key(polygon: &Polygon) -> (i32, i32) {
+    let height = f64::from(i32::from(polygon.viewport[3]) - i32::from(polygon.viewport[1]) + 1);
+    let ys = polygon
+        .vertices
+        .iter()
+        .filter(|v| v.clip[3] > 0.0)
+        .map(|v| {
+            let y = 191.0
+                - ((v.clip[1] / v.clip[3] + 1.0) * height / 2.0 + f64::from(polygon.viewport[1]));
+            y.clamp(-1024.0, 1024.0) as i32
+        });
+    let (low, high) = ys.fold((i32::MIN, i32::MAX), |(low, high), y| (low.max(y), high.min(y)));
+    (low, high)
 }
 
 fn plane_distance(c: [f64; 4], plane: usize) -> f64 {
