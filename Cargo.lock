@@ -894,6 +894,7 @@ name = "gen5"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cpal",
  "egui",
  "egui-wgpu",
  "egui-winit",

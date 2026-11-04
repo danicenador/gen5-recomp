@@ -38,6 +38,8 @@ const LINES: u32 = 263;
 const VISIBLE_LINES: u32 = 192;
 /// ARM9 bus cycles (33.51 MHz) per scanline.
 const CYCLES_PER_LINE: u32 = 2130;
+/// Bus cycles per frame (263 lines), the clock the sound hardware follows.
+pub const CYCLES_PER_FRAME: u64 = LINES as u64 * CYCLES_PER_LINE as u64;
 
 pub enum Effect {
     /// A DMA channel was enabled with immediate start timing.

@@ -14,6 +14,7 @@ use super::gpu2d::{self, Frame};
 use super::input::Input;
 use super::io::{self, Effect, Io};
 use super::memory::Memory;
+use super::sound::{AudioQueue, Sound};
 use crate::Result;
 use crate::importer::code::CodeManifest;
 use crate::recomp::program::{ModuleId, Program};
@@ -136,6 +137,8 @@ pub struct Options {
     pub on_vblank: Option<Box<dyn FnMut(u64) + Send>>,
     /// Buttons and touch screen, read once per frame.
     pub input: Option<Arc<Input>>,
+    /// Where mixed sound goes, if anyone listens.
+    pub audio: Option<Arc<AudioQueue>>,
 }
 
 pub struct Machine {
@@ -169,8 +172,10 @@ pub struct Machine {
     /// The shared card backup command block, set by the INIT request.
     backup_block: u32,
     backup_expects_block: bool,
-    /// The sound driver's shared work area (`SNDSharedWork`), once known.
-    sound_shared_work: u32,
+    /// The ARM7's sound driver and the sound hardware.
+    sound: Sound,
+    /// The frame the sound was last run up to.
+    sound_frame: u64,
     backup: Backup,
     firmware: Firmware,
     /// The ARM7 stand-in's IPCSYNC output nibble.
@@ -193,8 +198,6 @@ const LOOP_BUDGET: u32 = 2000;
 const PXI_TAG_PM: u32 = 8;
 const PXI_TAG_TOUCHPANEL: u32 = 6;
 const PXI_TAG_SOUND: u32 = 7;
-/// `SND_COMMAND_SHARED_WORK`: argument 0 is the `SNDSharedWork` address.
-const SND_COMMAND_SHARED_WORK: u32 = 0x1D;
 const PXI_TAG_NVRAM: u32 = 4;
 const PXI_TAG_RTC: u32 = 5;
 /// Where the ARM7 leaves the RTC date and time (BCD) for the SDK.
@@ -370,6 +373,7 @@ impl Machine {
             self.write16(BUTTON_XY, u32::from(button_xy));
         }
         gpu2d::capture(&mut self.io, &mut self.memory);
+        self.advance_sound();
         if let Some(on_vblank) = &mut self.options.on_vblank {
             on_vblank(self.presented);
         }
@@ -678,26 +682,36 @@ impl Machine {
 
     /// The sound driver: the ARM9 sends linked lists of commands
     /// (`SNDCommand`: next, id, four arguments) and waits for the ARM7 to
-    /// count each finished list in `SNDSharedWork::finishCommandTag`. The
-    /// commands are not carried out, so nothing plays yet; word 0 asks the
-    /// ARM7 to process pending lists now.
+    /// count each finished list in `SNDSharedWork::finishCommandTag`; word
+    /// 0 wakes the driver. Lists are carried out as they arrive.
     fn sound_message(&mut self, data: u32) {
-        if data == 0 {
-            return;
-        }
-        let mut command = data;
-        for _ in 0..4096 {
-            if command == 0 {
-                break;
+        self.sound.driver.message(&mut self.memory.main, data);
+        self.send_sound_alarms();
+    }
+
+    /// Run sound up to the current frame and hand the samples to the host.
+    fn advance_sound(&mut self) {
+        let frames = self.io.frame.saturating_sub(self.sound_frame);
+        self.sound_frame = self.io.frame;
+        // After a long stall (several frames at once) only the last few are
+        // queued; the rest would arrive too late to be heard.
+        for frame in 0..frames {
+            let samples = self
+                .sound
+                .advance(&mut self.memory.main, io::CYCLES_PER_FRAME);
+            if frames - frame <= 4
+                && let Some(audio) = &self.options.audio
+            {
+                audio.push(samples);
             }
-            if self.read32(command + 4) == SND_COMMAND_SHARED_WORK {
-                self.sound_shared_work = self.read32(command + 8);
-            }
-            command = self.read32(command);
         }
-        if self.sound_shared_work != 0 {
-            let finished = self.read32(self.sound_shared_work);
-            self.write32(self.sound_shared_work, finished.wrapping_add(1));
+        self.send_sound_alarms();
+    }
+
+    /// Sound alarms notify the ARM9 with their index and id.
+    fn send_sound_alarms(&mut self) {
+        for word in std::mem::take(&mut self.sound.driver.outbox) {
+            self.io.push_from_arm7((word << 6) | PXI_TAG_SOUND);
         }
     }
 
@@ -991,6 +1005,19 @@ impl Machine {
                 repeated(count)
             );
         }
+        let counts = self.sound.driver.command_counts;
+        let _ = writeln!(
+            report,
+            "sound: players active 0x{:04X}, commands {}",
+            self.sound.driver.active_players(),
+            counts
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(id, count)| format!("{id:02X}x{count}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         report.push_str("I/O registers touched (address: reads/writes):\n");
         for (address, access) in &self.io.touched {
             let _ = writeln!(
@@ -1669,7 +1696,8 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         nvram_bytes: Vec::new(),
         backup_block: 0,
         backup_expects_block: false,
-        sound_shared_work: 0,
+        sound: Sound::default(),
+        sound_frame: 0,
         backup: Backup::open(state_root.join("save.bin")),
         firmware: Firmware::open(state_root.join("firmware.bin")),
         arm7_sync_output: 7,

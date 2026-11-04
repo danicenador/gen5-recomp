@@ -92,7 +92,26 @@ fn run() -> Result<(), String> {
             let interval =
                 (fps != 0).then(|| std::time::Duration::from_secs_f64(1.0 / f64::from(fps)));
             let mut next = std::time::Instant::now();
+            // GEN5_AUDIO_WAV: record the mixed sound of a headless run.
+            let audio = std::env::var_os("GEN5_AUDIO_WAV")
+                .map(|path| -> Result<_, String> {
+                    let writer = gen5::runtime::audio::WavWriter::create(Path::new(&path))
+                        .map_err(|error| format!("could not create audio file: {error}"))?;
+                    Ok((
+                        std::sync::Arc::new(gen5::nds::sound::AudioQueue::default()),
+                        writer,
+                    ))
+                })
+                .transpose()?;
+            let queue = audio.as_ref().map(|(queue, _)| queue.clone());
+            let mut wav = audio.map(|(_, writer)| writer);
+            let wav_queue = queue.clone();
             let on_vblank = Some(Box::new(move |number: u64| {
+                if let (Some(writer), Some(queue)) = (&mut wav, &wav_queue)
+                    && let Err(error) = writer.drain(queue)
+                {
+                    eprintln!("could not write audio: {error}");
+                }
                 if let Some(interval) = interval {
                     next += interval;
                     let now = std::time::Instant::now();
@@ -165,6 +184,7 @@ fn run() -> Result<(), String> {
                     render_every: screenshot_every,
                     on_vblank,
                     input: Some(input),
+                    audio: queue,
                 },
             )
         }
