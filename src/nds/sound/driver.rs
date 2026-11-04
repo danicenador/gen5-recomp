@@ -370,6 +370,8 @@ pub struct Driver {
     pub outbox: Vec<u32>,
     /// How often each command was received, for reports.
     pub command_counts: [u64; command::COUNT],
+    /// GEN5_SOUND=off: acknowledge commands without carrying them out.
+    pub silent: bool,
 }
 
 impl Default for Driver {
@@ -391,6 +393,7 @@ impl Default for Driver {
             now: 0,
             outbox: Vec::new(),
             command_counts: [0; command::COUNT],
+            silent: std::env::var("GEN5_SOUND").is_ok_and(|value| value == "off"),
         };
         for (index, channel) in driver.channels.iter_mut().enumerate() {
             channel.id = index as u8;
@@ -519,6 +522,9 @@ impl Driver {
         use command::*;
         if let Some(count) = self.command_counts.get_mut(id as usize) {
             *count += 1;
+        }
+        if self.silent && id != SET_SHARED_WORK {
+            return;
         }
         let player = (arg[0] & 0xF) as usize;
         match id {
