@@ -142,6 +142,16 @@ pub struct Geometry {
     box_result: bool,
     pub swaps: u64,
     pub submitted_polygons: u64,
+    /// The most polygons and vertices one swapped list kept.
+    pub peak_polygons: usize,
+    pub peak_vertices: usize,
+    /// Swapped lists that dropped visible polygons because polygon or vertex
+    /// RAM was full.
+    pub overflowed_lists: u64,
+    overflowed: bool,
+    /// The most polygons one list submitted, culled ones included.
+    pub peak_submitted: u64,
+    list_start: u64,
 }
 
 impl Default for Geometry {
@@ -192,6 +202,12 @@ impl Default for Geometry {
             box_result: false,
             swaps: 0,
             submitted_polygons: 0,
+            peak_polygons: 0,
+            peak_vertices: 0,
+            overflowed_lists: 0,
+            overflowed: false,
+            peak_submitted: 0,
+            list_start: 0,
         }
     }
 }
@@ -266,6 +282,11 @@ impl Geometry {
         if let Some(flags) = self.swap.take() {
             self.render_w = flags & 2 != 0;
             self.manual_sort = flags & 1 != 0;
+            self.peak_polygons = self.peak_polygons.max(self.building.len());
+            self.peak_vertices = self.peak_vertices.max(self.vertex_count);
+            self.peak_submitted = self.peak_submitted.max(self.submitted_polygons - self.list_start);
+            self.list_start = self.submitted_polygons;
+            self.overflowed_lists += u64::from(std::mem::take(&mut self.overflowed));
             self.displayed = std::mem::take(&mut self.building);
             self.vertex_count = 0;
             self.swaps += 1;
@@ -509,6 +530,7 @@ impl Geometry {
                     viewport: self.viewport,
                 });
             }
+            self.overflowed |= !fits;
             fits
         } else {
             false
