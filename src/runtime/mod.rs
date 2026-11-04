@@ -1,3 +1,4 @@
+pub mod audio;
 mod desktop;
 pub mod screen;
 mod wgpu_renderer;
@@ -23,6 +24,9 @@ pub fn play_recompiled(cache_root: &Path, rom: &Path) -> Result<()> {
     use crate::nds::{input::Input, machine};
     let screens = Arc::new(screen::Screens::default());
     let input = Arc::new(Input::default());
+    let audio = Arc::new(crate::nds::sound::AudioQueue::default());
+    // Kept alive for as long as the window is open.
+    let _output = audio::start(audio.clone());
     let mut next = Instant::now();
     let sink = screens.clone();
     let on_frame: machine::FrameSink = Box::new(move |number, frame| {
@@ -44,6 +48,7 @@ pub fn play_recompiled(cache_root: &Path, rom: &Path) -> Result<()> {
         render_every: 1,
         on_vblank: None,
         input: Some(input.clone()),
+        audio: Some(audio.clone()),
     };
     let (cache_root, rom): (PathBuf, PathBuf) = (cache_root.into(), rom.into());
     std::thread::spawn(move || {

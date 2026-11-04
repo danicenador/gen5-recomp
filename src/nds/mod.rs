@@ -10,6 +10,7 @@
 //! - `gpu2d`: the two 2D engines, rendering a frame for each screen.
 //! - `input`: buttons and touch screen shared with the window.
 //! - `interpreter`: fallback for code without a recompiled function.
+//! - `sound`: the ARM7's sound driver and the sound hardware's mixer.
 //! - `threads`: NitroSDK threads as host threads taking turns.
 //! - `machine`: boot, call dispatch across overlays, interrupts, BIOS calls.
 
@@ -24,5 +25,6 @@ mod interpreter;
 pub mod io;
 pub mod machine;
 pub mod memory;
+pub mod sound;
 mod threads;
 pub mod vram;
