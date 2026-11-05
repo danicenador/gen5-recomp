@@ -26,6 +26,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 type GeneratedFunction = unsafe extern "C" fn(*mut Cpu);
@@ -141,6 +142,10 @@ pub struct Options {
     pub input: Option<Arc<Input>>,
     /// Where mixed sound goes, if anyone listens.
     pub audio: Option<Arc<AudioQueue>>,
+    /// The resolution multiple frames are drawn at. Above 1, frames carry
+    /// a `ScaledFrame` for a GPU renderer instead of pixels; GEN5_GPU=1 asks
+    /// for that at 1 too. It can change while the game runs.
+    pub scale: Arc<AtomicU32>,
 }
 
 pub struct Machine {
@@ -195,6 +200,8 @@ pub struct Machine {
     /// GEN5_PROFILE=path: render every frame, as the window does, even
     /// headless, and write each frame's host times (ms) to `path` as CSV.
     profile: Option<fs::File>,
+    /// GEN5_GPU=1: frames for the GPU renderer even at scale 1.
+    force_gpu: bool,
     /// GEN5_SP_LIMIT: stop when a call is made with the system-mode stack
     /// pointer above this, to catch code that pops more than it pushed.
     sp_limit: Option<u32>,
@@ -524,8 +531,19 @@ impl Machine {
             || self.options.render_every != 0
                 && self.presented.is_multiple_of(self.options.render_every);
         let rendered_start = Instant::now();
-        let frame = (render && self.options.on_frame.is_some() || self.profile.is_some())
-            .then(|| gpu2d::render_with(&self.io, &self.memory, &mut shared));
+        let scaled = self.options.scale.load(Ordering::Relaxed) > 1 || self.force_gpu;
+        let frame =
+            (render && self.options.on_frame.is_some() || self.profile.is_some()).then(|| {
+                if scaled {
+                    gpu2d::Frame {
+                        top: Vec::new(),
+                        bottom: Vec::new(),
+                        scaled: Some(Box::new(gpu2d::render_scaled(&self.io, &self.memory))),
+                    }
+                } else {
+                    gpu2d::render_with(&self.io, &self.memory, &mut shared)
+                }
+            });
         let rendered = Instant::now();
         let render_3d = self.io.geometry.take_render_time();
         let timing = &mut self.timing;
@@ -1945,6 +1963,7 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
                 .ok()?;
             Some(file)
         }),
+        force_gpu: std::env::var("GEN5_GPU").is_ok_and(|value| value == "1"),
         sp_limit: std::env::var("GEN5_SP_LIMIT")
             .ok()
             .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok()),

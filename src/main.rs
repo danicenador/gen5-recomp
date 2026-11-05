@@ -155,11 +155,38 @@ fn run() -> Result<(), String> {
                 );
             }) as Box<dyn FnMut(u64) + Send>);
             let directory = args.get(4).map(std::path::PathBuf::from);
+            // GEN5_SCALE: screenshots at a multiple of the DS resolution,
+            // drawn by the GPU renderer.
+            let scale = scale_from_env()?;
+            let mut gpu: Option<gen5::runtime::scaled::Headless> = None;
             let on_frame = directory.map(|directory| {
                 Box::new(move |number: u64, frame: &gen5::nds::gpu2d::Frame| {
-                    let mut pixels = frame.top.clone();
-                    pixels.extend_from_slice(&frame.bottom);
-                    let image = gen5::nds::gpu2d::png(256, 384, &pixels);
+                    let (width, height, pixels) = match &frame.scaled {
+                        Some(scaled) => {
+                            if gpu.is_none() {
+                                match gen5::runtime::scaled::Headless::new() {
+                                    Ok(renderer) => gpu = Some(renderer),
+                                    Err(error) => {
+                                        eprintln!("could not start the GPU renderer: {error}");
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                            match gpu.as_mut().unwrap().render(scaled, scale) {
+                                Ok(image) => image,
+                                Err(error) => {
+                                    eprintln!("{error}");
+                                    return;
+                                }
+                            }
+                        }
+                        None => {
+                            let mut pixels = frame.top.clone();
+                            pixels.extend_from_slice(&frame.bottom);
+                            (256, 384, pixels)
+                        }
+                    };
+                    let image = gen5::nds::gpu2d::png(width as usize, height as usize, &pixels);
                     let path = directory.join(format!("frame-{number:05}.png"));
                     if let Err(error) = std::fs::create_dir_all(&directory)
                         .and_then(|()| std::fs::write(&path, image))
@@ -185,11 +212,19 @@ fn run() -> Result<(), String> {
                     on_vblank,
                     input: Some(input),
                     audio: queue,
+                    scale: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(scale)),
                 },
             )
         }
-        Some("run") if args.len() == 3 => {
-            gen5::runtime::play_recompiled(Path::new(&args[1]), Path::new(&args[2]))
+        Some("run") if args.len() == 3 || args.len() == 4 => {
+            let scale = match args.get(3) {
+                Some(value) => value
+                    .trim_start_matches("--scale=")
+                    .parse()
+                    .map_err(|_| format!("invalid scale: {value}"))?,
+                None => scale_from_env()?,
+            };
+            gen5::runtime::play_recompiled(Path::new(&args[1]), Path::new(&args[2]), scale)
         }
         Some("disasm") if args.len() == 4 => {
             let module = args[2].parse::<ModuleId>()?;
@@ -343,6 +378,17 @@ fn inspect(path: &Path) -> Result<(), String> {
 }
 
 /// `first-last:button+button,...` into frame ranges and held buttons.
+/// GEN5_SCALE: the resolution multiple to draw at (default 1).
+fn scale_from_env() -> Result<u32, String> {
+    match std::env::var("GEN5_SCALE") {
+        Ok(value) => match value.parse::<u32>() {
+            Ok(scale @ 1..=8) => Ok(scale),
+            _ => Err(format!("invalid GEN5_SCALE {value}: expected 1 to 8")),
+        },
+        Err(_) => Ok(1),
+    }
+}
+
 fn parse_input_file(text: &str) -> Result<Vec<(std::ops::RangeInclusive<u64>, u32)>, String> {
     let entries: Vec<_> = text
         .lines()
@@ -829,7 +875,7 @@ fn print_usage() {
          gen5 codegen <import-cache-directory>\n\
          gen5 build <import-cache-directory> [c-compiler]\n\
          gen5 boot <import-cache-directory> <rom.nds> [frames [png-directory]]\n\
-         gen5 run <import-cache-directory> <rom.nds>\n\
+         gen5 run <import-cache-directory> <rom.nds> [scale]\n\
          gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 map-preview <import-cache-directory> [zone-index] [output.svg]\n\

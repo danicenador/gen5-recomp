@@ -834,12 +834,34 @@ impl Geometry {
         // Only a previously drawn translucent polygon suppresses another
         // translucent polygon with the same ID; opaque IDs do not.
         let mut ids = vec![64; WIDTH * HEIGHT];
-        let state = RenderState {
-            control: io.get16(0x0400_0060),
-            alpha_ref: io.get8(0x0400_0340),
-            toon: std::array::from_fn(|i| io.get16(0x0400_0380 + i as u32 * 2)),
-            w_buffer: self.render_w,
-        };
+        let state = RenderState::read(io, self.render_w);
+        let triangles = self.triangles();
+        if triangles.is_empty() {
+            return pixels;
+        }
+        // Every pixel only depends on the polygons drawn over it, in order,
+        // so bands of rows render in parallel with the same result.
+        pixels
+            .par_chunks_mut(BAND_ROWS * WIDTH)
+            .zip(depths.par_chunks_mut(BAND_ROWS * WIDTH))
+            .zip(ids.par_chunks_mut(BAND_ROWS * WIDTH))
+            .enumerate()
+            .for_each(|(index, ((pixels, depths), ids))| {
+                let top = index * BAND_ROWS;
+                let bottom = top + pixels.len() / WIDTH;
+                for triangle in &triangles {
+                    let rows = triangle.min_y.max(top)..triangle.max_y.min(bottom);
+                    if !rows.is_empty() {
+                        triangle.draw(rows, top, &state, vram, pixels, depths, ids);
+                    }
+                }
+            });
+        pixels
+    }
+
+    /// The displayed list as triangles in drawing order: clipped, culled,
+    /// and sorted as the hardware sorts polygons.
+    fn triangles(&self) -> Vec<Triangle<'_>> {
         // Opaque polygons precede translucent ones. The hardware sorts
         // opaque polygons, and translucent ones unless SWAP_BUFFERS asked
         // for manual order, by their lowest then highest screen Y. The sort
@@ -867,31 +889,132 @@ impl Geometry {
                     triangles.extend(Triangle::new(
                         [vertices[0], vertices[i], vertices[i + 1]],
                         polygon,
+                        translucent,
                     ));
                 }
             }
         }
-        if triangles.is_empty() {
-            return pixels;
+        triangles
+    }
+
+    /// The displayed list for a GPU rasterizer, with the registers and
+    /// texture memory it reads.
+    pub fn scene(&self, io: &Io, vram: &Vram) -> Scene {
+        let state = RenderState::read(io, self.render_w);
+        let clear = io.get32(0x0400_0350);
+        let mut vertices = Vec::new();
+        let mut batches: Vec<Batch> = Vec::new();
+        for triangle in self.triangles() {
+            let attr = triangle.polygon.attr;
+            let batch = Batch {
+                range: 0..0,
+                translucent: triangle.translucent,
+                depth_equal: attr & (1 << 14) != 0,
+                depth_write: !triangle.translucent || attr & (1 << 11) != 0,
+                id: if triangle.translucent {
+                    ((attr >> 24) & 63) as u8
+                } else {
+                    64
+                },
+            };
+            let start = vertices.len() as u32;
+            match batches.last_mut() {
+                Some(last) if last.same_state(&batch) => {}
+                _ => batches.push(Batch {
+                    range: start..start,
+                    ..batch
+                }),
+            }
+            for (i, vertex) in triangle.vertices.iter().enumerate() {
+                let w = vertex.clip[3];
+                vertices.push(SceneVertex {
+                    position: [
+                        triangle.screen[i][0] as f32,
+                        triangle.screen[i][1] as f32,
+                        (triangle.depth_w[i] * 0.5 + 0.5) as f32,
+                        w as f32,
+                    ],
+                    color: vertex.color.map(|c| c as f32),
+                    uv: vertex.uv.map(|c| c as f32),
+                    attr,
+                    texture: triangle.polygon.texture,
+                    palette: triangle.polygon.palette,
+                });
+            }
+            batches.last_mut().unwrap().range.end = vertices.len() as u32;
         }
-        // Every pixel only depends on the polygons drawn over it, in order,
-        // so bands of rows render in parallel with the same result.
-        pixels
-            .par_chunks_mut(BAND_ROWS * WIDTH)
-            .zip(depths.par_chunks_mut(BAND_ROWS * WIDTH))
-            .zip(ids.par_chunks_mut(BAND_ROWS * WIDTH))
-            .enumerate()
-            .for_each(|(index, ((pixels, depths), ids))| {
-                let top = index * BAND_ROWS;
-                let bottom = top + pixels.len() / WIDTH;
-                for triangle in &triangles {
-                    let rows = triangle.min_y.max(top)..triangle.max_y.min(bottom);
-                    if !rows.is_empty() {
-                        triangle.draw(rows, top, &state, vram, pixels, depths, ids);
-                    }
-                }
-            });
-        pixels
+        Scene {
+            vertices,
+            batches,
+            clear_color: clear as u16 & 0x7fff,
+            clear_alpha: ((clear >> 16) & 31) as u8,
+            clear_depth: f32::from(io.get16(0x0400_0354) & 0x7fff) / 32767.0,
+            control: state.control,
+            alpha_ref: state.alpha_ref,
+            toon: state.toon,
+            w_buffer: state.w_buffer,
+            texture: vram.snapshot(Region::Texture),
+            texture_palette: vram.snapshot(Region::TexturePalette),
+        }
+    }
+}
+
+/// One frame's 3D list for a GPU rasterizer: triangles in drawing order,
+/// in runs that share render state, and what the rasterizer reads.
+#[derive(Clone)]
+pub struct Scene {
+    pub vertices: Vec<SceneVertex>,
+    pub batches: Vec<Batch>,
+    pub clear_color: u16,
+    pub clear_alpha: u8,
+    pub clear_depth: f32,
+    /// DISP3DCNT.
+    pub control: u16,
+    pub alpha_ref: u8,
+    pub toon: [u16; 32],
+    pub w_buffer: bool,
+    /// Texture image and palette memory as mapped now (512 and 128 KiB).
+    pub texture: Vec<u8>,
+    pub texture_palette: Vec<u8>,
+}
+
+/// A triangle corner: DS screen position (pixels, y down), depth as the
+/// Z-buffer stores it, w, and the per-polygon attributes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SceneVertex {
+    pub position: [f32; 4],
+    pub color: [f32; 3],
+    pub uv: [f32; 2],
+    pub attr: u32,
+    pub texture: u32,
+    pub palette: u32,
+}
+
+/// Consecutive triangles drawn with the same blending, depth and stencil
+/// state. `id` is the translucent polygon ID (64 for opaque polygons).
+#[derive(Clone, Debug)]
+pub struct Batch {
+    pub range: std::ops::Range<u32>,
+    pub translucent: bool,
+    pub depth_equal: bool,
+    pub depth_write: bool,
+    pub id: u8,
+}
+
+impl Batch {
+    fn same_state(&self, other: &Self) -> bool {
+        (
+            self.translucent,
+            self.depth_equal,
+            self.depth_write,
+            self.id,
+        ) == (
+            other.translucent,
+            other.depth_equal,
+            other.depth_write,
+            other.id,
+        )
     }
 }
 
@@ -905,6 +1028,17 @@ struct RenderState {
     alpha_ref: u8,
     toon: [u16; 32],
     w_buffer: bool,
+}
+
+impl RenderState {
+    fn read(io: &Io, w_buffer: bool) -> Self {
+        Self {
+            control: io.get16(0x0400_0060),
+            alpha_ref: io.get8(0x0400_0340),
+            toon: std::array::from_fn(|i| io.get16(0x0400_0380 + i as u32 * 2)),
+            w_buffer,
+        }
+    }
 }
 
 /// The hardware's Y sort key: the bottom-most, then the top-most vertex.
@@ -1059,6 +1193,9 @@ fn texture_sample(vram: &Vram, param: u32, palette: u32, uv: [f64; 2]) -> Pixel 
 /// A triangle of a clipped polygon, set up once for every band it covers.
 struct Triangle<'a> {
     polygon: &'a Polygon,
+    /// Drawn in the translucent group.
+    translucent: bool,
+    vertices: [Vertex; 3],
     screen: [[f64; 2]; 3],
     area: f64,
     inverse_area: f64,
@@ -1078,7 +1215,7 @@ const EDGES: [(usize, usize); 3] = [(1, 2), (2, 0), (0, 1)];
 
 impl<'a> Triangle<'a> {
     /// None if nothing of the triangle is drawn.
-    fn new(vertices: [Vertex; 3], polygon: &'a Polygon) -> Option<Self> {
+    fn new(vertices: [Vertex; 3], polygon: &'a Polygon, translucent: bool) -> Option<Self> {
         if vertices.iter().any(|v| v.clip[3] <= 0.0) {
             return None;
         }
@@ -1131,6 +1268,8 @@ impl<'a> Triangle<'a> {
         let inverse_w = vertices.map(|v| 1.0 / v.clip[3]);
         Some(Self {
             polygon,
+            translucent,
+            vertices,
             screen,
             area,
             inverse_area: 1.0 / area,
@@ -1626,6 +1765,54 @@ mod tests {
         io.set16(0x0400_006c, 0x8010); // master brightness black
         let frame = super::super::gpu2d::render(&io, &memory);
         assert_eq!(&frame.top[at..at + 4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn gpu_renderer_matches_software_and_scales_the_3d_layer() {
+        let Ok(mut gpu) = crate::runtime::scaled::Headless::new() else {
+            eprintln!("no graphics adapter; skipping");
+            return;
+        };
+        let mut io = io();
+        let mut memory = super::super::memory::Memory::new();
+        // An opaque red triangle, and a translucent blue one over it and
+        // over the backdrop, with a semi-transparent 2D backdrop target.
+        triangle(&mut io.geometry, 31, 1024, 31, 0);
+        command(&mut io.geometry, 0x29, &[(15 << 16) | 0xc0 | (1 << 24)]);
+        command(&mut io.geometry, 0x40, &[0]);
+        command(&mut io.geometry, 0x20, &[31 << 10]);
+        vertex(&mut io.geometry, -4096, -1024, 0);
+        vertex(&mut io.geometry, 1024, -1024, 0);
+        vertex(&mut io.geometry, 1024, 3072, 0);
+        command(&mut io.geometry, 0x50, &[0]);
+        io.advance_to_vblank();
+        io.set16(0x0400_0304, 0x800a);
+        io.set32(0x0400_0000, 0x10108);
+        io.set16(0x0400_0060, 8); // alpha blending
+        io.set16(0x0400_0050, 1 << 13);
+        memory.palette[0..2].copy_from_slice(&(31u16 << 5).to_le_bytes());
+        let software = super::super::gpu2d::render(&io, &memory);
+        let scaled = super::super::gpu2d::render_scaled(&io, &memory);
+        let (width, height, pixels) = gpu.render(&scaled, 1).unwrap();
+        assert_eq!((width, height), (256, 384));
+        // Blends that land on a half may round either way (one step of 31);
+        // nothing may differ by more.
+        let differing = software
+            .top
+            .chunks(4)
+            .zip(pixels.chunks(4))
+            .filter(|(a, b)| (0..3).any(|i| a[i].abs_diff(b[i]) > 9))
+            .count();
+        assert_eq!(differing, 0);
+        let (width, _, doubled) = gpu.render(&scaled, 2).unwrap();
+        assert_eq!(width, 512);
+        for (x, y) in [(128, 96), (100, 130), (20, 20)] {
+            let one = &pixels[(y * 256 + x) * 4..][..4];
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let two = &doubled[((2 * y + dy) * 512 + 2 * x + dx) * 4..][..4];
+                assert_eq!(one, two, "pixel {x},{y}");
+            }
+        }
     }
 
     #[test]

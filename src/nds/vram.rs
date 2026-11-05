@@ -113,8 +113,16 @@ impl Vram {
                 (4, 3) => place(Region::TexturePalette, 0, size),
                 (4, 4) => place(Region::ABgExtPalette, 0, 0x8000),
                 // F, G: 16 KiB.
-                (5 | 6, 1) => place(Region::ABg, 0x4000 * (offset & 1) + 0x1_0000 * (offset >> 1), size),
-                (5 | 6, 2) => place(Region::AObj, 0x4000 * (offset & 1) + 0x1_0000 * (offset >> 1), size),
+                (5 | 6, 1) => place(
+                    Region::ABg,
+                    0x4000 * (offset & 1) + 0x1_0000 * (offset >> 1),
+                    size,
+                ),
+                (5 | 6, 2) => place(
+                    Region::AObj,
+                    0x4000 * (offset & 1) + 0x1_0000 * (offset >> 1),
+                    size,
+                ),
                 (5 | 6, 3) => place(
                     Region::TexturePalette,
                     0x4000 * ((offset & 1) + 4 * (offset >> 1)),
@@ -149,6 +157,17 @@ impl Vram {
     pub fn offset(&self, region: Region, offset: usize) -> Option<usize> {
         let base = (*self.maps[region as usize].get(offset / UNIT)?)?;
         Some(base + offset % UNIT)
+    }
+
+    /// A region as one linear buffer, unmapped parts zero.
+    pub fn snapshot(&self, region: Region) -> Vec<u8> {
+        let mut out = vec![0; region_size(region)];
+        for (unit, chunk) in out.chunks_mut(UNIT).enumerate() {
+            if let Some(Some(base)) = self.maps[region as usize].get(unit) {
+                chunk.copy_from_slice(&self.banks[*base..*base + UNIT]);
+            }
+        }
+        out
     }
 
     pub fn read8(&self, region: Region, offset: usize) -> u8 {
@@ -191,5 +210,16 @@ mod tests {
         vram.control[7] = 0x80;
         vram.update();
         assert_eq!(vram.cpu_offset(0x0689_8000), Some(0x9_8000));
+    }
+
+    #[test]
+    fn snapshot_follows_the_region_map() {
+        let mut vram = Vram::new();
+        vram.control[1] = 0x80 | 3 | (1 << 3); // B as texture slot 1
+        vram.update();
+        vram.banks[0x2_0000 + 5] = 7;
+        let texture = vram.snapshot(Region::Texture);
+        assert_eq!(texture.len(), 0x8_0000);
+        assert_eq!((texture[0x2_0005], texture[5]), (7, 0));
     }
 }

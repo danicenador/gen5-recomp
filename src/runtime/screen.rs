@@ -6,6 +6,7 @@
 use crate::Result;
 use crate::nds::gpu2d::{Frame, HEIGHT, WIDTH};
 use crate::nds::input::{self, Input};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -41,14 +42,24 @@ impl Screens {
 /// DS display refresh: 33.51 MHz / (355 * 263 * 6) ≈ 59.83 Hz.
 pub const FRAME_TIME: Duration = Duration::from_nanos(16_715_646);
 
-/// Run the window until it is closed; then the process exits.
-pub fn run(title: &str, screens: Arc<Screens>, input: Arc<Input>) -> Result<()> {
+/// The largest resolution multiple keys 1-8 select.
+pub const MAX_SCALE: u32 = 8;
+
+/// Run the window until it is closed; then the process exits. `scale` is
+/// the resolution multiple frames are drawn at; keys 1-8 change it.
+pub fn run(
+    title: &str,
+    screens: Arc<Screens>,
+    input: Arc<Input>,
+    scale: Arc<AtomicU32>,
+) -> Result<()> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("could not create event loop: {error}"))?;
     let mut app = App {
         title: title.to_owned(),
         screens,
         input,
+        scale,
         window: None,
         gpu: None,
         pressed: 0,
@@ -67,6 +78,7 @@ struct App {
     title: String,
     screens: Arc<Screens>,
     input: Arc<Input>,
+    scale: Arc<AtomicU32>,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     pressed: u32,
@@ -121,10 +133,32 @@ impl App {
         };
         if let Some((number, frame)) = self.screens.take_newer(self.shown) {
             self.shown = number;
-            gpu.upload(&frame);
+            gpu.upload(&frame, self.scale.load(Ordering::Relaxed));
         }
         gpu.draw(window.inner_size())
     }
+
+    fn window_title(&self) -> String {
+        match self.scale.load(Ordering::Relaxed) {
+            1 => self.title.clone(),
+            scale => format!("{} - {scale}x resolution", self.title),
+        }
+    }
+}
+
+/// Keys 1-8 select the resolution multiple.
+fn scale_key(key: KeyCode) -> Option<u32> {
+    Some(match key {
+        KeyCode::Digit1 => 1,
+        KeyCode::Digit2 => 2,
+        KeyCode::Digit3 => 3,
+        KeyCode::Digit4 => 4,
+        KeyCode::Digit5 => 5,
+        KeyCode::Digit6 => 6,
+        KeyCode::Digit7 => 7,
+        KeyCode::Digit8 => 8,
+        _ => return None,
+    })
 }
 
 impl ApplicationHandler for App {
@@ -132,9 +166,25 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attributes = Window::default_attributes()
-            .with_title(&self.title)
+        // Big enough to show the chosen resolution, within the monitor.
+        let scale = self.scale.load(Ordering::Relaxed);
+        let mut attributes = Window::default_attributes()
+            .with_title(self.window_title())
             .with_inner_size(winit::dpi::LogicalSize::new(512.0, 768.0));
+        if scale > 2 {
+            let mut size =
+                winit::dpi::PhysicalSize::new(WIDTH as u32 * scale, 2 * HEIGHT as u32 * scale);
+            if let Some(monitor) = event_loop.primary_monitor() {
+                let limit = monitor.size().height * 9 / 10;
+                if size.height > limit {
+                    size = winit::dpi::PhysicalSize::new(
+                        limit * WIDTH as u32 / (2 * HEIGHT as u32),
+                        limit,
+                    );
+                }
+            }
+            attributes = attributes.with_inner_size(size);
+        }
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -161,6 +211,15 @@ impl ApplicationHandler for App {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if code == KeyCode::Escape {
                         event_loop.exit();
+                        return;
+                    }
+                    if let Some(scale) = scale_key(code)
+                        && event.state == ElementState::Pressed
+                    {
+                        self.scale.store(scale, Ordering::Relaxed);
+                        if let Some(window) = &self.window {
+                            window.set_title(&self.window_title());
+                        }
                         return;
                     }
                     if let Some(bit) = button(code) {
@@ -241,9 +300,41 @@ struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// Software frames, at the DS resolution.
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    nearest: wgpu::Sampler,
+    linear: wgpu::Sampler,
+    /// Frames drawn at a multiple of the DS resolution.
+    scaled: Option<super::scaled::Renderer>,
+    /// The scaled output's scale, sampled nearest and linear (for windows
+    /// smaller than the output), while it is what is shown.
+    scaled_view: Option<(u32, wgpu::BindGroup, wgpu::BindGroup)>,
+    showing_scaled: bool,
+}
+
+fn screens_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("DS screens bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
 }
 
 impl Gpu {
@@ -297,6 +388,12 @@ impl Gpu {
             label: Some("DS screens nearest sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let linear = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("DS screens linear sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -376,10 +473,40 @@ impl Gpu {
             texture,
             bind_group,
             pipeline,
+            layout,
+            nearest: sampler,
+            linear,
+            scaled: None,
+            scaled_view: None,
+            showing_scaled: false,
         })
     }
 
-    fn upload(&self, frame: &Frame) {
+    fn upload(&mut self, frame: &Frame, scale: u32) {
+        self.showing_scaled = frame.scaled.is_some();
+        if let Some(scaled) = &frame.scaled {
+            let scale = scale.clamp(1, MAX_SCALE);
+            let renderer = self
+                .scaled
+                .get_or_insert_with(|| super::scaled::Renderer::new(&self.device, &self.queue));
+            let output = renderer.render(scaled, scale);
+            if self
+                .scaled_view
+                .as_ref()
+                .is_none_or(|(shown, _, _)| *shown != scale)
+            {
+                // Sample through the same format as software frames, so
+                // sRGB surfaces pass colors through unchanged.
+                let view = output.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(self.texture.format()),
+                    ..Default::default()
+                });
+                let nearest = screens_bind_group(&self.device, &self.layout, &view, &self.nearest);
+                let linear = screens_bind_group(&self.device, &self.layout, &view, &self.linear);
+                self.scaled_view = Some((scale, nearest, linear));
+            }
+            return;
+        }
         let mut pixels = frame.top.clone();
         pixels.extend_from_slice(&frame.bottom);
         self.queue.write_texture(
@@ -462,7 +589,18 @@ impl Gpu {
                 1.0,
             );
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            let bind_group = match &self.scaled_view {
+                // Shrinking a large output: average texels rather than skip them.
+                Some((shown, nearest, linear)) if self.showing_scaled => {
+                    if (*shown as f32) > scale {
+                        linear
+                    } else {
+                        nearest
+                    }
+                }
+                _ => &self.bind_group,
+            };
+            pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
