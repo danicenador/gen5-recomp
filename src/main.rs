@@ -1,12 +1,7 @@
 use gen5::formats::nds::{Cpu, NdsRom};
-use gen5::game::bw2::field;
-use gen5::game::bw2::map;
-use gen5::game::gen5 as gen5_game;
-use gen5::importer;
+use gen5::importer::{self, title as gen5_game};
 use gen5::recomp::analysis::{self as recomp_analysis, Analysis};
 use gen5::recomp::program::{ModuleId, Program, Resolution};
-use gen5::render;
-use gen5::runtime;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -240,81 +235,6 @@ fn run() -> Result<(), String> {
                 .get(2)
                 .map_or_else(|| Path::new(".gen5-cache"), |path| Path::new(path));
             import(Path::new(&args[1]), cache_path)
-        }
-        Some("map-preview") if (2..=4).contains(&args.len()) => {
-            let zone_id = args
-                .get(2)
-                .map(|value| {
-                    value
-                        .parse::<u32>()
-                        .map_err(|_| format!("invalid zone index '{value}'"))
-                })
-                .transpose()?
-                .unwrap_or(map::ASPERTIA_CITY_ZONE);
-            let cache_root = Path::new(&args[1]);
-            let output = args.get(3).map_or_else(
-                || {
-                    cache_root
-                        .join("previews")
-                        .join(format!("zone-{zone_id}.svg"))
-                },
-                PathBuf::from,
-            );
-            map_preview(cache_root, zone_id, &output)
-        }
-        Some("walk") if (2..=5).contains(&args.len()) => {
-            if args.len() == 4 {
-                print_usage();
-                return Err("provide both start coordinates or neither".to_owned());
-            }
-            let zone_id = args
-                .get(2)
-                .map(|value| {
-                    value
-                        .parse::<u32>()
-                        .map_err(|_| format!("invalid zone index '{value}'"))
-                })
-                .transpose()?
-                .unwrap_or(map::ASPERTIA_CITY_ZONE);
-            let start = if args.len() == 5 {
-                let x = args[3]
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid start x coordinate '{}'", args[3]))?;
-                let z = args[4]
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid start z coordinate '{}'", args[4]))?;
-                Some((x, z))
-            } else {
-                None
-            };
-            field_walk(Path::new(&args[1]), zone_id, start)
-        }
-        Some("play") if (2..=5).contains(&args.len()) => {
-            if args.len() == 4 {
-                print_usage();
-                return Err("provide both start coordinates or neither".to_owned());
-            }
-            let zone_id = args
-                .get(2)
-                .map(|value| {
-                    value
-                        .parse::<u32>()
-                        .map_err(|_| format!("invalid zone index '{value}'"))
-                })
-                .transpose()?
-                .unwrap_or(map::ASPERTIA_CITY_ZONE);
-            let start = if args.len() == 5 {
-                let x = args[3]
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid start x coordinate '{}'", args[3]))?;
-                let z = args[4]
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid start z coordinate '{}'", args[4]))?;
-                Some((x, z))
-            } else {
-                None
-            };
-            field_play(Path::new(&args[1]), zone_id, start)
         }
         Some("help" | "--help" | "-h") if args.len() == 1 => {
             print_usage();
@@ -808,47 +728,6 @@ fn import(path: &Path, cache_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn map_preview(cache_root: &Path, zone_id: u32, output: &Path) -> Result<(), String> {
-    let zone = map::load_zone(cache_root, zone_id)?;
-    let preview = render::render_map_svg(cache_root, &zone, output)?;
-    println!("Rendered {}", zone.display_name());
-    println!(
-        "Zone {}, area {}, matrix {} ({}×{}), map models: {}",
-        zone.zone_id,
-        zone.area_id,
-        zone.matrix_id,
-        zone.width,
-        zone.height,
-        preview
-            .model_ids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    println!("Geometry: {} triangles", preview.triangle_count);
-    println!("Preview: {}", preview.output.display());
-    Ok(())
-}
-
-fn field_walk(
-    cache_root: &Path,
-    zone_id: u32,
-    start: Option<(usize, usize)>,
-) -> Result<(), String> {
-    let zone = map::load_zone(cache_root, zone_id)?;
-    field::run_terminal(cache_root, zone, start)
-}
-
-fn field_play(
-    cache_root: &Path,
-    zone_id: u32,
-    start: Option<(usize, usize)>,
-) -> Result<(), String> {
-    let zone = map::load_zone(cache_root, zone_id)?;
-    runtime::run(cache_root, zone, start)
-}
-
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -866,7 +745,7 @@ fn human_size(bytes: u64) -> String {
 
 fn print_usage() {
     eprintln!(
-        "gen5 — native Pokémon Gen V ROM explorer/importer\n\n\
+        "gen5 — Pokémon Gen V ROM importer and static recompiler\n\n\
          Usage:\n\
          gen5 inspect <rom.nds>\n\
          gen5 list <rom.nds> [path-prefix]\n\
@@ -878,9 +757,6 @@ fn print_usage() {
          gen5 run <import-cache-directory> <rom.nds> [scale]\n\
          gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
-         gen5 map-preview <import-cache-directory> [zone-index] [output.svg]\n\
-         gen5 play <import-cache-directory> [zone-index [start-x start-z]]\n\
-         gen5 walk <import-cache-directory> [zone-index [start-x start-z]]\n\
          gen5 help"
     );
 }
