@@ -147,6 +147,18 @@ frames per second. Keys: arrows for the D-pad, X = A, Z = B, S = X, A = Y,
 Q = L, W = R, Enter = Start, Right Shift or Backspace = Select, and the
 mouse on the lower screen as the stylus. Escape quits.
 
+`run` takes an optional resolution multiple after the ROM, `run <cache>
+<rom> 4` (or `GEN5_SCALE=4`), and keys 1 to 8 change it while playing. At
+1 the software renderer draws the DS's own 256x192 per screen. Above 1 the
+GPU draws the 3D layer at that multiple, so models and the field gain
+detail, while 2D backgrounds and sprites are drawn at the DS resolution and
+repeated, so they stay sharp. A window smaller than the result shows it
+filtered down. 3D the game shows through display capture (the title
+screen's Kyurem) stays at the DS resolution, since the game reads captured
+pixels back.
+`boot` saves screenshots at the same multiple with `GEN5_SCALE`, and
+`GEN5_GPU=1` uses the GPU renderer at 1, to compare it with the software one.
+
 `boot` runs headless for a number of frames and ends with a report; with a
 directory it also saves both screens as PNG every 30 frames.
 `GEN5_INPUT=first-last:button+button,...` holds buttons over frame ranges,
@@ -243,9 +255,11 @@ The `nds` module provides:
   hardware, polygon RAM (2048 polygons, 6144 vertices) only keeps polygons
   that survive frustum, far-plane and facing tests, so wide scenes such as
   the opening flyover keep their distant map blocks; polygons are drawn in
-  the hardware's Y order. Everything runs on the CPU, not the host GPU
-  (the window only presents finished frames); bands of rows are rasterized
-  in parallel on the host's cores. Matrix and
+  the hardware's Y order. At the DS resolution everything runs on the CPU,
+  with bands of rows rasterized in parallel on the host's cores; at higher
+  resolutions the same culled, clipped and sorted triangles go to
+  `runtime::scaled`, which rasterizes them with wgpu (textures decoded in
+  the shader, translucent polygon IDs in the stencil buffer). Matrix and
   geometry-test results are readable by the game. Commands run synchronously
   except buffer swaps, which wait for vblank; FIFO timing is approximate.
   Fog, edge marking, antialiasing, wireframe, shadow polygons and rear-plane

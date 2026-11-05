@@ -1,5 +1,6 @@
 pub mod audio;
 mod desktop;
+pub mod scaled;
 pub mod screen;
 mod wgpu_renderer;
 
@@ -19,9 +20,13 @@ pub fn run(cache_root: &Path, zone: ZoneMap, start: Option<(usize, usize)>) -> R
 }
 
 /// Play the recompiled game in a window: the game runs on its own threads,
-/// paced to the DS frame rate, and the window shows its frames.
-pub fn play_recompiled(cache_root: &Path, rom: &Path) -> Result<()> {
+/// paced to the DS frame rate, and the window shows its frames, drawn at
+/// `scale` times the DS resolution (keys 1-8 change it).
+pub fn play_recompiled(cache_root: &Path, rom: &Path, scale: u32) -> Result<()> {
     use crate::nds::{input::Input, machine};
+    let scale = Arc::new(std::sync::atomic::AtomicU32::new(
+        scale.clamp(1, screen::MAX_SCALE),
+    ));
     let screens = Arc::new(screen::Screens::default());
     let input = Arc::new(Input::default());
     let audio = Arc::new(crate::nds::sound::AudioQueue::default());
@@ -49,6 +54,7 @@ pub fn play_recompiled(cache_root: &Path, rom: &Path) -> Result<()> {
         on_vblank: None,
         input: Some(input.clone()),
         audio: Some(audio.clone()),
+        scale: scale.clone(),
     };
     let (cache_root, rom): (PathBuf, PathBuf) = (cache_root.into(), rom.into());
     std::thread::spawn(move || {
@@ -57,7 +63,7 @@ pub fn play_recompiled(cache_root: &Path, rom: &Path) -> Result<()> {
             std::process::exit(1);
         }
     });
-    screen::run("Gen5 Recomp", screens, input)?;
+    screen::run("Gen5 Recomp", screens, input, scale)?;
     // The game threads never return; closing the window ends the program.
     std::process::exit(0);
 }

@@ -19,11 +19,13 @@ const LAYER_BACKDROP: usize = 5;
 /// Lines per parallel task when drawing a screen.
 const LINES_PER_TASK: usize = 8;
 
-/// Both screens as RGBA8.
+/// Both screens as RGBA8, or, for a GPU renderer at a higher resolution,
+/// what it needs to draw them (`top` and `bottom` are then empty).
 #[derive(Clone)]
 pub struct Frame {
     pub top: Vec<u8>,
     pub bottom: Vec<u8>,
+    pub scaled: Option<Box<ScaledFrame>>,
 }
 
 impl Frame {
@@ -31,7 +33,90 @@ impl Frame {
         Self {
             top: vec![0; WIDTH * HEIGHT * 4],
             bottom: vec![0; WIDTH * HEIGHT * 4],
+            scaled: None,
         }
+    }
+}
+
+/// A frame for a GPU renderer: both screens composed at native resolution
+/// with the 3D layer left open, and the 3D list to draw at any resolution.
+/// 2D layers scale by pixel repetition; only the 3D layer gains detail.
+#[derive(Clone)]
+pub struct ScaledFrame {
+    /// 256 x 384 `Composed::pack` pixels, top screen first.
+    pub pixels: Vec<[u32; 4]>,
+    /// MASTER_BRIGHT of the top and bottom screens.
+    pub brightness: [u16; 2],
+    pub three_d: Option<ThreeDLayer>,
+}
+
+/// Engine A's 3D layer: the screen it is on (0 top, 1 bottom), its BG0
+/// horizontal scroll, and the list.
+#[derive(Clone)]
+pub struct ThreeDLayer {
+    pub screen: usize,
+    pub scroll: u32,
+    pub scene: super::gpu3d::Scene,
+}
+
+/// Both screens for a GPU renderer.
+pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
+    let power = io.get16(POWCNT1);
+    let blank = vec![Pixel::default(); WIDTH * HEIGHT];
+    let mut three_d = None;
+    let mut engine = |b: bool, bit: u16| -> (Vec<Composed>, u16) {
+        if power & bit == 0 {
+            return (vec![Composed::fixed(0); WIDTH * HEIGHT], 0);
+        }
+        let engine = Engine::new(io, memory, b, &blank);
+        let dispcnt = engine.reg32(0);
+        let brightness = engine.reg16(0x6C);
+        if b || engine.display_mode(dispcnt) != 1 || dispcnt & 0x80 != 0 {
+            let colors = engine
+                .colors(dispcnt)
+                .into_iter()
+                .map(Composed::fixed)
+                .collect();
+            return (colors, brightness);
+        }
+        let mut composed = vec![Composed::default(); WIDTH * HEIGHT];
+        let scroll = std::sync::atomic::AtomicUsize::new(0);
+        composed
+            .par_chunks_mut(WIDTH * LINES_PER_TASK)
+            .enumerate()
+            .for_each(|(index, rows)| {
+                for (offset, row) in rows.chunks_mut(WIDTH).enumerate() {
+                    let line = index * LINES_PER_TASK + offset;
+                    let s = engine.compose_line(dispcnt, line, row);
+                    scroll.store(s, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        let uses_three_d = dispcnt & 0x100 != 0 && engine.bg_kind(dispcnt, 0) == BgKind::ThreeD;
+        if power & (1 << 3) != 0 && uses_three_d {
+            three_d = Some((
+                scroll.into_inner() as u32,
+                io.geometry.scene(io, &memory.vram),
+            ));
+        }
+        (composed, brightness)
+    };
+    let (a, a_bright) = engine(false, 1 << 1);
+    let (b, b_bright) = engine(true, 1 << 9);
+    // POWCNT1 bit 15 puts engine A on the top screen.
+    let a_on_top = power & 0x8000 != 0;
+    let (top, bottom, brightness) = if a_on_top {
+        (a, b, [a_bright, b_bright])
+    } else {
+        (b, a, [b_bright, a_bright])
+    };
+    ScaledFrame {
+        pixels: top.iter().chain(&bottom).map(Composed::pack).collect(),
+        brightness,
+        three_d: three_d.map(|(scroll, scene)| ThreeDLayer {
+            screen: usize::from(!a_on_top),
+            scroll,
+            scene,
+        }),
     }
 }
 
@@ -99,9 +184,17 @@ pub fn render_with(io: &Io, memory: &Memory, cache: &mut FrameCache) -> Frame {
     let b = engine(cache, true, 1 << 9);
     // POWCNT1 bit 15 puts engine A on the top screen.
     if power & 0x8000 != 0 {
-        Frame { top: a, bottom: b }
+        Frame {
+            top: a,
+            bottom: b,
+            scaled: None,
+        }
     } else {
-        Frame { top: b, bottom: a }
+        Frame {
+            top: b,
+            bottom: a,
+            scaled: None,
+        }
     }
 }
 
@@ -207,7 +300,211 @@ struct Layer {
     color: u16,
     layer: usize,
     semi: bool,
-    three_d_alpha: Option<u8>,
+    /// Engine A's BG0 showing the 3D layer; its color is the 3D pixel's.
+    three_d: bool,
+}
+
+/// BLDALPHA's EVA and EVB and BLDY's EVY, each at most 16.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Coefficients {
+    pub eva: u8,
+    pub evb: u8,
+    pub evy: u8,
+}
+
+/// What a special effect does to the 3D layer when it is the top layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effect {
+    None,
+    /// Alpha blend with the layer below (EVA, EVB).
+    Mix,
+    Brighten,
+    Darken,
+}
+
+/// How a pixel combines with the 3D pixel under it, when there is one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum With {
+    /// The 3D layer is hidden, or below the top two layers.
+    Fixed(u16),
+    /// The 3D layer is on top, over `second`. A translucent 3D pixel blends
+    /// with it by its own alpha when `alpha_blend`; otherwise `effect`.
+    First {
+        second: u16,
+        alpha_blend: bool,
+        effect: Effect,
+    },
+    /// The 3D layer is second, and `first` alpha-blends with it.
+    Second { first: u16 },
+}
+
+/// One pixel of a screen with the 3D layer left open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Composed {
+    /// The color where the 3D layer is transparent.
+    pub without: u16,
+    pub with: With,
+    pub coefficients: Coefficients,
+}
+
+impl Default for Composed {
+    fn default() -> Self {
+        Self::fixed(0)
+    }
+}
+
+impl Composed {
+    /// A pixel that does not depend on the 3D layer.
+    pub fn fixed(color: u16) -> Self {
+        Self {
+            without: color,
+            with: With::Fixed(color),
+            coefficients: Coefficients::default(),
+        }
+    }
+
+    /// The final color, given the visible 3D pixel here, if any.
+    pub fn resolve(&self, three_d: Option<Pixel>) -> u16 {
+        let Some(pixel) = three_d else {
+            return self.without;
+        };
+        let Coefficients { eva, evb, evy } = self.coefficients;
+        let (eva, evb, evy) = (u32::from(eva), u32::from(evb), u32::from(evy));
+        match self.with {
+            With::Fixed(color) => color,
+            With::First {
+                second,
+                alpha_blend,
+                effect,
+            } => {
+                if pixel.alpha < 31 && alpha_blend {
+                    let a = u32::from(pixel.alpha) + 1;
+                    let mut result = 0;
+                    for shift in [0, 5, 10] {
+                        let c = (u32::from((pixel.color >> shift) & 31) * a
+                            + u32::from((second >> shift) & 31) * (32 - a))
+                            / 32;
+                        result |= (c as u16) << shift;
+                    }
+                    return result;
+                }
+                match effect {
+                    Effect::None => pixel.color,
+                    Effect::Mix => mix(pixel.color, second, eva, evb),
+                    Effect::Brighten => map_channels(pixel.color, |c| c + (31 - c) * evy / 16),
+                    Effect::Darken => map_channels(pixel.color, |c| c - c * evy / 16),
+                }
+            }
+            With::Second { first } => mix(first, pixel.color, eva, evb),
+        }
+    }
+
+    /// Packed for the GPU compositor: the color without 3D and the kind
+    /// (bits 16-17: fixed, 3D first, 3D second); the other color; the
+    /// alpha-blend flag (bit 0), effect (bits 1-2) and EVA, EVB, EVY
+    /// (bits 8, 16, 24).
+    pub fn pack(&self) -> [u32; 4] {
+        let (kind, other, flags) = match self.with {
+            With::Fixed(color) => (0, color, 0),
+            With::First {
+                second,
+                alpha_blend,
+                effect,
+            } => (1, second, u32::from(alpha_blend) | (effect as u32) << 1),
+            With::Second { first } => (2, first, 0),
+        };
+        let c = self.coefficients;
+        [
+            u32::from(self.without) | kind << 16,
+            u32::from(other),
+            flags | u32::from(c.eva) << 8 | u32::from(c.evb) << 16 | u32::from(c.evy) << 24,
+            0,
+        ]
+    }
+}
+
+/// The blend registers for one pixel.
+struct BlendState {
+    /// BLDCNT.
+    blend: u16,
+    /// The window lets special effects through.
+    effects: bool,
+    coefficients: Coefficients,
+}
+
+impl BlendState {
+    fn first_target(&self, layer: usize) -> bool {
+        self.blend & (1 << layer) != 0
+    }
+
+    fn second_target(&self, layer: usize) -> bool {
+        self.blend & (0x100 << layer) != 0
+    }
+
+    fn mode(&self) -> u16 {
+        (self.blend >> 6) & 3
+    }
+
+    /// The color of the top two 2D layers (`first` is None when only the
+    /// backdrop shows).
+    fn fixed(&self, first: Option<Layer>, second: Layer, backdrop: Layer) -> u16 {
+        let top = first.is_some();
+        let first = first.unwrap_or(backdrop);
+        let Coefficients { eva, evb, evy } = self.coefficients;
+        let (eva, evb, evy) = (u32::from(eva), u32::from(evb), u32::from(evy));
+        let is_second = self.second_target(second.layer);
+        if first.semi && is_second && top {
+            mix(first.color, second.color, eva, evb)
+        } else if !self.effects || !self.first_target(first.layer) {
+            first.color
+        } else {
+            match self.mode() {
+                1 if is_second && top => mix(first.color, second.color, eva, evb),
+                2 => map_channels(first.color, |c| c + (31 - c) * evy / 16),
+                3 => map_channels(first.color, |c| c - c * evy / 16),
+                _ => first.color,
+            }
+        }
+    }
+
+    /// The 3D layer on top of `second`.
+    fn three_d_first(&self, second: Layer) -> With {
+        let is_second = self.second_target(second.layer);
+        let effect = if !self.effects || !self.first_target(0) {
+            Effect::None
+        } else {
+            match self.mode() {
+                1 if is_second => Effect::Mix,
+                2 => Effect::Brighten,
+                3 => Effect::Darken,
+                _ => Effect::None,
+            }
+        };
+        With::First {
+            second: second.color,
+            alpha_blend: is_second && self.effects,
+            effect,
+        }
+    }
+
+    /// `first` over the 3D layer.
+    fn three_d_second(&self, first: Layer) -> With {
+        let blends = self.second_target(0);
+        if first.semi && blends {
+            return With::Second { first: first.color };
+        }
+        if !self.effects || !self.first_target(first.layer) {
+            return With::Fixed(first.color);
+        }
+        let Coefficients { evy, .. } = self.coefficients;
+        let evy = u32::from(evy);
+        match self.mode() {
+            1 if blends => With::Second { first: first.color },
+            2 => With::Fixed(map_channels(first.color, |c| c + (31 - c) * evy / 16)),
+            3 => With::Fixed(map_channels(first.color, |c| c - c * evy / 16)),
+            _ => With::Fixed(first.color),
+        }
+    }
 }
 
 /// One engine's view of the hardware. It holds no `Memory` (whose page
@@ -364,9 +661,26 @@ impl<'a> Engine<'a> {
     }
 
     fn render_line(&self, dispcnt: u32, line: usize, out: &mut [u16]) {
+        let mut composed = [Composed::default(); WIDTH];
+        let scroll = self.compose_line(dispcnt, line, &mut composed);
+        for (x, (out, composed)) in out.iter_mut().zip(&composed).enumerate() {
+            let sx = (x + scroll) & 0x1ff;
+            let three_d = (sx < WIDTH)
+                .then(|| self.three_d[line * WIDTH + sx])
+                .filter(|pixel| pixel.alpha != 0);
+            *out = composed.resolve(three_d);
+        }
+    }
+
+    /// Compose one line, leaving the 3D layer (engine A's BG0) open: each
+    /// pixel says what it shows without a 3D pixel and how it combines with
+    /// one. Returns the 3D layer's horizontal scroll.
+    fn compose_line(&self, dispcnt: u32, line: usize, out: &mut [Composed]) -> usize {
         let mut bgs: [[Option<u16>; WIDTH]; 4] = [[None; WIDTH]; 4];
         let mut priorities = [0_u8; 4];
         let mut enabled = [false; 4];
+        let mut three_d = false;
+        let scroll = usize::from(self.reg16(0x10) & 0x1ff);
         for index in 0..4 {
             if dispcnt & (0x100 << index) == 0 {
                 continue;
@@ -380,18 +694,7 @@ impl<'a> Engine<'a> {
                     let kind = self.bg_kind(dispcnt, index);
                     self.affine_line(dispcnt, index, control, kind, line, &mut bgs[index]);
                 }
-                BgKind::ThreeD => {
-                    let scroll = usize::from(self.reg16(0x10) & 0x1ff);
-                    for (x, color) in bgs[index].iter_mut().enumerate() {
-                        let sx = (x + scroll) & 0x1ff;
-                        if sx < WIDTH {
-                            let pixel = self.three_d[line * WIDTH + sx];
-                            if pixel.alpha != 0 {
-                                *color = Some(pixel.color);
-                            }
-                        }
-                    }
-                }
+                BgKind::ThreeD => three_d = true,
                 BgKind::Off => enabled[index] = false,
             }
         }
@@ -404,19 +707,31 @@ impl<'a> Engine<'a> {
         let window_masks = self.window_masks(dispcnt, line, &obj_window);
         let blend = self.reg16(0x50);
         let alpha = self.reg16(0x52);
-        let eva = u32::from(alpha & 0x1F).min(16);
-        let evb = u32::from((alpha >> 8) & 0x1F).min(16);
-        let evy = u32::from(self.reg16(0x54) & 0x1F).min(16);
-        let backdrop = self.palette(0);
+        let coefficients = Coefficients {
+            eva: (alpha & 0x1F).min(16) as u8,
+            evb: ((alpha >> 8) & 0x1F).min(16) as u8,
+            evy: (self.reg16(0x54) & 0x1F).min(16) as u8,
+        };
+        let backdrop = Layer {
+            color: self.palette(0),
+            layer: LAYER_BACKDROP,
+            semi: false,
+            three_d: false,
+        };
+        let effects = |mask: u16| BlendState {
+            blend,
+            effects: mask & 0x20 != 0,
+            coefficients,
+        };
 
-        for x in 0..WIDTH {
+        for (x, out) in out.iter_mut().enumerate() {
             let mask = window_masks[x];
-            let mut top: [Option<Layer>; 2] = [None, None];
+            // The top three candidates: enough to know the top two with and
+            // without the 3D pixel.
+            let mut stack: [Option<Layer>; 3] = [None; 3];
             let mut push = |layer: Layer| {
-                if top[0].is_none() {
-                    top[0] = Some(layer);
-                } else if top[1].is_none() {
-                    top[1] = Some(layer);
+                if let Some(slot) = stack.iter_mut().find(|slot| slot.is_none()) {
+                    *slot = Some(layer);
                 }
             };
             for priority in 0..4 {
@@ -428,70 +743,52 @@ impl<'a> Engine<'a> {
                         color: obj.color,
                         layer: LAYER_OBJ,
                         semi: obj.semi,
-                        three_d_alpha: None,
+                        three_d: false,
                     });
                 }
                 for index in 0..4 {
-                    if enabled[index]
-                        && priorities[index] == priority
-                        && mask & (1 << index) != 0
-                        && let Some(color) = bgs[index][x]
+                    if !enabled[index] || priorities[index] != priority || mask & (1 << index) == 0
                     {
+                        continue;
+                    }
+                    if index == 0 && three_d {
+                        if (x + scroll) & 0x1ff < WIDTH {
+                            push(Layer {
+                                color: 0,
+                                layer: 0,
+                                semi: false,
+                                three_d: true,
+                            });
+                        }
+                    } else if let Some(color) = bgs[index][x] {
                         push(Layer {
                             color,
                             layer: index,
                             semi: false,
-                            three_d_alpha: if index == 0
-                                && self.bg_kind(dispcnt, 0) == BgKind::ThreeD
-                            {
-                                let sx = (x + usize::from(self.reg16(0x10) & 0x1ff)) & 0x1ff;
-                                Some(self.three_d[line * WIDTH + sx].alpha)
-                            } else {
-                                None
-                            },
+                            three_d: false,
                         });
                     }
                 }
             }
-            let backdrop_layer = Layer {
-                color: backdrop,
-                layer: LAYER_BACKDROP,
-                semi: false,
-                three_d_alpha: None,
+            let state = effects(mask);
+            let mut flat = stack.iter().flatten().filter(|layer| !layer.three_d);
+            let (first, second) = (flat.next().copied(), flat.next().copied());
+            let without = state.fixed(first, second.unwrap_or(backdrop), backdrop);
+            let position = stack
+                .iter()
+                .position(|layer| layer.is_some_and(|layer| layer.three_d));
+            let with = match position {
+                Some(0) => state.three_d_first(stack[1].unwrap_or(backdrop)),
+                Some(1) => state.three_d_second(stack[0].unwrap()),
+                _ => With::Fixed(without),
             };
-            let first = top[0].unwrap_or(backdrop_layer);
-            let second = top[1].unwrap_or(backdrop_layer);
-            let is_second = blend & (0x100 << second.layer) != 0;
-            let is_first = blend & (1 << first.layer) != 0;
-            out[x] = if let Some(alpha) = first.three_d_alpha
-                && alpha < 31
-                && is_second
-                && mask & 0x20 != 0
-            {
-                let a = u32::from(alpha) + 1;
-                let c1 = first.color;
-                let c2 = second.color;
-                let mut result = 0;
-                for shift in [0, 5, 10] {
-                    let c = (u32::from((c1 >> shift) & 31) * a
-                        + u32::from((c2 >> shift) & 31) * (32 - a))
-                        / 32;
-                    result |= (c as u16) << shift;
-                }
-                result
-            } else if first.semi && is_second && top[0].is_some() {
-                mix(first.color, second.color, eva, evb)
-            } else if mask & 0x20 == 0 || !is_first {
-                first.color
-            } else {
-                match (blend >> 6) & 3 {
-                    1 if is_second && top[0].is_some() => mix(first.color, second.color, eva, evb),
-                    2 => map_channels(first.color, |c| c + (31 - c) * evy / 16),
-                    3 => map_channels(first.color, |c| c - c * evy / 16),
-                    _ => first.color,
-                }
+            *out = Composed {
+                without,
+                with,
+                coefficients,
             };
         }
+        scroll
     }
 
     /// Which layers (bits 0-4) and effects (bit 5) each pixel shows.
