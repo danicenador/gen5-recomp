@@ -4,9 +4,11 @@
 //! seen. Engine A's BG0 can use the geometry engine's rendered 3D layer.
 //! Behaviour per GBATEK.
 
+use super::gpu3d::Pixel;
 use super::io::Io;
 use super::memory::Memory;
-use super::vram::Region;
+use super::vram::{Region, Vram};
+use rayon::prelude::*;
 
 pub const WIDTH: usize = 256;
 pub const HEIGHT: usize = 192;
@@ -14,6 +16,8 @@ pub const HEIGHT: usize = 192;
 const POWCNT1: u32 = 0x0400_0304;
 const LAYER_OBJ: usize = 4;
 const LAYER_BACKDROP: usize = 5;
+/// Lines per parallel task when drawing a screen.
+const LINES_PER_TASK: usize = 8;
 
 /// Both screens as RGBA8.
 #[derive(Clone)]
@@ -32,26 +36,67 @@ impl Frame {
 }
 
 pub fn render(io: &Io, memory: &Memory) -> Frame {
+    render_with(io, memory, &mut FrameCache::default())
+}
+
+/// What display capture and the screens of one frame share: the 3D layer
+/// and engine A's lines. Nothing they read changes between the two (capture
+/// only writes LCDC banks, which no engine or texture reads).
+#[derive(Default)]
+pub struct FrameCache {
+    three_d: Option<Vec<Pixel>>,
+    /// Engine A's lines before master brightness, and whether they were
+    /// composed with the rendered 3D layer rather than a blank one.
+    engine_a: Option<(bool, Vec<u16>)>,
+}
+
+impl FrameCache {
+    fn three_d(&mut self, io: &Io, memory: &Memory) -> &[Pixel] {
+        self.three_d
+            .get_or_insert_with(|| io.geometry.render(io, &memory.vram))
+    }
+
+    /// Engine A's lines, composed with the 3D layer or a blank one.
+    fn engine_a(&mut self, io: &Io, memory: &Memory, with_three_d: bool, dispcnt: u32) -> &[u16] {
+        if self
+            .engine_a
+            .as_ref()
+            .is_none_or(|(three_d, _)| *three_d != with_three_d)
+        {
+            let blank;
+            let three_d = if with_three_d {
+                self.three_d(io, memory)
+            } else {
+                blank = vec![Pixel::default(); WIDTH * HEIGHT];
+                &blank
+            };
+            let lines = Engine::new(io, memory, false, three_d).lines(dispcnt);
+            self.engine_a = Some((with_three_d, lines));
+        }
+        &self.engine_a.as_ref().unwrap().1
+    }
+}
+
+/// `render`, sharing work with this frame's `capture_with`.
+pub fn render_with(io: &Io, memory: &Memory, cache: &mut FrameCache) -> Frame {
     let power = io.get16(POWCNT1);
-    let three_d = if power & (1 << 3) != 0 {
-        io.geometry.render(io, &memory.vram)
-    } else {
-        vec![super::gpu3d::Pixel::default(); WIDTH * HEIGHT]
-    };
-    let engine = |b: bool, bit: u16| {
+    let with_three_d = power & (1 << 3) != 0;
+    let blank = vec![Pixel::default(); WIDTH * HEIGHT];
+    let engine = |cache: &mut FrameCache, b: bool, bit: u16| {
         if power & bit == 0 {
             return vec![0; WIDTH * HEIGHT * 4];
         }
-        Engine {
-            io,
-            memory,
-            b,
-            three_d: &three_d,
-        }
-        .render()
+        let engine = Engine::new(io, memory, b, &blank);
+        let dispcnt = engine.reg32(0);
+        let colors = if !b && engine.display_mode(dispcnt) == 1 && dispcnt & 0x80 == 0 {
+            cache.engine_a(io, memory, with_three_d, dispcnt).to_vec()
+        } else {
+            engine.colors(dispcnt)
+        };
+        engine.brighten(&colors)
     };
-    let a = engine(false, 1 << 1);
-    let b = engine(true, 1 << 9);
+    let a = engine(cache, false, 1 << 1);
+    let b = engine(cache, true, 1 << 9);
     // POWCNT1 bit 15 puts engine A on the top screen.
     if power & 0x8000 != 0 {
         Frame { top: a, bottom: b }
@@ -64,6 +109,11 @@ pub fn render(io: &Io, memory: &Memory) -> Frame {
 /// Capture observes engine A before master brightness and writes physical
 /// LCDC banks; software can remap the result into either engine next frame.
 pub fn capture(io: &mut Io, memory: &mut Memory) {
+    capture_with(io, memory, &mut FrameCache::default());
+}
+
+/// `capture`, sharing work with this frame's `render_with`.
+pub fn capture_with(io: &mut Io, memory: &mut Memory, cache: &mut FrameCache) {
     const CAPTURE: u32 = 0x0400_0064;
     let control = io.get32(CAPTURE);
     if control & 0x8000_0000 == 0 {
@@ -78,33 +128,19 @@ pub fn capture(io: &mut Io, memory: &mut Memory) {
     let (width, height) =
         [(128, 128), (256, 64), (256, 128), (256, 192)][((control >> 20) & 3) as usize];
     let mode = (control >> 29) & 3;
-    let three_d = if mode != 1 {
-        io.geometry.render(io, &memory.vram)
-    } else {
-        Vec::new()
-    };
     let mut source_a = vec![0u16; WIDTH * HEIGHT];
     if mode != 1 {
+        let dispcnt = io.get32(0x0400_0000);
         if control & (1 << 24) != 0 {
-            for (out, p) in source_a.iter_mut().zip(&three_d) {
+            for (out, p) in source_a.iter_mut().zip(cache.three_d(io, memory)) {
                 *out = p.color | if p.alpha != 0 { 0x8000 } else { 0 };
             }
+        } else if dispcnt & 0x80 != 0 {
+            source_a.fill(0xffff);
         } else {
-            let engine = Engine {
-                io,
-                memory,
-                b: false,
-                three_d: &three_d,
-            };
-            if io.get32(0x0400_0000) & 0x80 != 0 {
-                source_a.fill(0xffff);
-            } else {
-                for (line, row) in source_a.chunks_mut(WIDTH).enumerate() {
-                    engine.render_line(io.get32(0x0400_0000), line, row);
-                    for c in row {
-                        *c |= 0x8000;
-                    }
-                }
+            let lines = cache.engine_a(io, memory, true, dispcnt);
+            for (out, &c) in source_a.iter_mut().zip(lines) {
+                *out = c | 0x8000;
             }
         }
     }
@@ -174,15 +210,30 @@ struct Layer {
     three_d_alpha: Option<u8>,
 }
 
+/// One engine's view of the hardware. It holds no `Memory` (whose page
+/// tables are raw pointers), so lines can be drawn on several threads.
 struct Engine<'a> {
     io: &'a Io,
-    memory: &'a Memory,
+    vram: &'a Vram,
+    palette_ram: &'a [u8],
+    oam: &'a [u8],
     /// Engine B (sub) rather than A (main).
     b: bool,
-    three_d: &'a [super::gpu3d::Pixel],
+    three_d: &'a [Pixel],
 }
 
-impl Engine<'_> {
+impl<'a> Engine<'a> {
+    fn new(io: &'a Io, memory: &'a Memory, b: bool, three_d: &'a [Pixel]) -> Self {
+        Self {
+            io,
+            vram: &memory.vram,
+            palette_ram: &memory.palette,
+            oam: &memory.oam,
+            b,
+            three_d,
+        }
+    }
+
     fn reg16(&self, offset: u32) -> u16 {
         self.io
             .get16(if self.b { 0x0400_1000 } else { 0x0400_0000 } + offset)
@@ -204,7 +255,7 @@ impl Engine<'_> {
     /// Standard palette entry: BG entries 0-255, OBJ entries 256-511.
     fn palette(&self, index: usize) -> u16 {
         let at = if self.b { 0x400 } else { 0 } + index * 2;
-        u16::from_le_bytes([self.memory.palette[at], self.memory.palette[at + 1]])
+        u16::from_le_bytes([self.palette_ram[at], self.palette_ram[at + 1]])
     }
 
     fn bg_ext_palette(&self, slot: usize, index: usize) -> u16 {
@@ -213,7 +264,7 @@ impl Engine<'_> {
         } else {
             Region::ABgExtPalette
         };
-        self.memory.vram.read16(region, slot * 0x2000 + index * 2)
+        self.vram.read16(region, slot * 0x2000 + index * 2)
     }
 
     fn obj_ext_palette(&self, index: usize) -> u16 {
@@ -222,56 +273,75 @@ impl Engine<'_> {
         } else {
             Region::AObjExtPalette
         };
-        self.memory.vram.read16(region, index * 2)
+        self.vram.read16(region, index * 2)
     }
 
     fn oam16(&self, offset: usize) -> u16 {
         let at = if self.b { 0x400 } else { 0 } + offset;
-        u16::from_le_bytes([self.memory.oam[at], self.memory.oam[at + 1]])
+        u16::from_le_bytes([self.oam[at], self.oam[at + 1]])
     }
 
-    fn render(&self) -> Vec<u8> {
-        let dispcnt = self.reg32(0);
-        let mut colors = vec![0x7FFF_u16; WIDTH * HEIGHT];
-        let display_mode = if self.b {
+    fn display_mode(&self, dispcnt: u32) -> u32 {
+        if self.b {
             (dispcnt >> 16) & 1
         } else {
             (dispcnt >> 16) & 3
-        };
-        match display_mode {
+        }
+    }
+
+    /// The screen's colors before master brightness.
+    fn colors(&self, dispcnt: u32) -> Vec<u16> {
+        let mut colors = vec![0x7FFF_u16; WIDTH * HEIGHT];
+        match self.display_mode(dispcnt) {
             // Display off: white.
             0 => {}
             1 if dispcnt & 0x80 != 0 => {}
-            1 => {
-                for (line, row) in colors.chunks_mut(WIDTH).enumerate() {
-                    self.render_line(dispcnt, line, row);
-                }
-            }
+            1 => colors = self.lines(dispcnt),
             // A VRAM bank in LCDC mode, shown directly.
             2 => {
                 let base = ((dispcnt >> 18) & 3) as usize * 0x2_0000;
                 for (index, color) in colors.iter_mut().enumerate() {
-                    *color = self.memory.vram.read16(Region::Lcdc, base + index * 2);
+                    *color = self.vram.read16(Region::Lcdc, base + index * 2);
                 }
             }
             // Main memory display (fed by DMA) is not supported.
             _ => colors.fill(0),
         }
+        colors
+    }
+
+    /// Every line of the backgrounds and sprites. Lines are independent,
+    /// so they are drawn in parallel.
+    fn lines(&self, dispcnt: u32) -> Vec<u16> {
+        let mut colors = vec![0_u16; WIDTH * HEIGHT];
+        colors
+            .par_chunks_mut(WIDTH * LINES_PER_TASK)
+            .enumerate()
+            .for_each(|(index, rows)| {
+                for (offset, row) in rows.chunks_mut(WIDTH).enumerate() {
+                    self.render_line(dispcnt, index * LINES_PER_TASK + offset, row);
+                }
+            });
+        colors
+    }
+
+    /// RGBA8 after master brightness.
+    fn brighten(&self, colors: &[u16]) -> Vec<u8> {
         let bright = self.reg16(0x6C);
         let factor = u32::from(bright & 0x1F).min(16);
-        let mut rgba = Vec::with_capacity(WIDTH * HEIGHT * 4);
-        for color in colors {
+        let mode = bright >> 14;
+        let mut rgba = vec![0xFF; WIDTH * HEIGHT * 4];
+        for (out, &color) in rgba.chunks_exact_mut(4).zip(colors) {
             let mut channels =
                 [color & 0x1F, (color >> 5) & 0x1F, (color >> 10) & 0x1F].map(u32::from);
-            match bright >> 14 {
+            match mode {
                 1 => channels = channels.map(|c| c + (31 - c) * factor / 16),
                 2 => channels = channels.map(|c| c - c * factor / 16),
                 _ => {}
             }
-            for c in channels {
-                rgba.push(((c << 3) | (c >> 2)) as u8);
+            for (out, c) in out.iter_mut().zip(channels) {
+                *out = ((c << 3) | (c >> 2)) as u8;
             }
-            rgba.push(0xFF);
         }
         rgba
     }
@@ -482,7 +552,7 @@ impl Engine<'_> {
         line: usize,
         out: &mut [Option<u16>; WIDTH],
     ) {
-        let vram = &self.memory.vram;
+        let vram = self.vram;
         let region = self.region(false);
         let hofs = usize::from(self.reg16(0x10 + 4 * index as u32) & 0x1FF);
         let vofs = usize::from(self.reg16(0x12 + 4 * index as u32) & 0x1FF);
@@ -540,7 +610,7 @@ impl Engine<'_> {
         line: usize,
         out: &mut [Option<u16>; WIDTH],
     ) {
-        let vram = &self.memory.vram;
+        let vram = self.vram;
         let region = self.region(false);
         let params = 0x20 + 0x10 * (index as u32 - 2);
         let pa = i32::from(self.reg16(params) as i16);
@@ -624,7 +694,7 @@ impl Engine<'_> {
             [(16, 8), (32, 8), (32, 16), (64, 32)],
             [(8, 16), (8, 32), (16, 32), (32, 64)],
         ];
-        let vram = &self.memory.vram;
+        let vram = self.vram;
         let region = self.region(true);
         for index in 0..128 {
             let attr0 = self.oam16(index * 8);

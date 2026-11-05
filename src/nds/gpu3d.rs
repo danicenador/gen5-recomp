@@ -6,6 +6,9 @@
 //! This is a functional renderer, not a cycle-accurate FIFO or rasterizer.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rayon::prelude::*;
 
 use super::io::Io;
 use super::vram::{Region, Vram};
@@ -33,10 +36,13 @@ fn multiply(a: Matrix, b: Matrix) -> Matrix {
 }
 
 fn transform(v: [f64; 4], m: Matrix) -> [f64; 4] {
+    // Dividing by 4096 is exact, so multiplying by its inverse is too.
+    const SCALE: f64 = 1.0 / 4096.0;
     std::array::from_fn(|c| {
-        (0..4)
-            .map(|r| v[r] * f64::from(m[r * 4 + c]) / 4096.0)
-            .sum()
+        v[0] * (f64::from(m[c]) * SCALE)
+            + v[1] * (f64::from(m[4 + c]) * SCALE)
+            + v[2] * (f64::from(m[8 + c]) * SCALE)
+            + v[3] * (f64::from(m[12 + c]) * SCALE)
     })
 }
 
@@ -94,6 +100,8 @@ struct Polygon {
 
 pub struct Geometry {
     matrices: [Matrix; 4], // projection, position, direction, texture
+    /// Position times projection, recomputed when either changes.
+    clip: Option<Matrix>,
     position_stack: [(Matrix, Matrix); 32],
     projection_stack: Matrix,
     texture_stack: Matrix,
@@ -156,12 +164,15 @@ pub struct Geometry {
     pub trace_next: bool,
     trace: Option<String>,
     pub traced: Option<String>,
+    /// Host time spent rendering, in nanoseconds.
+    render_nanos: AtomicU64,
 }
 
 impl Default for Geometry {
     fn default() -> Self {
         Self {
             matrices: [identity(); 4],
+            clip: None,
             position_stack: [(identity(), identity()); 32],
             projection_stack: identity(),
             texture_stack: identity(),
@@ -215,6 +226,7 @@ impl Default for Geometry {
             trace_next: false,
             trace: None,
             traced: None,
+            render_nanos: AtomicU64::new(0),
         }
     }
 }
@@ -263,8 +275,7 @@ impl Geometry {
                 self.parameters.push(value);
             }
             if self.parameters.len() == parameter_count(cmd) {
-                let params = std::mem::take(&mut self.parameters);
-                self.execute(cmd, &params);
+                self.execute_parameters(cmd);
                 self.direct = None;
             }
         }
@@ -279,9 +290,16 @@ impl Geometry {
                 break;
             }
             self.commands.pop_front();
-            let params = std::mem::take(&mut self.parameters);
-            self.execute(cmd, &params);
+            self.execute_parameters(cmd);
         }
+    }
+
+    /// Run `cmd` with the parameters gathered for it, keeping the buffer.
+    fn execute_parameters(&mut self, cmd: u8) {
+        let mut params = std::mem::take(&mut self.parameters);
+        self.execute(cmd, &params);
+        params.clear();
+        self.parameters = params;
     }
 
     /// Publish the completed list at vblank, retaining it until the next swap.
@@ -291,7 +309,9 @@ impl Geometry {
             self.manual_sort = flags & 1 != 0;
             self.peak_polygons = self.peak_polygons.max(self.building.len());
             self.peak_vertices = self.peak_vertices.max(self.vertex_count);
-            self.peak_submitted = self.peak_submitted.max(self.submitted_polygons - self.list_start);
+            self.peak_submitted = self
+                .peak_submitted
+                .max(self.submitted_polygons - self.list_start);
             self.list_start = self.submitted_polygons;
             self.overflowed_lists += u64::from(std::mem::take(&mut self.overflowed));
             self.displayed = std::mem::take(&mut self.building);
@@ -311,6 +331,11 @@ impl Geometry {
                 self.write(address, value);
             }
         }
+    }
+
+    /// Polygons in the list being displayed.
+    pub fn displayed_polygons(&self) -> usize {
+        self.displayed.len()
     }
 
     pub fn status(&self) -> u32 {
@@ -387,6 +412,7 @@ impl Geometry {
         if self.mode != 3 && index >= if position { 31 } else { 1 } {
             self.stack_error = true;
         }
+        self.clip = None;
         if matches!(cmd, 0x11 | 0x13) {
             match self.mode {
                 0 => self.projection_stack = self.matrices[0],
@@ -440,6 +466,9 @@ impl Geometry {
         }
         let index = [0, 1, 1, 3][self.mode];
         let load = matches!(cmd, 0x15..=0x17);
+        if index != 3 {
+            self.clip = None;
+        }
         self.matrices[index] = if load {
             m
         } else {
@@ -492,6 +521,12 @@ impl Geometry {
         self.color = self.color.map(|c| c.clamp(0.0, 31.0));
     }
 
+    fn clip_matrix(&mut self) -> Matrix {
+        *self
+            .clip
+            .get_or_insert_with(|| multiply(self.matrices[1], self.matrices[0]))
+    }
+
     fn vertex(&mut self) {
         let Some(primitive) = self.primitive else {
             return;
@@ -501,8 +536,9 @@ impl Geometry {
             p[3] = 0.0;
             self.texture_transform(p, 3);
         }
+        let clip = transform(self.position, self.clip_matrix());
         self.vertices.push(Vertex {
-            clip: transform(self.position, multiply(self.matrices[1], self.matrices[0])),
+            clip,
             color: self.color,
             uv: self.uv,
         });
@@ -538,7 +574,11 @@ impl Geometry {
             if fits {
                 self.vertex_count += shared;
                 self.building.push(Polygon {
-                    vertices: if self.trace.is_some() { vertices.clone() } else { std::mem::take(&mut vertices) },
+                    vertices: if self.trace.is_some() {
+                        vertices.clone()
+                    } else {
+                        std::mem::take(&mut vertices)
+                    },
                     attr: self.attr,
                     texture: self.texture,
                     palette: self.palette,
@@ -600,13 +640,13 @@ impl Geometry {
         if vertices.iter().all(|v| v.clip[3] > 0.0) {
             // Facing, in the same screen orientation the rasterizer uses
             // (y grows downwards).
-            let screen: Vec<[f64; 2]> = vertices
-                .iter()
-                .map(|v| [v.clip[0] / v.clip[3], -v.clip[1] / v.clip[3]])
-                .collect();
+            let screen = |v: &Vertex| [v.clip[0] / v.clip[3], -v.clip[1] / v.clip[3]];
             let mut area = 0.0;
-            for i in 0..screen.len() {
-                let (a, b) = (screen[i], screen[(i + 1) % screen.len()]);
+            for i in 0..vertices.len() {
+                let (a, b) = (
+                    screen(&vertices[i]),
+                    screen(&vertices[(i + 1) % vertices.len()]),
+                );
                 area += a[0] * b[1] - b[0] * a[1];
             }
             if area != 0.0 {
@@ -718,7 +758,7 @@ impl Geometry {
                         ]
                     })
                     .collect();
-                let clip = multiply(self.matrices[1], self.matrices[0]);
+                let clip = self.clip_matrix();
                 let corners: Vec<_> = (0..8)
                     .map(|n| {
                         transform(
@@ -740,6 +780,7 @@ impl Geometry {
                 }
             }
             0x71 => {
+                let clip = self.clip_matrix();
                 self.position_result = transform(
                     [
                         f64::from(v as i16) / 4096.0,
@@ -747,7 +788,7 @@ impl Geometry {
                         f64::from(p[1] as i16) / 4096.0,
                         1.0,
                     ],
-                    multiply(self.matrices[1], self.matrices[0]),
+                    clip,
                 )
                 .map(|x| (x * 4096.0) as i32);
             }
@@ -760,6 +801,19 @@ impl Geometry {
     }
 
     pub fn render(&self, io: &Io, vram: &Vram) -> Vec<Pixel> {
+        let start = std::time::Instant::now();
+        let pixels = self.render_list(io, vram);
+        self.render_nanos
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        pixels
+    }
+
+    /// Host time spent rendering since the last call, for the frame-time report.
+    pub fn take_render_time(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.render_nanos.swap(0, Ordering::Relaxed))
+    }
+
+    fn render_list(&self, io: &Io, vram: &Vram) -> Vec<Pixel> {
         let clear = io.get32(0x0400_0350);
         let mut pixels = vec![
             Pixel {
@@ -780,8 +834,17 @@ impl Geometry {
         // Only a previously drawn translucent polygon suppresses another
         // translucent polygon with the same ID; opaque IDs do not.
         let mut ids = vec![64; WIDTH * HEIGHT];
-        // Opaque polygons precede translucent ones. Preserve submission order
-        // within each group; hardware's automatic Y sort is not modeled yet.
+        let state = RenderState {
+            control: io.get16(0x0400_0060),
+            alpha_ref: io.get8(0x0400_0340),
+            toon: std::array::from_fn(|i| io.get16(0x0400_0380 + i as u32 * 2)),
+            w_buffer: self.render_w,
+        };
+        // Opaque polygons precede translucent ones. The hardware sorts
+        // opaque polygons, and translucent ones unless SWAP_BUFFERS asked
+        // for manual order, by their lowest then highest screen Y. The sort
+        // is stable, like submission order within equal keys.
+        let mut triangles = Vec::new();
         for translucent in [false, true] {
             let mut group: Vec<&Polygon> = self
                 .displayed
@@ -792,10 +855,6 @@ impl Geometry {
                     (alpha < 31 || format == 1 || format == 6) == translucent
                 })
                 .collect();
-            // The hardware sorts opaque polygons, and translucent ones
-            // unless SWAP_BUFFERS asked for manual order, by their lowest
-            // then highest screen Y. The sort is stable, like submission
-            // order within equal keys.
             if !translucent || !self.manual_sort {
                 group.sort_by_cached_key(|polygon| sort_key(polygon));
             }
@@ -805,21 +864,47 @@ impl Geometry {
                     continue;
                 }
                 for i in 1..vertices.len() - 1 {
-                    rasterize(
+                    triangles.extend(Triangle::new(
                         [vertices[0], vertices[i], vertices[i + 1]],
                         polygon,
-                        io,
-                        vram,
-                        self.render_w,
-                        &mut pixels,
-                        &mut depths,
-                        &mut ids,
-                    );
+                    ));
                 }
             }
         }
+        if triangles.is_empty() {
+            return pixels;
+        }
+        // Every pixel only depends on the polygons drawn over it, in order,
+        // so bands of rows render in parallel with the same result.
+        pixels
+            .par_chunks_mut(BAND_ROWS * WIDTH)
+            .zip(depths.par_chunks_mut(BAND_ROWS * WIDTH))
+            .zip(ids.par_chunks_mut(BAND_ROWS * WIDTH))
+            .enumerate()
+            .for_each(|(index, ((pixels, depths), ids))| {
+                let top = index * BAND_ROWS;
+                let bottom = top + pixels.len() / WIDTH;
+                for triangle in &triangles {
+                    let rows = triangle.min_y.max(top)..triangle.max_y.min(bottom);
+                    if !rows.is_empty() {
+                        triangle.draw(rows, top, &state, vram, pixels, depths, ids);
+                    }
+                }
+            });
         pixels
     }
+}
+
+/// Rows per band of the parallel rasterizer.
+const BAND_ROWS: usize = 8;
+
+/// The display registers the rasterizer reads.
+struct RenderState {
+    /// DISP3DCNT.
+    control: u16,
+    alpha_ref: u8,
+    toon: [u16; 32],
+    w_buffer: bool,
 }
 
 /// The hardware's Y sort key: the bottom-most, then the top-most vertex.
@@ -834,7 +919,9 @@ fn sort_key(polygon: &Polygon) -> (i32, i32) {
                 - ((v.clip[1] / v.clip[3] + 1.0) * height / 2.0 + f64::from(polygon.viewport[1]));
             y.clamp(-1024.0, 1024.0) as i32
         });
-    let (low, high) = ys.fold((i32::MIN, i32::MAX), |(low, high), y| (low.max(y), high.min(y)));
+    let (low, high) = ys.fold((i32::MIN, i32::MAX), |(low, high), y| {
+        (low.max(y), high.min(y))
+    });
     (low, high)
 }
 
@@ -969,197 +1056,268 @@ fn texture_sample(vram: &Vram, param: u32, palette: u32, uv: [f64; 2]) -> Pixel 
     Pixel { color, alpha }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rasterize(
-    vertices: [Vertex; 3],
-    polygon: &Polygon,
-    io: &Io,
-    vram: &Vram,
-    w_buffer: bool,
-    pixels: &mut [Pixel],
-    depths: &mut [f64],
-    ids: &mut [u32],
-) {
-    if vertices.iter().any(|v| v.clip[3] <= 0.0) {
-        return;
+/// A triangle of a clipped polygon, set up once for every band it covers.
+struct Triangle<'a> {
+    polygon: &'a Polygon,
+    screen: [[f64; 2]; 3],
+    area: f64,
+    inverse_area: f64,
+    /// Edges (1,2), (2,0) and (0,1) that the half-open fill rule leaves out.
+    excluded: [bool; 3],
+    /// Per vertex: 1/w, z/w, and color and texture coordinates over w.
+    inverse_w: [f64; 3],
+    depth_w: [f64; 3],
+    attributes_w: [[f64; 5]; 3],
+    min_x: usize,
+    max_x: usize,
+    min_y: usize,
+    max_y: usize,
+}
+
+const EDGES: [(usize, usize); 3] = [(1, 2), (2, 0), (0, 1)];
+
+impl<'a> Triangle<'a> {
+    /// None if nothing of the triangle is drawn.
+    fn new(vertices: [Vertex; 3], polygon: &'a Polygon) -> Option<Self> {
+        if vertices.iter().any(|v| v.clip[3] <= 0.0) {
+            return None;
+        }
+        let polygon_alpha = (polygon.attr >> 16) & 31;
+        // Wireframe and shadow polygons need edge/stencil rasterization.
+        if polygon_alpha == 0 || (polygon.attr >> 4) & 3 == 3 {
+            return None;
+        }
+        let vp = polygon.viewport;
+        let width = i32::from(vp[2]) - i32::from(vp[0]) + 1;
+        let height = i32::from(vp[3]) - i32::from(vp[1]) + 1;
+        let screen = vertices.map(|v| {
+            [
+                (v.clip[0] / v.clip[3] + 1.0) * f64::from(width) / 2.0 + f64::from(vp[0]),
+                191.0
+                    - ((v.clip[1] / v.clip[3] + 1.0) * f64::from(height) / 2.0 + f64::from(vp[1])),
+            ]
+        });
+        let area = edge(screen[0], screen[1], screen[2]);
+        if area.abs() < 1e-10 {
+            return None;
+        }
+        let front = area < 0.0;
+        if polygon.attr & (if front { 1 << 7 } else { 1 << 6 }) == 0 {
+            return None;
+        }
+        // Half-open triangle edges prevent a quad's shared diagonal from
+        // blending twice (or hiding the far half of a translucent polygon).
+        let excluded = EDGES.map(|(a, b)| {
+            let (a, b) = if area > 0.0 {
+                (screen[a], screen[b])
+            } else {
+                (screen[b], screen[a])
+            };
+            !(b[1] < a[1] || b[1] == a[1] && b[0] > a[0])
+        });
+        let bound = |axis: usize, limit: f64| {
+            let low = screen.iter().map(|p| p[axis]).fold(f64::INFINITY, f64::min);
+            let high = screen
+                .iter()
+                .map(|p| p[axis])
+                .fold(f64::NEG_INFINITY, f64::max);
+            (
+                low.floor().clamp(0.0, limit) as usize,
+                high.ceil().clamp(0.0, limit) as usize,
+            )
+        };
+        let (min_x, max_x) = bound(0, WIDTH as f64);
+        let (min_y, max_y) = bound(1, HEIGHT as f64);
+        let inverse_w = vertices.map(|v| 1.0 / v.clip[3]);
+        Some(Self {
+            polygon,
+            screen,
+            area,
+            inverse_area: 1.0 / area,
+            excluded,
+            inverse_w,
+            depth_w: std::array::from_fn(|i| vertices[i].clip[2] / vertices[i].clip[3]),
+            attributes_w: std::array::from_fn(|i| {
+                let v = vertices[i];
+                [v.color[0], v.color[1], v.color[2], v.uv[0], v.uv[1]].map(|a| a * inverse_w[i])
+            }),
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+        })
     }
-    let vp = polygon.viewport;
-    let width = i32::from(vp[2]) - i32::from(vp[0]) + 1;
-    let height = i32::from(vp[3]) - i32::from(vp[1]) + 1;
-    let screen = vertices.map(|v| {
-        [
-            (v.clip[0] / v.clip[3] + 1.0) * f64::from(width) / 2.0 + f64::from(vp[0]),
-            191.0 - ((v.clip[1] / v.clip[3] + 1.0) * f64::from(height) / 2.0 + f64::from(vp[1])),
-        ]
-    });
-    let edge = |a: [f64; 2], b: [f64; 2], p: [f64; 2]| {
-        (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
-    };
-    let area = edge(screen[0], screen[1], screen[2]);
-    if area.abs() < 1e-10 {
-        return;
-    }
-    let front = area < 0.0;
-    if polygon.attr & (if front { 1 << 7 } else { 1 << 6 }) == 0 {
-        return;
-    }
-    let min_x = screen
-        .iter()
-        .map(|p| p[0])
-        .fold(f64::INFINITY, f64::min)
-        .floor()
-        .clamp(0.0, 256.0) as usize;
-    let max_x = screen
-        .iter()
-        .map(|p| p[0])
-        .fold(f64::NEG_INFINITY, f64::max)
-        .ceil()
-        .clamp(0.0, 256.0) as usize;
-    let min_y = screen
-        .iter()
-        .map(|p| p[1])
-        .fold(f64::INFINITY, f64::min)
-        .floor()
-        .clamp(0.0, 192.0) as usize;
-    let max_y = screen
-        .iter()
-        .map(|p| p[1])
-        .fold(f64::NEG_INFINITY, f64::max)
-        .ceil()
-        .clamp(0.0, 192.0) as usize;
-    let control = io.get16(0x0400_0060);
-    let id = (polygon.attr >> 24) & 63;
-    let polygon_alpha = ((polygon.attr >> 16) & 31) as u8;
-    // Wireframe and shadow polygons need edge/stencil rasterization.
-    if polygon_alpha == 0 || (polygon.attr >> 4) & 3 == 3 {
-        return;
-    }
-    for y in min_y..max_y {
-        for x in min_x..max_x {
-            let point = [x as f64 + 0.5, y as f64 + 0.5];
-            let weights = [
-                edge(screen[1], screen[2], point) / area,
-                edge(screen[2], screen[0], point) / area,
-                edge(screen[0], screen[1], point) / area,
-            ];
-            if weights.iter().any(|w| *w < -1e-10) {
+
+    /// The columns of row `y` that can be inside the triangle, with a pixel
+    /// of margin either side; the per-pixel test decides.
+    fn span(&self, y: usize) -> std::ops::Range<usize> {
+        let py = y as f64 + 0.5;
+        let sign = self.area.signum();
+        let tolerance = 1e-10 * self.area.abs();
+        let (mut low, mut high) = (self.min_x as f64, self.max_x as f64);
+        for (a, b) in EDGES {
+            let (a, b) = (self.screen[a], self.screen[b]);
+            // sign * edge(a, b, (px, py)) = constant - slope * px, which
+            // must not fall below -tolerance.
+            let slope = sign * (b[1] - a[1]);
+            let constant = sign * ((b[0] - a[0]) * (py - a[1]) + (b[1] - a[1]) * a[0]);
+            if slope == 0.0 {
+                if constant < -tolerance {
+                    return 0..0;
+                }
                 continue;
             }
-            // Half-open triangle edges prevent a quad's shared diagonal from
-            // blending twice (or hiding the far half of a translucent polygon).
-            let mut on_excluded_edge = false;
-            for (i, &(a, b)) in [(1, 2), (2, 0), (0, 1)].iter().enumerate() {
-                if weights[i].abs() > 1e-10 {
+            let px = (constant + tolerance) / slope - 0.5;
+            if slope > 0.0 {
+                high = high.min(px.ceil() + 2.0);
+            } else {
+                low = low.max(px.floor() - 1.0);
+            }
+        }
+        let low = low.clamp(self.min_x as f64, self.max_x as f64) as usize;
+        let high = high.clamp(self.min_x as f64, self.max_x as f64) as usize;
+        low..high.max(low)
+    }
+
+    /// Draw `rows` into a band of the frame that starts at row `top`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        &self,
+        rows: std::ops::Range<usize>,
+        top: usize,
+        state: &RenderState,
+        vram: &Vram,
+        pixels: &mut [Pixel],
+        depths: &mut [f64],
+        ids: &mut [u32],
+    ) {
+        let polygon = self.polygon;
+        let screen = self.screen;
+        let control = state.control;
+        let w_buffer = state.w_buffer;
+        let id = (polygon.attr >> 24) & 63;
+        let polygon_alpha = ((polygon.attr >> 16) & 31) as u8;
+        let mode = (polygon.attr >> 4) & 3;
+        let depth_equal = polygon.attr & (1 << 14) != 0;
+        let translucent_depth = polygon.attr & (1 << 11) != 0;
+        let textured = control & 1 != 0;
+        for y in rows {
+            for x in self.span(y) {
+                let point = [x as f64 + 0.5, y as f64 + 0.5];
+                let weights = [
+                    edge(screen[1], screen[2], point) * self.inverse_area,
+                    edge(screen[2], screen[0], point) * self.inverse_area,
+                    edge(screen[0], screen[1], point) * self.inverse_area,
+                ];
+                if weights.iter().any(|w| *w < -1e-10) {
                     continue;
                 }
-                let (a, b) = if area > 0.0 {
-                    (screen[a], screen[b])
+                if (0..3).any(|i| self.excluded[i] && weights[i].abs() <= 1e-10) {
+                    continue;
+                }
+                let reciprocal_w = weights[0] * self.inverse_w[0]
+                    + weights[1] * self.inverse_w[1]
+                    + weights[2] * self.inverse_w[2];
+                let depth = if w_buffer {
+                    1.0 / reciprocal_w
                 } else {
-                    (screen[b], screen[a])
+                    (weights[0] * self.depth_w[0]
+                        + weights[1] * self.depth_w[1]
+                        + weights[2] * self.depth_w[2])
+                        * 0.5
+                        + 0.5
                 };
-                if !(b[1] < a[1] || b[1] == a[1] && b[0] > a[0]) {
-                    on_excluded_edge = true;
-                }
-            }
-            if on_excluded_edge {
-                continue;
-            }
-            let reciprocal_w: f64 = (0..3).map(|i| weights[i] / vertices[i].clip[3]).sum();
-            let depth = if w_buffer {
-                1.0 / reciprocal_w
-            } else {
-                (0..3)
-                    .map(|i| weights[i] * vertices[i].clip[2] / vertices[i].clip[3])
-                    .sum::<f64>()
-                    * 0.5
-                    + 0.5
-            };
-            let at = y * WIDTH + x;
-            if polygon.attr & (1 << 14) != 0 {
-                if (depth - depths[at]).abs() > if w_buffer { 0.125 } else { 0.000125 } {
+                let at = (y - top) * WIDTH + x;
+                if depth_equal {
+                    if (depth - depths[at]).abs() > if w_buffer { 0.125 } else { 0.000125 } {
+                        continue;
+                    }
+                } else if depth >= depths[at] {
                     continue;
                 }
-            } else if depth >= depths[at] {
-                continue;
-            }
-            let interpolate = |get: &dyn Fn(Vertex) -> f64| {
-                (0..3)
-                    .map(|i| weights[i] * get(vertices[i]) / vertices[i].clip[3])
-                    .sum::<f64>()
-                    / reciprocal_w
-            };
-            let vertex_color: [f64; 3] = std::array::from_fn(|i| interpolate(&|v| v.color[i]));
-            let uv = std::array::from_fn(|i| interpolate(&|v| v.uv[i]));
-            let tex = if control & 1 != 0 {
-                texture_sample(vram, polygon.texture, polygon.palette, uv)
-            } else {
-                Pixel {
-                    color: 0x7fff,
-                    alpha: 31,
-                }
-            };
-            let texture_color = rgb(u32::from(tex.color));
-            let mode = (polygon.attr >> 4) & 3;
-            let alpha = if mode == 1 {
-                polygon_alpha
-            } else {
-                (((u32::from(tex.alpha) + 1) * (u32::from(polygon_alpha) + 1) - 1) / 32) as u8
-            };
-            if alpha == 0 || control & 4 != 0 && alpha <= io.get8(0x0400_0340) {
-                continue;
-            }
-            let color = match mode {
-                1 => std::array::from_fn(|i| {
-                    (texture_color[i] * f64::from(tex.alpha)
-                        + vertex_color[i] * f64::from(31 - tex.alpha))
-                        / 31.0
-                }),
-                2 => {
-                    let toon = rgb(u32::from(
-                        io.get16(0x0400_0380 + vertex_color[0].clamp(0.0, 31.0) as u32 * 2),
-                    ));
-                    std::array::from_fn(|i| {
-                        if control & 2 == 0 {
-                            texture_color[i] * toon[i] / 31.0
-                        } else {
-                            (texture_color[i] * vertex_color[i] / 31.0 + toon[i]).min(31.0)
-                        }
-                    })
-                }
-                _ => std::array::from_fn(|i| texture_color[i] * vertex_color[i] / 31.0),
-            };
-            if alpha < 31 {
-                if ids[at] == id {
+                let w = 1.0 / reciprocal_w;
+                let a = &self.attributes_w;
+                let interpolated: [f64; 5] = std::array::from_fn(|i| {
+                    (weights[0] * a[0][i] + weights[1] * a[1][i] + weights[2] * a[2][i]) * w
+                });
+                let vertex_color = [interpolated[0], interpolated[1], interpolated[2]];
+                let tex = if textured {
+                    texture_sample(
+                        vram,
+                        polygon.texture,
+                        polygon.palette,
+                        [interpolated[3], interpolated[4]],
+                    )
+                } else {
+                    Pixel {
+                        color: 0x7fff,
+                        alpha: 31,
+                    }
+                };
+                let alpha = if mode == 1 {
+                    polygon_alpha
+                } else {
+                    (((u32::from(tex.alpha) + 1) * (u32::from(polygon_alpha) + 1) - 1) / 32) as u8
+                };
+                if alpha == 0 || control & 4 != 0 && alpha <= state.alpha_ref {
                     continue;
                 }
-                if control & 8 != 0 && pixels[at].alpha != 0 {
-                    let old = rgb(u32::from(pixels[at].color));
-                    pixels[at].color = pack(std::array::from_fn(|i| {
-                        (color[i] * f64::from(alpha + 1) + old[i] * f64::from(31 - alpha)) / 32.0
-                    }));
-                    pixels[at].alpha = pixels[at].alpha.max(alpha);
+                let texture_color = rgb(u32::from(tex.color));
+                let color = match mode {
+                    1 => std::array::from_fn(|i| {
+                        (texture_color[i] * f64::from(tex.alpha)
+                            + vertex_color[i] * f64::from(31 - tex.alpha))
+                            / 31.0
+                    }),
+                    2 => {
+                        let toon = rgb(u32::from(
+                            state.toon[vertex_color[0].clamp(0.0, 31.0) as usize],
+                        ));
+                        std::array::from_fn(|i| {
+                            if control & 2 == 0 {
+                                texture_color[i] * toon[i] / 31.0
+                            } else {
+                                (texture_color[i] * vertex_color[i] / 31.0 + toon[i]).min(31.0)
+                            }
+                        })
+                    }
+                    _ => std::array::from_fn(|i| texture_color[i] * vertex_color[i] / 31.0),
+                };
+                if alpha < 31 {
+                    if ids[at] == id {
+                        continue;
+                    }
+                    if control & 8 != 0 && pixels[at].alpha != 0 {
+                        let old = rgb(u32::from(pixels[at].color));
+                        pixels[at].color = pack(std::array::from_fn(|i| {
+                            (color[i] * f64::from(alpha + 1) + old[i] * f64::from(31 - alpha))
+                                / 32.0
+                        }));
+                        pixels[at].alpha = pixels[at].alpha.max(alpha);
+                    } else {
+                        pixels[at] = Pixel {
+                            color: pack(color),
+                            alpha,
+                        };
+                    }
+                    ids[at] = id;
                 } else {
                     pixels[at] = Pixel {
                         color: pack(color),
                         alpha,
                     };
+                    ids[at] = 64;
                 }
-            } else {
-                pixels[at] = Pixel {
-                    color: pack(color),
-                    alpha,
-                };
-            }
-            if alpha < 31 {
-                ids[at] = id;
-            } else {
-                ids[at] = 64;
-            }
-            if alpha == 31 || polygon.attr & (1 << 11) != 0 {
-                depths[at] = depth;
+                if alpha == 31 || translucent_depth {
+                    depths[at] = depth;
+                }
             }
         }
     }
+}
+
+fn edge(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
 }
 
 #[cfg(test)]

@@ -23,8 +23,10 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 type GeneratedFunction = unsafe extern "C" fn(*mut Cpu);
 
@@ -188,10 +190,52 @@ pub struct Machine {
     options: Options,
     /// The last frame handed to `Options::on_frame`.
     presented: u64,
+    /// Where each frame's host time went, for the report.
+    timing: FrameTiming,
+    /// GEN5_PROFILE=path: render every frame, as the window does, even
+    /// headless, and write each frame's host times (ms) to `path` as CSV.
+    profile: Option<fs::File>,
     /// GEN5_SP_LIMIT: stop when a call is made with the system-mode stack
     /// pointer above this, to catch code that pops more than it pushed.
     sp_limit: Option<u32>,
     _library: Library,
+}
+
+/// Host time per frame: game code (and everything else between frames), 3D
+/// rendering, 2D rendering, display capture and sound. Waiting for the frame
+/// pace is not counted.
+#[derive(Default)]
+struct FrameTiming {
+    /// When the previous frame's work ended.
+    last: Option<Instant>,
+    frames: u64,
+    game: Duration,
+    three_d: Duration,
+    two_d: Duration,
+    capture: Duration,
+    sound: Duration,
+    /// Frames whose work took longer than a DS frame.
+    slow: u64,
+    worst: (Duration, u64),
+}
+
+impl FrameTiming {
+    fn describe(&self) -> String {
+        let n = self.frames.max(1) as u32;
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(n);
+        format!(
+            "host time per frame over {} frames: game {:.2} ms, 3D {:.2} ms, 2D {:.2} ms, capture {:.2} ms, sound {:.2} ms; {} frames over 16.7 ms, worst {:.1} ms at frame {}",
+            self.frames,
+            ms(self.game),
+            ms(self.three_d),
+            ms(self.two_d),
+            ms(self.capture),
+            ms(self.sound),
+            self.slow,
+            self.worst.0.as_secs_f64() * 1000.0,
+            self.worst.1
+        )
+    }
 }
 
 const EVENT_HISTORY: usize = 400;
@@ -391,8 +435,15 @@ impl Machine {
             self.io.set16(io::KEYINPUT, keys);
             self.write16(BUTTON_XY, u32::from(button_xy));
         }
-        gpu2d::capture(&mut self.io, &mut self.memory);
+        let start = Instant::now();
+        let game = self.timing.last.map_or(Duration::ZERO, |last| start - last);
+        self.io.geometry.take_render_time();
+        let mut shared = gpu2d::FrameCache::default();
+        gpu2d::capture_with(&mut self.io, &mut self.memory, &mut shared);
+        let captured = Instant::now();
+        let capture_3d = self.io.geometry.take_render_time();
         self.advance_sound();
+        let sounded = Instant::now();
         // GEN5_3D_TRACE=first[-last][:path] describes the 3D lists started
         // after those frames: every polygon, whether it was kept, and box
         // tests. A range writes one file per list, with the frame appended.
@@ -423,14 +474,18 @@ impl Machine {
                     let base = palette as usize * if format == 2 { 8 } else { 16 };
                     let colors: Vec<String> = (0..16)
                         .map(|index| {
-                            let color = self.memory.vram.read16(
-                                super::vram::Region::TexturePalette,
-                                base + index * 2,
-                            );
+                            let color = self
+                                .memory
+                                .vram
+                                .read16(super::vram::Region::TexturePalette, base + index * 2);
                             format!("{color:04X}")
                         })
                         .collect();
-                    let _ = writeln!(text, "palette {palette:04X} format {format}: {}", colors.join(" "));
+                    let _ = writeln!(
+                        text,
+                        "palette {palette:04X} format {format}: {}",
+                        colors.join(" ")
+                    );
                 }
                 let path = if first == last {
                     path.to_owned()
@@ -468,10 +523,44 @@ impl Machine {
             || in_range
             || self.options.render_every != 0
                 && self.presented.is_multiple_of(self.options.render_every);
-        if render && let Some(on_frame) = &mut self.options.on_frame {
-            let frame = gpu2d::render(&self.io, &self.memory);
-            on_frame(self.presented, &frame);
+        let rendered_start = Instant::now();
+        let frame = (render && self.options.on_frame.is_some() || self.profile.is_some())
+            .then(|| gpu2d::render_with(&self.io, &self.memory, &mut shared));
+        let rendered = Instant::now();
+        let render_3d = self.io.geometry.take_render_time();
+        let timing = &mut self.timing;
+        if timing.last.is_some() {
+            let work =
+                game + (captured - start) + (sounded - captured) + (rendered - rendered_start);
+            timing.frames += 1;
+            timing.game += game;
+            timing.three_d += capture_3d + render_3d;
+            timing.capture += (captured - start).saturating_sub(capture_3d);
+            timing.sound += sounded - captured;
+            timing.two_d += (rendered - rendered_start).saturating_sub(render_3d);
+            timing.slow += u64::from(work > Duration::from_nanos(16_715_646));
+            if work > timing.worst.0 {
+                timing.worst = (work, self.presented);
+            }
+            if let Some(file) = &mut self.profile {
+                let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                let _ = writeln!(
+                    file,
+                    "{},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
+                    self.presented,
+                    ms(game),
+                    ms(capture_3d + render_3d),
+                    ms((rendered - rendered_start).saturating_sub(render_3d)),
+                    ms((captured - start).saturating_sub(capture_3d)),
+                    ms(sounded - captured),
+                    self.io.geometry.displayed_polygons()
+                );
+            }
         }
+        if render && let (Some(frame), Some(on_frame)) = (&frame, &mut self.options.on_frame) {
+            on_frame(self.presented, frame);
+        }
+        self.timing.last = Some(Instant::now());
     }
 
     fn write_slow(&mut self, address: u32, size: u32, value: u32) {
@@ -507,7 +596,7 @@ impl Machine {
         if control != self.memory.vram.control {
             self.memory.vram.control = control;
             self.memory.vram.update();
-            self.memory.remap();
+            self.memory.remap_vram();
         }
     }
 
@@ -578,6 +667,17 @@ impl Machine {
         };
         let destination_step = step((control >> 21) & 3);
         let source_step = step((control >> 23) & 3);
+        // Display lists go to the geometry FIFO by DMA, tens of thousands
+        // of words a frame: hand them straight to the geometry engine.
+        if words && destination_step == 0 && (0x0400_0400..=0x0400_05C8).contains(&destination) {
+            self.poll = (0, 0);
+            for _ in 0..count {
+                let value = self.read32(source);
+                self.io.write(destination, 4, value);
+                source = source.wrapping_add(source_step as u32);
+            }
+            count = 0;
+        }
         for _ in 0..count {
             if words {
                 let value = self.read32(source);
@@ -977,27 +1077,46 @@ impl Machine {
             opc2,
             value,
         });
+        let memory = &self.memory;
+        let layout = (
+            memory.dtcm_enabled,
+            memory.itcm_enabled,
+            memory.dtcm_base,
+            memory.dtcm_size,
+            memory.itcm_end,
+        );
         match (crn, crm, opc2) {
             (1, 0, 0) => {
                 self.cp15_control = value;
                 self.memory.dtcm_enabled = value & (1 << 16) != 0;
                 self.memory.itcm_enabled = value & (1 << 18) != 0;
-                self.memory.remap();
             }
             (9, 1, 0) => {
                 self.cp15_dtcm = value;
                 self.memory.dtcm_base = value & 0xFFFF_F000;
                 self.memory.dtcm_size = 512 << ((value >> 1) & 0x1F);
-                self.memory.remap();
             }
             (9, 1, 1) => {
                 self.cp15_itcm = value;
                 self.memory.itcm_end = (512_u32 << ((value >> 1) & 0x1F)).min(0x0200_0000);
-                self.memory.remap();
             }
             // Wait for interrupt.
             (7, 0, 4) | (7, 8, 2) => return true,
             _ => {}
+        }
+        // The control register also holds cache and protection bits, which
+        // games toggle often; only a TCM change moves memory.
+        let memory = &self.memory;
+        if layout
+            != (
+                memory.dtcm_enabled,
+                memory.itcm_enabled,
+                memory.dtcm_base,
+                memory.dtcm_size,
+                memory.itcm_end,
+            )
+        {
+            self.memory.remap();
         }
         false
     }
@@ -1057,6 +1176,7 @@ impl Machine {
             self.io.geometry.peak_vertices,
             self.io.geometry.overflowed_lists
         );
+        let _ = writeln!(report, "{}", self.timing.describe());
         let cpu = self.cpu();
         let _ = writeln!(
             report,
@@ -1073,8 +1193,10 @@ impl Machine {
         for event in &self.events {
             let _ = writeln!(report, "  {}", describe(event));
         }
-        report.push_str("recent calls, jumps and interpreter entries (oldest first):
-");
+        report.push_str(
+            "recent calls, jumps and interpreter entries (oldest first):
+",
+        );
         for event in &self.control {
             let _ = writeln!(report, "  {}", describe(event));
         }
@@ -1117,7 +1239,7 @@ impl Machine {
                 .join(" ")
         );
         report.push_str("I/O registers touched (address: reads/writes):\n");
-        for (address, access) in &self.io.touched {
+        for (address, access) in self.io.touched.iter() {
             let _ = writeln!(
                 report,
                 "  0x{address:08X}: {}/{}",
@@ -1643,12 +1765,25 @@ pub(super) extern "C" fn host_write_psr(cpu: *mut Cpu, spsr: u32, fields: u32, v
 
 /// Take a pending interrupt now if the CPU accepts interrupts. Called where
 /// the game re-enables them, which is where hardware would take one.
+///
+/// An interrupt raised while the handler ran is taken as soon as it
+/// returns, as on hardware. NitroSDK's MI_SendGXCommandAsync relies on
+/// this: each geometry FIFO interrupt sends one 112-word block, and the
+/// FIFO asks again at once. Left for later, every block would wait for the
+/// waiting loop to use up its branch budget.
 fn interrupt_if_enabled(cpu: *mut Cpu) {
-    let machine = unsafe { machine(cpu) };
-    if !machine.banks.irq_disabled && machine.io.pending() != 0 {
-        deliver_interrupts(cpu);
+    for _ in 0..CHAINED_INTERRUPTS {
+        let machine = unsafe { machine(cpu) };
+        if machine.banks.irq_disabled || machine.io.pending() == 0 || !deliver_interrupts(cpu) {
+            return;
+        }
     }
 }
+
+/// At most this many interrupts are taken back to back before the
+/// interrupted code runs again, in case a level-triggered source is never
+/// acknowledged.
+const CHAINED_INTERRUPTS: usize = 256;
 
 /// A loop ran out of budget: let time pass, let the ARM7 act, and take a
 /// pending interrupt.
@@ -1803,6 +1938,13 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         arm7_init_phase: 0,
         options,
         presented: 0,
+        timing: FrameTiming::default(),
+        profile: std::env::var_os("GEN5_PROFILE").and_then(|path| {
+            let mut file = fs::File::create(path).ok()?;
+            file.write_all(b"frame,game,3d,2d,capture,sound,polygons\n")
+                .ok()?;
+            Some(file)
+        }),
         sp_limit: std::env::var("GEN5_SP_LIMIT")
             .ok()
             .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok()),

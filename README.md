@@ -187,6 +187,11 @@ screenshots in one stretch of a run. `GEN5_3D_TRACE=frame:path` writes every
 polygon of the 3D list that follows that frame to `path`: whether it was kept
 or culled (and why), its attributes and screen coordinates, plus box tests;
 `first-last:path` writes one `path.frame` file per list in that range.
+The report also says where host time went per frame (game code, 3D, 2D,
+capture, sound) and how many frames took longer than a DS frame.
+`GEN5_PROFILE=path` renders every frame as the window does, even headless,
+and writes those times for each frame to `path` as CSV, with the size of the
+polygon list shown.
 
 `./scripts/white2/replay.ps1 -Inputs scripts/white2/field.inputs -Frames 52000`
 replays the first controllable-field checkpoint from a fresh save: finish the
@@ -226,7 +231,9 @@ The `nds` module provides:
 - `gpu2d`: both 2D engines, rendered once per frame at vblank: text,
   affine, extended and bitmap backgrounds, sprites, windows, blending and
   master brightness. Engine A's BG0 can composite the 3D layer, including
-  its alpha, scrolling, window masks and priority.
+  its alpha, scrolling, window masks and priority. Lines are drawn in
+  parallel, and display capture shares engine A's lines and the 3D layer
+  with the screen of the same frame.
 - `gpu3d`: a software geometry engine and rasterizer. Packed FIFO commands,
   direct command ports and geometry FIFO DMA feed the matrix stacks,
   lighting, vertex lists and frame swaps. The rasterizer clips polygons,
@@ -236,7 +243,9 @@ The `nds` module provides:
   hardware, polygon RAM (2048 polygons, 6144 vertices) only keeps polygons
   that survive frustum, far-plane and facing tests, so wide scenes such as
   the opening flyover keep their distant map blocks; polygons are drawn in
-  the hardware's Y order. Matrix and
+  the hardware's Y order. Everything runs on the CPU, not the host GPU
+  (the window only presents finished frames); bands of rows are rasterized
+  in parallel on the host's cores. Matrix and
   geometry-test results are readable by the game. Commands run synchronously
   except buffer swaps, which wait for vblank; FIFO timing is approximate.
   Fog, edge marking, antialiasing, wireframe, shadow polygons and rear-plane
