@@ -1,8 +1,9 @@
 pub mod code;
+pub mod title;
 
 use crate::Result;
 use crate::formats::nds::{NdsRom, RomFile};
-use crate::game::gen5::{self, Gen5Title};
+use title::Gen5Title;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
@@ -39,7 +40,7 @@ pub struct ImportReport {
 
 /// Import all files addressed by the NDS FNT/FAT tables into an immutable cache.
 pub fn import_rom(mut rom: NdsRom, cache_root: &Path) -> Result<ImportReport> {
-    let game = gen5::identify(&rom.header.game_code).ok_or_else(|| {
+    let game = title::identify(&rom.header.game_code).ok_or_else(|| {
         format!(
             "game code '{}' is not a recognized Pokémon Gen V retail title",
             String::from_utf8_lossy(&rom.header.game_code)
