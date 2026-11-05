@@ -56,6 +56,49 @@ pub struct Access {
     pub writes: u64,
 }
 
+/// Reads and writes per I/O register, for reports. The ARM9's own
+/// registers get a table, since the geometry FIFO alone is written tens of
+/// thousands of times a frame.
+pub struct Touched {
+    near: Vec<Access>,
+    far: BTreeMap<u32, Access>,
+}
+
+const TOUCHED_NEAR: u32 = 0x2000;
+
+impl Touched {
+    fn new() -> Self {
+        Self {
+            near: vec![Access::default(); TOUCHED_NEAR as usize],
+            far: BTreeMap::new(),
+        }
+    }
+
+    fn get(&mut self, address: u32) -> &mut Access {
+        match address.checked_sub(0x0400_0000) {
+            Some(offset) if offset < TOUCHED_NEAR => &mut self.near[offset as usize],
+            _ => self.far.entry(address).or_default(),
+        }
+    }
+
+    /// Every register touched, in address order.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, Access)> + '_ {
+        let near = self
+            .near
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.reads + a.writes != 0);
+        let (low, high): (Vec<_>, Vec<_>) = self
+            .far
+            .iter()
+            .map(|(&address, &a)| (address, a))
+            .partition(|&(address, _)| address < 0x0400_0000);
+        low.into_iter()
+            .chain(near.map(|(offset, &a)| (0x0400_0000 + offset as u32, a)))
+            .chain(high)
+    }
+}
+
 pub struct Io {
     pub geometry: super::gpu3d::Geometry,
     regs: Vec<u8>,
@@ -63,7 +106,7 @@ pub struct Io {
     pub frame: u64,
     /// Words from the ARM7 waiting in the receive FIFO.
     pub fifo_recv: VecDeque<u32>,
-    pub touched: BTreeMap<u32, Access>,
+    pub touched: Touched,
     timers: [Timer; 4],
 }
 
@@ -112,7 +155,7 @@ impl Io {
             line: 0,
             frame: 0,
             fifo_recv: VecDeque::new(),
-            touched: BTreeMap::new(),
+            touched: Touched::new(),
             timers: [Timer::default(); 4],
         };
         io.set16(KEYINPUT, 0x03FF);
@@ -224,7 +267,7 @@ impl Io {
 
     pub fn read(&mut self, address: u32, size: u32) -> u32 {
         let aligned = address & !(size - 1);
-        self.touched.entry(aligned).or_default().reads += 1;
+        self.touched.get(aligned).reads += 1;
         if let Some(value) = self.geometry.read(aligned) {
             return (value >> (8 * (address & 3))) & (u32::MAX >> (32 - 8 * size));
         }
@@ -263,7 +306,7 @@ impl Io {
 
     pub fn write(&mut self, address: u32, size: u32, value: u32) -> Option<Effect> {
         let aligned = address & !(size - 1);
-        self.touched.entry(aligned).or_default().writes += 1;
+        self.touched.get(aligned).writes += 1;
         if (0x0400_0400..=0x0400_05c8).contains(&aligned) && size == 4 {
             self.geometry.write(aligned, value);
             return None;

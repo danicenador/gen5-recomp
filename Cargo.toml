@@ -21,3 +21,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 wgpu = "30.0.1"
 winit = "0.30.13"
+rayon = "1.12.0"

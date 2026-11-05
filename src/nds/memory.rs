@@ -108,6 +108,36 @@ impl Memory {
         self.read_pages[PAGE_COUNT - 1] = unsafe { self.bios.as_mut_ptr().add(0x7000) };
     }
 
+    /// Remap only the VRAM pages, after VRAMCNT changed. Games remap banks
+    /// several times a frame to upload textures, and rebuilding every page
+    /// table each time is slow.
+    pub fn remap_vram(&mut self) {
+        let tcm_overlaps = |enabled: bool, start: u32, end: u32| {
+            enabled && start < 0x0700_0000 && end > 0x0600_0000
+        };
+        let dtcm_end = self
+            .dtcm_base
+            .saturating_add(self.dtcm_size.max(PAGE as u32));
+        if tcm_overlaps(self.itcm_enabled, 0, self.itcm_end)
+            || tcm_overlaps(self.dtcm_enabled, self.dtcm_base, dtcm_end)
+        {
+            return self.remap();
+        }
+        let banks = self.vram.banks.as_mut_ptr();
+        for page in (0x0600_0000_u32 >> PAGE_SHIFT)..(0x0700_0000 >> PAGE_SHIFT) {
+            let pointer =
+                self.vram
+                    .cpu_offset(page << PAGE_SHIFT)
+                    .map_or(std::ptr::null_mut(), |offset| {
+                        // SAFETY: the offset is inside the bank buffer, which is
+                        // never reallocated.
+                        unsafe { banks.add(offset) }
+                    });
+            self.read_pages[page as usize] = pointer;
+            self.write_pages[page as usize] = pointer;
+        }
+    }
+
     /// The host byte for a guest address, if the address is mapped.
     pub fn byte(&self, address: u32, write: bool) -> Option<*mut u8> {
         let pages = if write {
@@ -153,5 +183,23 @@ mod tests {
         assert!(memory.byte(0x0400_0000, false).is_none());
         assert!(memory.byte(0xFFFF_0000, true).is_none());
         assert!(memory.byte(0xFFFF_FFFC, false).is_some());
+    }
+
+    #[test]
+    fn vram_remap_matches_full_remap() {
+        let mut memory = Memory::new();
+        memory.dtcm_base = 0x027E_0000;
+        memory.remap();
+        for control in [
+            [0x81, 0x89, 0x84, 0x80, 0x82, 0x80, 0x00, 0x81, 0x83],
+            [0; 9],
+        ] {
+            memory.vram.control = control;
+            memory.vram.update();
+            memory.remap_vram();
+            let (read, write) = (memory.read_pages.clone(), memory.write_pages.clone());
+            memory.remap();
+            assert!(read == memory.read_pages && write == memory.write_pages);
+        }
     }
 }
