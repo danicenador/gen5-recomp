@@ -11,8 +11,15 @@ use std::sync::Arc;
 /// paced to the DS frame rate (or a multiple of it while fast-forwarding,
 /// Tab), and the window shows its frames, drawn at `scale` times the DS
 /// resolution (keys 1-8 change it). The window draws as often as `fps`
-/// says, interpolating 3D between game frames.
-pub fn play_recompiled(cache_root: &Path, rom: &Path, scale: u32, fps: pacing::Fps) -> Result<()> {
+/// says, interpolating 3D between game frames. `split_screens` puts each
+/// DS screen in its own window.
+pub fn play_recompiled(
+    cache_root: &Path,
+    rom: &Path,
+    scale: u32,
+    fps: pacing::Fps,
+    split_screens: bool,
+) -> Result<()> {
     use crate::nds::{input::Input, machine, speed::Speed};
     let scale = Arc::new(std::sync::atomic::AtomicU32::new(
         scale.clamp(1, screen::MAX_SCALE),
@@ -55,7 +62,15 @@ pub fn play_recompiled(cache_root: &Path, rom: &Path, scale: u32, fps: pacing::F
             std::process::exit(1);
         }
     });
-    screen::run("Gen5 Recomp", screens, input, scale, fps, speed)?;
+    screen::run(
+        "Gen5 Recomp",
+        screens,
+        input,
+        scale,
+        fps,
+        speed,
+        split_screens,
+    )?;
     // The game threads never return; closing the window ends the program.
     std::process::exit(0);
 }

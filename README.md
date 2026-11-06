@@ -149,6 +149,11 @@ frames per second. Keys: arrows for the D-pad, X = A, Z = B, S = X, A = Y,
 Q = L, W = R, Enter = Start, Right Shift or Backspace = Select, and the
 mouse on the lower screen as the stylus. Escape quits.
 
+Add `--split-screens` to `run` to put the top and bottom DS screens in
+separate, independently resizable windows. Keyboard controls work in either
+window; the mouse acts as the stylus only in the bottom-screen window.
+Closing either window quits. Without the flag, both screens remain stacked.
+
 `run` takes an optional resolution multiple after the ROM, `run <cache>
 <rom> 4` (or `GEN5_SCALE=4`), and keys 1 to 8 change it while playing. At
 1 the software renderer draws the DS's own 256x192 per screen. Above 1 the

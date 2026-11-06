@@ -1,4 +1,4 @@
-//! A window for the recompiled game: both DS screens stacked, scaled to
+//! Windows for the recompiled game: DS screens stacked or separate, scaled to
 //! fit with square pixels, keyboard buttons and the mouse as the stylus.
 //! The game runs on its own threads and hands frames over through
 //! `Screens`; this side presents them and records input. With an `Fps`
@@ -88,10 +88,11 @@ pub use crate::nds::speed::FRAME_TIME;
 /// The largest resolution multiple keys 1-8 select.
 pub const MAX_SCALE: u32 = 8;
 
-/// Run the window until it is closed; then the process exits. `scale` is
+/// Run until either window is closed; then the process exits. `scale` is
 /// the resolution multiple frames are drawn at; keys 1-8 change it. `fps`
 /// is how often it draws; F turns interpolation off and on to compare.
 /// Tab turns fast-forward on and off, and + and - change its speed.
+/// `split_screens` gives each screen its own window instead of stacking them.
 pub fn run(
     title: &str,
     screens: Arc<Screens>,
@@ -99,6 +100,7 @@ pub fn run(
     scale: Arc<AtomicU32>,
     fps: Fps,
     speed: Arc<Speed>,
+    split_screens: bool,
 ) -> Result<()> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("could not create event loop: {error}"))?;
@@ -108,7 +110,9 @@ pub fn run(
         input,
         scale,
         speed,
-        window: None,
+        windows: Vec::new(),
+        split_screens,
+        redraw_pending: false,
         gpu: None,
         pressed: 0,
         cursor: None,
@@ -139,7 +143,9 @@ struct App {
     input: Arc<Input>,
     scale: Arc<AtomicU32>,
     speed: Arc<Speed>,
-    window: Option<Arc<Window>>,
+    windows: Vec<Arc<Window>>,
+    split_screens: bool,
+    redraw_pending: bool,
     gpu: Option<Gpu>,
     pressed: u32,
     cursor: Option<PhysicalPosition<f64>>,
@@ -176,29 +182,81 @@ fn button(key: KeyCode) -> Option<u32> {
     })
 }
 
-/// Where the two screens are drawn in a window of this size: x, y, scale.
-fn placement(width: u32, height: u32) -> (f32, f32, f32) {
-    let scale = (width as f32 / WIDTH as f32).min(height as f32 / (2 * HEIGHT) as f32);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum View {
+    Stacked,
+    Top,
+    Bottom,
+}
+
+impl View {
+    fn height(self) -> usize {
+        if self == Self::Stacked {
+            2 * HEIGHT
+        } else {
+            HEIGHT
+        }
+    }
+
+    fn instance(self) -> u32 {
+        match self {
+            Self::Stacked => 0,
+            Self::Top => 1,
+            Self::Bottom => 2,
+        }
+    }
+
+    fn touch(
+        self,
+        size: winit::dpi::PhysicalSize<u32>,
+        cursor: PhysicalPosition<f64>,
+    ) -> Option<(u8, u8)> {
+        if self == Self::Top || size.width == 0 || size.height == 0 {
+            return None;
+        }
+        let (x, y, scale) = placement(size.width, size.height, self);
+        let px = ((cursor.x as f32 - x) / scale).floor();
+        let py = ((cursor.y as f32 - y) / scale).floor()
+            - if self == Self::Stacked {
+                HEIGHT as f32
+            } else {
+                0.0
+            };
+        ((0.0..WIDTH as f32).contains(&px) && (0.0..HEIGHT as f32).contains(&py))
+            .then_some((px as u8, py as u8))
+    }
+}
+
+/// Where the screens are drawn in a window of this size: x, y, scale.
+fn placement(width: u32, height: u32, view: View) -> (f32, f32, f32) {
+    let scale = (width as f32 / WIDTH as f32).min(height as f32 / view.height() as f32);
     let x = (width as f32 - WIDTH as f32 * scale) / 2.0;
-    let y = (height as f32 - (2 * HEIGHT) as f32 * scale) / 2.0;
+    let y = (height as f32 - view.height() as f32 * scale) / 2.0;
     (x, y, scale)
 }
 
 impl App {
+    fn view(&self, index: usize) -> View {
+        if !self.split_screens {
+            View::Stacked
+        } else if index == 0 {
+            View::Top
+        } else {
+            View::Bottom
+        }
+    }
+
     fn update_touch(&self) {
         let point = self.cursor.filter(|_| self.pen_down).and_then(|cursor| {
-            let size = self.window.as_ref()?.inner_size();
-            let (x, y, scale) = placement(size.width, size.height);
-            let px = ((cursor.x as f32 - x) / scale).floor();
-            let py = ((cursor.y as f32 - y) / scale).floor() - HEIGHT as f32;
-            ((0.0..WIDTH as f32).contains(&px) && (0.0..HEIGHT as f32).contains(&py))
-                .then_some((px as u8, py as u8))
+            let index = usize::from(self.split_screens);
+            self.view(index)
+                .touch(self.windows.get(index)?.inner_size(), cursor)
         });
         self.input.set_touch(point);
     }
 
     fn redraw(&mut self) -> Result<()> {
-        let (Some(window), Some(gpu)) = (&self.window, &mut self.gpu) else {
+        let Some(gpu) = &mut self.gpu else {
             return Ok(());
         };
         self.history.extend(self.screens.take());
@@ -234,7 +292,9 @@ impl App {
             }
             self.history.drain(..pick.keep_from);
         }
-        gpu.draw(window.inner_size())?;
+        for (index, window) in self.windows.iter().enumerate() {
+            gpu.draw(index, window.inner_size())?;
+        }
         self.rate.presents += 1;
         let elapsed = self.rate.since.elapsed();
         if self.fps.interpolates() && elapsed >= Duration::from_millis(500) {
@@ -253,10 +313,7 @@ impl App {
                 matched: Matched::default(),
                 shown,
             };
-            let title = self.window_title();
-            if let Some(window) = &self.window {
-                window.set_title(&title);
-            }
+            self.update_title();
         }
         Ok(())
     }
@@ -276,8 +333,24 @@ impl App {
     }
 
     fn update_title(&self) {
-        if let Some(window) = &self.window {
-            window.set_title(&self.window_title());
+        for (index, window) in self.windows.iter().enumerate() {
+            window.set_title(&self.output_title(index));
+        }
+    }
+
+    fn output_title(&self, index: usize) -> String {
+        let title = self.window_title();
+        match self.view(index) {
+            View::Stacked => title,
+            View::Top => format!("{title} - Top screen"),
+            View::Bottom => format!("{title} - Bottom screen"),
+        }
+    }
+
+    fn request_redraw(&mut self) {
+        self.redraw_pending = true;
+        for window in &self.windows {
+            window.request_redraw();
         }
     }
 
@@ -330,37 +403,37 @@ fn scale_key(key: KeyCode) -> Option<u32> {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if !self.windows.is_empty() {
             return;
         }
         // Big enough to show the chosen resolution, within the monitor.
         let scale = self.scale.load(Ordering::Relaxed);
-        let mut attributes = Window::default_attributes()
-            .with_title(self.window_title())
-            .with_inner_size(winit::dpi::LogicalSize::new(512.0, 768.0));
-        if scale > 2 {
-            let mut size =
-                winit::dpi::PhysicalSize::new(WIDTH as u32 * scale, 2 * HEIGHT as u32 * scale);
-            if let Some(monitor) = event_loop.primary_monitor() {
-                let limit = monitor.size().height * 9 / 10;
-                if size.height > limit {
-                    size = winit::dpi::PhysicalSize::new(
-                        limit * WIDTH as u32 / (2 * HEIGHT as u32),
-                        limit,
-                    );
+        for index in 0..if self.split_screens { 2 } else { 1 } {
+            let height = self.view(index).height() as u32;
+            let mut attributes = Window::default_attributes()
+                .with_title(self.output_title(index))
+                .with_inner_size(winit::dpi::LogicalSize::new(512.0, f64::from(height * 2)));
+            if scale > 2 {
+                let mut size = winit::dpi::PhysicalSize::new(WIDTH as u32 * scale, height * scale);
+                if let Some(monitor) = event_loop.primary_monitor() {
+                    let limit = monitor.size().height * 9 / 10;
+                    if size.height > limit {
+                        size = winit::dpi::PhysicalSize::new(limit * WIDTH as u32 / height, limit);
+                    }
                 }
+                attributes = attributes.with_inner_size(size);
             }
-            attributes = attributes.with_inner_size(size);
+            let window = match event_loop.create_window(attributes) {
+                Ok(window) => Arc::new(window),
+                Err(error) => {
+                    self.error = Some(format!("could not create window: {error}"));
+                    event_loop.exit();
+                    return;
+                }
+            };
+            self.windows.push(window);
         }
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
-            Err(error) => {
-                self.error = Some(format!("could not create window: {error}"));
-                event_loop.exit();
-                return;
-            }
-        };
-        match pollster::block_on(Gpu::new(window.clone(), self.fps)) {
+        match pollster::block_on(Gpu::new(&self.windows, self.fps)) {
             Ok(gpu) => self.gpu = Some(gpu),
             Err(error) => {
                 self.error = Some(error);
@@ -368,10 +441,13 @@ impl ApplicationHandler for App {
                 return;
             }
         }
-        self.window = Some(window);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let Some(index) = self.windows.iter().position(|window| window.id() == id) else {
+            return;
+        };
+        let touch_window = self.view(index) != View::Top;
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
@@ -411,11 +487,11 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::CursorMoved { position, .. } if touch_window => {
                 self.cursor = Some(position);
                 self.update_touch();
             }
-            WindowEvent::CursorLeft { .. } => {
+            WindowEvent::CursorLeft { .. } if touch_window => {
                 self.cursor = None;
                 self.update_touch();
             }
@@ -423,17 +499,29 @@ impl ApplicationHandler for App {
                 state,
                 button: MouseButton::Left,
                 ..
-            } => {
+            } if touch_window => {
                 self.pen_down = state == ElementState::Pressed;
                 self.update_touch();
             }
             WindowEvent::Focused(false) => {
                 self.pressed = 0;
-                self.pen_down = false;
                 self.input.set_buttons(0);
+                if touch_window {
+                    self.pen_down = false;
+                    self.cursor = None;
+                    self.update_touch();
+                }
+            }
+            WindowEvent::Resized(_) if touch_window => {
                 self.update_touch();
             }
             WindowEvent::RedrawRequested => {
+                // Both windows request the same presentation. Draw once so
+                // they share a frame and interpolation point.
+                if !self.redraw_pending {
+                    return;
+                }
+                self.redraw_pending = false;
                 if let Err(error) = self.redraw() {
                     self.error = Some(error);
                     event_loop.exit();
@@ -444,26 +532,26 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(window) = &self.window else {
+        if self.windows.is_empty() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_TIME / 2));
             return;
-        };
+        }
         match self.fps {
             Fps::Ds => {
-                window.request_redraw();
+                self.request_redraw();
                 event_loop
                     .set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_TIME / 2));
             }
             // Vsync, or nothing, paces the presents.
             Fps::Display | Fps::Uncapped => {
-                window.request_redraw();
+                self.request_redraw();
                 event_loop.set_control_flow(ControlFlow::Poll);
             }
             Fps::Cap(rate) => {
                 let now = Instant::now();
                 if now >= self.next_present {
                     self.next_present = pacing::next_present(self.next_present, now, rate);
-                    window.request_redraw();
+                    self.request_redraw();
                 }
                 event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_present));
             }
@@ -478,11 +566,14 @@ struct Out {
 };
 
 @vertex
-fn vs_main(@builtin(vertex_index) index: u32) -> Out {
+fn vs_main(@builtin(vertex_index) index: u32, @builtin(instance_index) screen_index: u32) -> Out {
     let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
     var out: Out;
     out.position = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
     out.uv = uv;
+    if screen_index != 0u {
+        out.uv.y = (uv.y + f32(screen_index - 1u)) * 0.5;
+    }
     return out;
 }
 
@@ -496,10 +587,9 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
 ";
 
 struct Gpu {
-    surface: wgpu::Surface<'static>,
+    targets: Vec<SurfaceTarget>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
     /// Software frames, at the DS resolution.
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
@@ -513,6 +603,12 @@ struct Gpu {
     /// smaller than the output), while it is what is shown.
     scaled_view: Option<(u32, wgpu::BindGroup, wgpu::BindGroup)>,
     showing_scaled: bool,
+}
+
+struct SurfaceTarget {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    view: View,
 }
 
 fn screens_bind_group(
@@ -538,14 +634,19 @@ fn screens_bind_group(
 }
 
 impl Gpu {
-    async fn new(window: Arc<Window>, fps: Fps) -> Result<Self> {
+    async fn new(windows: &[Arc<Window>], fps: Fps) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface = instance
-            .create_surface(window.clone())
-            .map_err(|error| format!("could not create the window surface: {error}"))?;
+        let surfaces = windows
+            .iter()
+            .map(|window| {
+                instance
+                    .create_surface(window.clone())
+                    .map_err(|error| format!("could not create the window surface: {error}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
+                compatible_surface: surfaces.first(),
                 ..Default::default()
             })
             .await
@@ -557,16 +658,42 @@ impl Gpu {
             })
             .await
             .map_err(|error| format!("could not create graphics device: {error}"))?;
-        let size = window.inner_size();
-        let mut config = surface
+        let size = windows[0].inner_size();
+        let config = surfaces[0]
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| "graphics surface has no supported configuration".to_owned())?;
-        config.present_mode = if fps.vsync() {
+        let present_mode = if fps.vsync() {
             wgpu::PresentMode::Fifo
         } else {
             wgpu::PresentMode::AutoNoVsync
         };
-        surface.configure(&device, &config);
+        let mut targets = Vec::new();
+        for (index, (surface, window)) in surfaces.into_iter().zip(windows).enumerate() {
+            let size = window.inner_size();
+            let capabilities = surface.get_capabilities(&adapter);
+            if !capabilities.formats.contains(&config.format) {
+                return Err(
+                    "graphics adapter does not support a shared format for both windows".to_owned(),
+                );
+            }
+            let mut target_config = surface
+                .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+                .ok_or_else(|| "graphics surface has no supported configuration".to_owned())?;
+            target_config.format = config.format;
+            target_config.present_mode = present_mode;
+            surface.configure(&device, &target_config);
+            targets.push(SurfaceTarget {
+                surface,
+                config: target_config,
+                view: if windows.len() == 1 {
+                    View::Stacked
+                } else if index == 0 {
+                    View::Top
+                } else {
+                    View::Bottom
+                },
+            });
+        }
 
         // Frames are sRGB colours; match the surface so they pass through.
         let format = if config.format.is_srgb() {
@@ -671,10 +798,9 @@ impl Gpu {
             cache: None,
         });
         Ok(Self {
-            surface,
+            targets,
             device,
             queue,
-            config,
             texture,
             bind_group,
             pipeline,
@@ -745,20 +871,21 @@ impl Gpu {
         matched
     }
 
-    fn draw(&mut self, size: winit::dpi::PhysicalSize<u32>) -> Result<()> {
+    fn draw(&mut self, index: usize, size: winit::dpi::PhysicalSize<u32>) -> Result<()> {
         if size.width == 0 || size.height == 0 {
             return Ok(());
         }
-        if (size.width, size.height) != (self.config.width, self.config.height) {
-            self.config.width = size.width;
-            self.config.height = size.height;
-            self.surface.configure(&self.device, &self.config);
+        let target = &mut self.targets[index];
+        if (size.width, size.height) != (target.config.width, target.config.height) {
+            target.config.width = size.width;
+            target.config.height = size.height;
+            target.surface.configure(&self.device, &target.config);
         }
-        let frame = match self.surface.get_current_texture() {
+        let frame = match target.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
+                target.surface.configure(&self.device, &target.config);
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -794,12 +921,12 @@ impl Gpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let (x, y, scale) = placement(size.width, size.height);
+            let (x, y, scale) = placement(size.width, size.height, target.view);
             pass.set_viewport(
                 x,
                 y,
                 WIDTH as f32 * scale,
-                (2 * HEIGHT) as f32 * scale,
+                target.view.height() as f32 * scale,
                 0.0,
                 1.0,
             );
@@ -816,7 +943,8 @@ impl Gpu {
                 _ => &self.bind_group,
             };
             pass.set_bind_group(0, bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            let instance = target.view.instance();
+            pass.draw(0..3, instance..instance + 1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
@@ -830,10 +958,217 @@ mod tests {
 
     #[test]
     fn screens_fit_with_square_pixels() {
-        assert_eq!(placement(512, 768), (0.0, 0.0, 2.0));
+        assert_eq!(placement(512, 768, View::Stacked), (0.0, 0.0, 2.0));
         // A wide window letterboxes horizontally.
-        let (x, y, scale) = placement(1000, 384);
+        let (x, y, scale) = placement(1000, 384, View::Stacked);
         assert_eq!((y, scale), (0.0, 1.0));
         assert_eq!(x, (1000.0 - 256.0) / 2.0);
+    }
+
+    #[test]
+    fn separate_screens_fit_with_square_pixels() {
+        for view in [View::Top, View::Bottom] {
+            assert_eq!(placement(512, 384, view), (0.0, 0.0, 2.0));
+            assert_eq!(placement(1000, 384, view), (244.0, 0.0, 2.0));
+            assert_eq!(placement(256, 400, view), (0.0, 104.0, 1.0));
+        }
+    }
+
+    #[test]
+    fn stylus_only_maps_the_bottom_screen() {
+        let size = winit::dpi::PhysicalSize::new(512, 768);
+        let point = PhysicalPosition::new(256.0, 576.0);
+        assert_eq!(View::Stacked.touch(size, point), Some((128, 96)));
+        assert_eq!(
+            View::Stacked.touch(size, PhysicalPosition::new(256.0, 192.0)),
+            None
+        );
+        assert_eq!(View::Top.touch(size, point), None);
+        let size = winit::dpi::PhysicalSize::new(1000, 384);
+        assert_eq!(
+            View::Bottom.touch(size, PhysicalPosition::new(500.0, 192.0)),
+            Some((128, 96))
+        );
+        for (x, y) in [(243.0, 0.0), (756.0, 0.0), (244.0, -1.0), (244.0, 384.0)] {
+            assert_eq!(View::Bottom.touch(size, PhysicalPosition::new(x, y)), None);
+        }
+        assert_eq!(
+            View::Bottom.touch(size, PhysicalPosition::new(244.0, 0.0)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            View::Bottom.touch(size, PhysicalPosition::new(755.0, 383.0)),
+            Some((255, 191))
+        );
+        assert_eq!(
+            View::Bottom.touch(winit::dpi::PhysicalSize::new(0, 0), point),
+            None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires a Windows desktop and graphics adapter"]
+    fn split_windows_present_native_and_scaled_frames() {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        struct Smoke;
+        impl ApplicationHandler for Smoke {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                let windows: Vec<_> = ["Top test", "Bottom test"]
+                    .into_iter()
+                    .map(|title| {
+                        Arc::new(
+                            event_loop
+                                .create_window(
+                                    Window::default_attributes()
+                                        .with_title(title)
+                                        .with_inner_size(winit::dpi::PhysicalSize::new(512, 384)),
+                                )
+                                .unwrap(),
+                        )
+                    })
+                    .collect();
+                let mut gpu = pollster::block_on(Gpu::new(&windows, Fps::Ds)).unwrap();
+                assert_eq!(gpu.targets.len(), 2);
+                assert_eq!(gpu.targets[0].view, View::Top);
+                assert_eq!(gpu.targets[1].view, View::Bottom);
+                let mut frame = Frame::blank();
+                for pixel in frame.top.chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&[255, 0, 0, 255]);
+                }
+                for pixel in frame.bottom.chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&[0, 255, 0, 255]);
+                }
+                gpu.upload(&frame);
+                verify_screen_pixels(&gpu);
+                for (index, window) in windows.iter().enumerate() {
+                    gpu.draw(index, window.inner_size()).unwrap();
+                    gpu.draw(index, winit::dpi::PhysicalSize::new(320, 240))
+                        .unwrap();
+                    gpu.draw(index, winit::dpi::PhysicalSize::new(0, 0))
+                        .unwrap();
+                }
+                use crate::nds::gpu2d::{Composed, ScaledFrame};
+                let mut pixels = vec![Composed::fixed(31).pack(); WIDTH * HEIGHT];
+                pixels.extend(vec![Composed::fixed(31 << 5).pack(); WIDTH * HEIGHT]);
+                frame.scaled = Some(Box::new(ScaledFrame {
+                    pixels,
+                    brightness: [0; 2],
+                    three_d: None,
+                }));
+                gpu.upload(&frame);
+                for scale in [1, 2, 4] {
+                    gpu.render_scaled(scale, None, 0.0);
+                    verify_screen_pixels(&gpu);
+                    for (index, window) in windows.iter().enumerate() {
+                        gpu.draw(index, window.inner_size()).unwrap();
+                    }
+                }
+                event_loop.exit();
+            }
+
+            fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+        }
+
+        let event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
+        event_loop.run_app(&mut Smoke).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn verify_screen_pixels(gpu: &Gpu) {
+        let format = gpu.targets[0].config.format;
+        for view in [View::Stacked, View::Top, View::Bottom] {
+            let height = view.height() as u32;
+            let output = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("screen selection test"),
+                size: wgpu::Extent3d {
+                    width: WIDTH as u32,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let output_view = output.create_view(&Default::default());
+            let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("screen selection readback"),
+                size: u64::from(WIDTH as u32 * height * 4),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            {
+                let colors = [Some(wgpu::RenderPassColorAttachment {
+                    view: &output_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &colors,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&gpu.pipeline);
+                let bind_group = if gpu.showing_scaled {
+                    &gpu.scaled_view.as_ref().unwrap().1
+                } else {
+                    &gpu.bind_group
+                };
+                pass.set_bind_group(0, bind_group, &[]);
+                let instance = view.instance();
+                pass.draw(0..3, instance..instance + 1);
+            }
+            encoder.copy_texture_to_buffer(
+                output.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(WIDTH as u32 * 4),
+                        rows_per_image: Some(height),
+                    },
+                },
+                output.size(),
+            );
+            gpu.queue.submit(std::iter::once(encoder.finish()));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    sender.send(result).unwrap();
+                });
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            receiver.recv().unwrap().unwrap();
+            let data = buffer.slice(..).get_mapped_range().unwrap();
+            for (index, pixel) in data.chunks_exact(4).enumerate() {
+                let bottom =
+                    view == View::Bottom || (view == View::Stacked && index >= WIDTH * HEIGHT);
+                let expected = if bottom {
+                    [0, 255, 0, 255]
+                } else {
+                    [255, 0, 0, 255]
+                };
+                let actual = match format {
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+                        [pixel[2], pixel[1], pixel[0], pixel[3]]
+                    }
+                    wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {
+                        [pixel[0], pixel[1], pixel[2], pixel[3]]
+                    }
+                    _ => panic!("unexpected test surface format: {format:?}"),
+                };
+                assert_eq!(actual, expected, "{view:?}, pixel {index}");
+            }
+        }
     }
 }
