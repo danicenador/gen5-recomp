@@ -226,11 +226,14 @@ fn run() -> Result<(), String> {
                 },
             )
         }
-        Some("run") if (3..=5).contains(&args.len()) => {
+        Some("run") if (3..=6).contains(&args.len()) => {
             let mut scale = None;
             let mut fps = None;
+            let mut split_screens = false;
             for value in &args[3..] {
-                if let Some(mode) = value.strip_prefix("--fps=") {
+                if value == "--split-screens" {
+                    split_screens = true;
+                } else if let Some(mode) = value.strip_prefix("--fps=") {
                     fps = Some(gen5::runtime::pacing::Fps::parse(mode)?);
                 } else {
                     scale = Some(
@@ -249,7 +252,13 @@ fn run() -> Result<(), String> {
                 Some(fps) => fps,
                 None => fps_from_env()?,
             };
-            gen5::runtime::play_recompiled(Path::new(&args[1]), Path::new(&args[2]), scale, fps)
+            gen5::runtime::play_recompiled(
+                Path::new(&args[1]),
+                Path::new(&args[2]),
+                scale,
+                fps,
+                split_screens,
+            )
         }
         Some("disasm") if args.len() == 4 => {
             let module = args[2].parse::<ModuleId>()?;
@@ -793,7 +802,7 @@ fn print_usage() {
          gen5 codegen <import-cache-directory>\n\
          gen5 build <import-cache-directory> [c-compiler]\n\
          gen5 boot <import-cache-directory> <rom.nds> [frames [png-directory]]\n\
-         gen5 run <import-cache-directory> <rom.nds> [scale] [--fps=ds|display|uncapped|N]\n\
+         gen5 run <import-cache-directory> <rom.nds> [scale] [--fps=ds|display|uncapped|N] [--split-screens]\n\
          gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 help"
