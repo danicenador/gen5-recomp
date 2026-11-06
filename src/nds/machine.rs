@@ -15,6 +15,7 @@ use super::input::Input;
 use super::io::{self, Effect, Io};
 use super::memory::Memory;
 use super::sound::{AudioQueue, Sound};
+use super::speed::{self, KeyRepeat, Pace, Speed, Step};
 use crate::Result;
 use crate::importer::code::CodeManifest;
 use crate::recomp::program::{ModuleId, Program};
@@ -123,8 +124,9 @@ enum Event {
     },
 }
 
-/// Receives each frame number and both screens.
-pub type FrameSink = Box<dyn FnMut(u64, &Frame) + Send>;
+/// Receives each frame number, both screens, and when the frame is due on
+/// screen (when the game moves on to the next frame; now, when not paced).
+pub type FrameSink = Box<dyn FnMut(u64, &Frame, Instant) + Send>;
 
 pub struct Options {
     /// Stop after this many frames (vertical blanks).
@@ -149,6 +151,13 @@ pub struct Options {
     /// Always hand frames to a GPU renderer, at any scale: the window needs
     /// the 3D list to draw frames between game frames.
     pub gpu: bool,
+    /// Fast-forward, which can change while the game runs; `None` runs
+    /// at normal speed.
+    pub speed: Option<Arc<Speed>>,
+    /// Hold the game to the DS frame rate (times the fast-forward factor)
+    /// in real time, as the window does. Headless runs leave it off and
+    /// run as fast as they can.
+    pub real_time: bool,
 }
 
 pub struct Machine {
@@ -189,6 +198,10 @@ pub struct Machine {
     sound: Sound,
     /// The frame the sound was last run up to.
     sound_frame: u64,
+    /// Real time per frame, for pacing and fast-forward.
+    pace: Option<Pace>,
+    /// Keeps menu key repeat at normal speed while fast-forwarding.
+    key_repeat: KeyRepeat,
     backup: Backup,
     firmware: Firmware,
     /// The ARM7 stand-in's IPCSYNC output nibble.
@@ -440,11 +453,13 @@ impl Machine {
         // The ARM7 counts vertical blanks for OS_GetVBlankCount.
         let count = self.read32(VBLANK_COUNT);
         self.write32(VBLANK_COUNT, count.wrapping_add(1));
+        let step = self.pace.as_mut().map(Pace::start);
         if let Some(input) = &self.options.input {
             let (keys, button_xy) = (input.keyinput(), input.button_xy());
             self.io.set16(io::KEYINPUT, keys);
             self.write16(BUTTON_XY, u32::from(button_xy));
         }
+        self.key_repeat.frame(&mut self.memory.main, step.as_ref());
         let start = Instant::now();
         let game = self.timing.last.map_or(Duration::ZERO, |last| start - last);
         self.io.geometry.take_render_time();
@@ -452,7 +467,7 @@ impl Machine {
         gpu2d::capture_with(&mut self.io, &mut self.memory, &mut shared);
         let captured = Instant::now();
         let capture_3d = self.io.geometry.take_render_time();
-        self.advance_sound();
+        self.advance_sound(step.filter(Step::is_fast));
         let sounded = Instant::now();
         // GEN5_3D_TRACE=first[-last][:path] describes the 3D lists started
         // after those frames: every polygon, whether it was kept, and box
@@ -529,9 +544,16 @@ impl Machine {
         let in_range = range.is_some_and(|(first, last, every)| {
             (first..=last).contains(&self.presented) && self.presented.is_multiple_of(every.max(1))
         });
+        // Fast-forwarding in a window, only about one frame per DS frame
+        // of real time is shown.
+        let shown = match (&mut self.pace, &step) {
+            (Some(pace), Some(step)) => pace.show(step),
+            _ => true,
+        };
         let render = self.presented == self.options.max_frames
             || in_range
-            || self.options.render_every != 0
+            || shown
+                && self.options.render_every != 0
                 && self.presented.is_multiple_of(self.options.render_every);
         let rendered_start = Instant::now();
         let scaled =
@@ -560,7 +582,7 @@ impl Machine {
             timing.capture += (captured - start).saturating_sub(capture_3d);
             timing.sound += sounded - captured;
             timing.two_d += (rendered - rendered_start).saturating_sub(render_3d);
-            timing.slow += u64::from(work > Duration::from_nanos(16_715_646));
+            timing.slow += u64::from(work > speed::FRAME_TIME);
             if work > timing.worst.0 {
                 timing.worst = (work, self.presented);
             }
@@ -579,8 +601,15 @@ impl Machine {
                 );
             }
         }
+        let deadline = match (&mut self.pace, &step) {
+            (Some(pace), Some(step)) => pace.deadline(step),
+            _ => Instant::now(),
+        };
         if render && let (Some(frame), Some(on_frame)) = (&frame, &mut self.options.on_frame) {
-            on_frame(self.presented, frame);
+            on_frame(self.presented, frame, deadline);
+        }
+        if let Some(pace) = &self.pace {
+            pace.wait();
         }
         self.timing.last = Some(Instant::now());
     }
@@ -900,9 +929,19 @@ impl Machine {
     }
 
     /// Run sound up to the current frame and hand the samples to the host.
-    fn advance_sound(&mut self) {
+    /// Fast-forwarding, sound runs for the real time that passed instead,
+    /// so that it keeps its normal speed.
+    fn advance_sound(&mut self, fast: Option<Step>) {
         let frames = self.io.frame.saturating_sub(self.sound_frame);
         self.sound_frame = self.io.frame;
+        if let Some(step) = fast {
+            let samples = self.sound.advance(&mut self.memory.main, step.sound_cycles);
+            if let Some(audio) = &self.options.audio {
+                audio.push(samples);
+            }
+            self.send_sound_alarms();
+            return;
+        }
         // After a long stall (several frames at once) only the last few are
         // queued; the rest would arrive too late to be heard.
         for frame in 0..frames {
@@ -1954,6 +1993,11 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         backup_expects_block: false,
         sound: Sound::default(),
         sound_frame: 0,
+        pace: options
+            .speed
+            .as_ref()
+            .map(|speed| Pace::new(speed.clone(), options.real_time)),
+        key_repeat: KeyRepeat::find(&arm9, manifest.arm9.binary.load_address),
         backup: Backup::open(state_root.join("save.bin")),
         firmware: Firmware::open(state_root.join("firmware.bin")),
         arm7_sync_output: 7,
@@ -2033,6 +2077,9 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         "Booting ARM9 entry 0x{entry:08X} with {} functions",
         table.len()
     );
+    if machine.options.speed.is_some() && !machine.key_repeat.is_found() {
+        eprintln!("fast-forward: this game's key repeat was not recognised, so menus will repeat keys faster too");
+    }
     // The machine is reached through `cpu.runtime` from here on.
     let machine = Box::leak(machine);
     // Generated code that loops without calling the runtime cannot be
