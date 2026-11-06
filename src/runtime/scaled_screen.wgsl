@@ -1,5 +1,7 @@
 // Both screens composed over the scaled 3D layer. Follows
 // `nds::gpu2d::Composed::resolve`; 2D pixels repeat to fill the scale.
+// In widescreen everything is `extra` DS columns wider on each side; the
+// bottom screen keeps its 256 columns, with black around them.
 
 
 struct Params {
@@ -8,7 +10,8 @@ struct Params {
     screen: i32,
     // Engine A's BG0 horizontal scroll.
     scroll: u32,
-    _pad: u32,
+    // Widescreen columns on each side (0 without).
+    extra: u32,
     // MASTER_BRIGHT of the top and bottom screens.
     brightness: vec4<u32>,
 };
@@ -93,15 +96,26 @@ fn resolve(record: vec4<u32>, color: u32, alpha: u32) -> u32 {
 @fragment
 fn screen_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let scale = params.scale;
+    let extra = params.extra;
     let x = u32(position.x);
     let y = u32(position.y);
-    let record = textureLoad(composed, vec2<u32>(x / scale, y / scale), 0);
     let screen = (y / scale) / 192u;
+    if screen == 1u && (x / scale < extra || x / scale >= extra + 256u) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    let record = textureLoad(composed, vec2<u32>(x / scale, y / scale), 0);
     var color = record.x & 0x7FFFu;
     if i32(screen) == params.screen {
-        let sx = (x + params.scroll * scale) % (512u * scale);
-        if sx < 256u * scale {
-            let at = vec2<u32>(sx, y - screen * 192u * scale);
+        // The 3D layer's column, in scaled DS pixels from the screen's
+        // left edge, after BG0's scroll (-256 to 255).
+        var scroll = i32(params.scroll);
+        if scroll >= 256 {
+            scroll = scroll - 512;
+        }
+        let side = i32(extra * scale);
+        let sx = i32(x) - side + scroll * i32(scale);
+        if sx >= -side && sx < i32(256u * scale) + side {
+            let at = vec2<u32>(u32(sx + side), y - screen * 192u * scale);
             let alpha = u32(round(textureLoad(layer_alpha, at, 0).x * 31.0));
             if alpha != 0u {
                 let layer = textureLoad(layer_color, at, 0);

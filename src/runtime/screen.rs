@@ -1,6 +1,7 @@
 //! Windows for the recompiled game: DS screens stacked or separate, scaled to
 //! fit with square pixels, keyboard or controller buttons and the mouse as
-//! the stylus. Esc asks before quitting.
+//! the stylus. Esc asks before quitting. In widescreen the top screen is
+//! 16:9 and the bottom one sits centered under it.
 //! The game runs on its own threads and hands frames over through
 //! `Screens`; this side presents them and records input. With an `Fps`
 //! other than `Ds` it draws between game frames too (see `pacing`).
@@ -13,7 +14,7 @@ use crate::nds::gpu3d::{DisplayList, Matched};
 use crate::nds::input::{self, Input};
 use crate::nds::speed::Speed;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -95,6 +96,8 @@ pub const MAX_SCALE: u32 = 8;
 /// is how often it draws; F turns interpolation off and on to compare.
 /// Tab turns fast-forward on and off, and + and - change its speed.
 /// `split_screens` gives each screen its own window instead of stacking them.
+/// `widescreen` makes the top screen 16:9; H turns it off and on.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     title: &str,
     screens: Arc<Screens>,
@@ -103,6 +106,7 @@ pub fn run(
     fps: Fps,
     speed: Arc<Speed>,
     split_screens: bool,
+    widescreen: Arc<AtomicBool>,
 ) -> Result<()> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("could not create event loop: {error}"))?;
@@ -114,6 +118,7 @@ pub fn run(
         speed,
         windows: Vec::new(),
         split_screens,
+        widescreen,
         redraw_pending: false,
         gpu: None,
         pressed: 0,
@@ -149,6 +154,9 @@ struct App {
     speed: Arc<Speed>,
     windows: Vec<Arc<Window>>,
     split_screens: bool,
+    /// Whether the game draws the top screen 16:9; frames say how wide
+    /// they are, so this only decides new frames and window sizes.
+    widescreen: Arc<AtomicBool>,
     redraw_pending: bool,
     gpu: Option<Gpu>,
     /// Buttons held on the keyboard.
@@ -206,11 +214,25 @@ impl View {
         }
     }
 
-    fn instance(self) -> u32 {
+    /// The width shown, in DS pixels, when the top screen has `extra`
+    /// widescreen columns on each side.
+    fn width(self, extra: usize) -> usize {
+        if self == Self::Bottom {
+            WIDTH
+        } else {
+            WIDTH + 2 * extra
+        }
+    }
+
+    /// The part of the stacked screens shown, in texture coordinates:
+    /// x, y, width, height. Frames are `WIDTH + 2 * extra` wide, the bottom
+    /// screen in the middle of its half.
+    fn rect(self, extra: usize) -> [f32; 4] {
+        let total = (WIDTH + 2 * extra) as f32;
         match self {
-            Self::Stacked => 0,
-            Self::Top => 1,
-            Self::Bottom => 2,
+            Self::Stacked => [0.0, 0.0, 1.0, 1.0],
+            Self::Top => [0.0, 0.0, 1.0, 0.5],
+            Self::Bottom => [extra as f32 / total, 0.5, WIDTH as f32 / total, 0.5],
         }
     }
 
@@ -218,12 +240,18 @@ impl View {
         self,
         size: winit::dpi::PhysicalSize<u32>,
         cursor: PhysicalPosition<f64>,
+        extra: usize,
     ) -> Option<(u8, u8)> {
         if self == Self::Top || size.width == 0 || size.height == 0 {
             return None;
         }
-        let (x, y, scale) = placement(size.width, size.height, self);
-        let px = ((cursor.x as f32 - x) / scale).floor();
+        let (x, y, scale) = placement(size.width, size.height, self, extra);
+        let px = ((cursor.x as f32 - x) / scale).floor()
+            - if self == Self::Stacked {
+                extra as f32
+            } else {
+                0.0
+            };
         let py = ((cursor.y as f32 - y) / scale).floor()
             - if self == Self::Stacked {
                 HEIGHT as f32
@@ -235,12 +263,23 @@ impl View {
     }
 }
 
-/// Where the screens are drawn in a window of this size: x, y, scale.
-fn placement(width: u32, height: u32, view: View) -> (f32, f32, f32) {
-    let scale = (width as f32 / WIDTH as f32).min(height as f32 / view.height() as f32);
-    let x = (width as f32 - WIDTH as f32 * scale) / 2.0;
+/// Where the screens are drawn in a window of this size, with `extra`
+/// widescreen columns on each side of the top screen: x, y, scale.
+fn placement(width: u32, height: u32, view: View, extra: usize) -> (f32, f32, f32) {
+    let shown = view.width(extra) as f32;
+    let scale = (width as f32 / shown).min(height as f32 / view.height() as f32);
+    let x = (width as f32 - shown * scale) / 2.0;
     let y = (height as f32 - view.height() as f32 * scale) / 2.0;
     (x, y, scale)
+}
+
+/// The widescreen columns on each side of the top screen.
+fn extra_columns(widescreen: bool) -> usize {
+    if widescreen {
+        crate::nds::gpu2d::WIDE_EXTRA
+    } else {
+        0
+    }
 }
 
 impl App {
@@ -290,12 +329,32 @@ impl App {
     }
 
     fn update_touch(&self) {
+        // Where the screens are is decided by the frame shown.
+        let extra = self.gpu.as_ref().map_or(0, |gpu| gpu.extra);
         let point = self.cursor.filter(|_| self.pen_down).and_then(|cursor| {
             let index = usize::from(self.split_screens);
             self.view(index)
-                .touch(self.windows.get(index)?.inner_size(), cursor)
+                .touch(self.windows.get(index)?.inner_size(), cursor, extra)
         });
         self.input.set_touch(point);
+    }
+
+    /// H: switch the top screen between 16:9 and 4:3. Windows keep their
+    /// height and change width to match, unless maximized or full screen.
+    fn toggle_widescreen(&mut self) {
+        let wide = !self.widescreen.load(Ordering::Relaxed);
+        self.widescreen.store(wide, Ordering::Relaxed);
+        for (index, window) in self.windows.iter().enumerate() {
+            if window.is_maximized() || window.fullscreen().is_some() {
+                continue;
+            }
+            let view = self.view(index);
+            let size = window.inner_size();
+            let width = size.height as usize * view.width(extra_columns(wide)) / view.height();
+            let _ =
+                window.request_inner_size(winit::dpi::PhysicalSize::new(width as u32, size.height));
+        }
+        self.update_title();
     }
 
     fn redraw(&mut self) -> Result<()> {
@@ -366,6 +425,9 @@ impl App {
             1 => self.title.clone(),
             scale => format!("{} - {scale}x resolution", self.title),
         };
+        if self.widescreen.load(Ordering::Relaxed) {
+            title = format!("{title} - 16:9");
+        }
         if self.speed.is_fast() {
             title = format!("{title} - fast-forward {}x", self.speed.factor());
         }
@@ -451,17 +513,23 @@ impl ApplicationHandler for App {
         }
         // Big enough to show the chosen resolution, within the monitor.
         let scale = self.scale.load(Ordering::Relaxed);
+        let extra = extra_columns(self.widescreen.load(Ordering::Relaxed));
         for index in 0..if self.split_screens { 2 } else { 1 } {
-            let height = self.view(index).height() as u32;
+            let view = self.view(index);
+            let height = view.height() as u32;
+            let width = view.width(extra) as u32;
             let mut attributes = Window::default_attributes()
                 .with_title(self.output_title(index))
-                .with_inner_size(winit::dpi::LogicalSize::new(512.0, f64::from(height * 2)));
+                .with_inner_size(winit::dpi::LogicalSize::new(
+                    f64::from(width * 2),
+                    f64::from(height * 2),
+                ));
             if scale > 2 {
-                let mut size = winit::dpi::PhysicalSize::new(WIDTH as u32 * scale, height * scale);
+                let mut size = winit::dpi::PhysicalSize::new(width * scale, height * scale);
                 if let Some(monitor) = event_loop.primary_monitor() {
                     let limit = monitor.size().height * 9 / 10;
                     if size.height > limit {
-                        size = winit::dpi::PhysicalSize::new(limit * WIDTH as u32 / height, limit);
+                        size = winit::dpi::PhysicalSize::new(limit * width / height, limit);
                     }
                 }
                 attributes = attributes.with_inner_size(size);
@@ -510,6 +578,12 @@ impl ApplicationHandler for App {
                         && self.fps.interpolates()
                     {
                         self.interpolate = !self.interpolate;
+                        return;
+                    }
+                    if code == KeyCode::KeyH {
+                        if event.state == ElementState::Pressed && !event.repeat {
+                            self.toggle_widescreen();
+                        }
                         return;
                     }
                     if let Some(scale) = scale_key(code)
@@ -614,15 +688,20 @@ struct Out {
     @location(0) uv: vec2<f32>,
 };
 
+// The part of the stacked screens this window shows: offset and size.
+struct Rect {
+    offset: vec2<f32>,
+    size: vec2<f32>,
+};
+
+@group(1) @binding(0) var<uniform> rect: Rect;
+
 @vertex
-fn vs_main(@builtin(vertex_index) index: u32, @builtin(instance_index) screen_index: u32) -> Out {
+fn vs_main(@builtin(vertex_index) index: u32) -> Out {
     let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
     var out: Out;
     out.position = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
-    out.uv = uv;
-    if screen_index != 0u {
-        out.uv.y = (uv.y + f32(screen_index - 1u)) * 0.5;
-    }
+    out.uv = rect.offset + uv * rect.size;
     return out;
 }
 
@@ -648,16 +727,45 @@ struct Gpu {
     linear: wgpu::Sampler,
     /// Frames drawn at a multiple of the DS resolution.
     scaled: Option<super::scaled::Renderer>,
-    /// The scaled output's scale, sampled nearest and linear (for windows
-    /// smaller than the output), while it is what is shown.
-    scaled_view: Option<(u32, wgpu::BindGroup, wgpu::BindGroup)>,
+    /// The scaled output's scale and width, sampled nearest and linear (for
+    /// windows smaller than the output), while it is what is shown.
+    scaled_view: Option<((u32, u32), wgpu::BindGroup, wgpu::BindGroup)>,
     showing_scaled: bool,
+    /// The widescreen columns on each side of the shown frame's top screen.
+    extra: usize,
+    /// For the screen tests, which draw views no window has.
+    #[cfg_attr(not(test), allow(dead_code))]
+    rect_layout: wgpu::BindGroupLayout,
 }
 
 struct SurfaceTarget {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     view: View,
+    /// What part of the screens the window shows (`View::rect`).
+    rect: wgpu::Buffer,
+    rect_bind_group: wgpu::BindGroup,
+}
+
+fn rect_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("DS screens rect"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("DS screens rect bind group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    (buffer, bind_group)
 }
 
 fn screens_bind_group(
@@ -716,6 +824,19 @@ impl Gpu {
         } else {
             wgpu::PresentMode::AutoNoVsync
         };
+        let rect_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("DS screens rect layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
         let mut targets = Vec::new();
         for (index, (surface, window)) in surfaces.into_iter().zip(windows).enumerate() {
             let size = window.inner_size();
@@ -731,6 +852,7 @@ impl Gpu {
             target_config.format = config.format;
             target_config.present_mode = present_mode;
             surface.configure(&device, &target_config);
+            let (rect, rect_bind_group) = rect_bind_group(&device, &rect_layout);
             targets.push(SurfaceTarget {
                 surface,
                 config: target_config,
@@ -741,6 +863,8 @@ impl Gpu {
                 } else {
                     View::Bottom
                 },
+                rect,
+                rect_bind_group,
             });
         }
 
@@ -818,7 +942,7 @@ impl Gpu {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("DS screens pipeline layout"),
-            bind_group_layouts: &[Some(&layout)],
+            bind_group_layouts: &[Some(&layout), Some(&rect_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -859,12 +983,15 @@ impl Gpu {
             scaled: None,
             scaled_view: None,
             showing_scaled: false,
+            extra: 0,
+            rect_layout,
         })
     }
 
     /// Take the frame to show. A scaled frame is drawn by `render_scaled`.
     fn upload(&mut self, frame: &Frame) {
         self.showing_scaled = frame.scaled.is_some();
+        self.extra = frame.scaled.as_ref().map_or(0, |scaled| scaled.extra);
         if let Some(scaled) = &frame.scaled {
             self.scaled
                 .get_or_insert_with(|| super::scaled::Renderer::new(&self.device, &self.queue))
@@ -902,10 +1029,11 @@ impl Gpu {
             return Matched::default();
         };
         let (output, matched) = renderer.draw(scale, next, alpha);
+        let id = (scale, output.width());
         if self
             .scaled_view
             .as_ref()
-            .is_none_or(|(shown, _, _)| *shown != scale)
+            .is_none_or(|(shown, _, _)| *shown != id)
         {
             // Sample through the same format as software frames, so
             // sRGB surfaces pass colors through unchanged.
@@ -915,7 +1043,7 @@ impl Gpu {
             });
             let nearest = screens_bind_group(&self.device, &self.layout, &view, &self.nearest);
             let linear = screens_bind_group(&self.device, &self.layout, &view, &self.linear);
-            self.scaled_view = Some((scale, nearest, linear));
+            self.scaled_view = Some((id, nearest, linear));
         }
         matched
     }
@@ -925,6 +1053,11 @@ impl Gpu {
             return Ok(());
         }
         let target = &mut self.targets[index];
+        self.queue.write_buffer(
+            &target.rect,
+            0,
+            bytemuck::cast_slice(&target.view.rect(self.extra)),
+        );
         if (size.width, size.height) != (target.config.width, target.config.height) {
             target.config.width = size.width;
             target.config.height = size.height;
@@ -970,11 +1103,11 @@ impl Gpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let (x, y, scale) = placement(size.width, size.height, target.view);
+            let (x, y, scale) = placement(size.width, size.height, target.view, self.extra);
             pass.set_viewport(
                 x,
                 y,
-                WIDTH as f32 * scale,
+                target.view.width(self.extra) as f32 * scale,
                 target.view.height() as f32 * scale,
                 0.0,
                 1.0,
@@ -982,7 +1115,7 @@ impl Gpu {
             pass.set_pipeline(&self.pipeline);
             let bind_group = match &self.scaled_view {
                 // Shrinking a large output: average texels rather than skip them.
-                Some((shown, nearest, linear)) if self.showing_scaled => {
+                Some(((shown, _), nearest, linear)) if self.showing_scaled => {
                     if (*shown as f32) > scale {
                         linear
                     } else {
@@ -992,8 +1125,8 @@ impl Gpu {
                 _ => &self.bind_group,
             };
             pass.set_bind_group(0, bind_group, &[]);
-            let instance = target.view.instance();
-            pass.draw(0..3, instance..instance + 1);
+            pass.set_bind_group(1, &target.rect_bind_group, &[]);
+            pass.draw(0..3, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
@@ -1007,51 +1140,88 @@ mod tests {
 
     #[test]
     fn screens_fit_with_square_pixels() {
-        assert_eq!(placement(512, 768, View::Stacked), (0.0, 0.0, 2.0));
+        assert_eq!(placement(512, 768, View::Stacked, 0), (0.0, 0.0, 2.0));
         // A wide window letterboxes horizontally.
-        let (x, y, scale) = placement(1000, 384, View::Stacked);
+        let (x, y, scale) = placement(1000, 384, View::Stacked, 0);
         assert_eq!((y, scale), (0.0, 1.0));
         assert_eq!(x, (1000.0 - 256.0) / 2.0);
+        // Widescreen stacks a 342-wide top screen over the bottom one.
+        assert_eq!(placement(684, 768, View::Stacked, 43), (0.0, 0.0, 2.0));
+        assert_eq!(placement(1000, 384, View::Stacked, 43).0, 329.0);
     }
 
     #[test]
     fn separate_screens_fit_with_square_pixels() {
         for view in [View::Top, View::Bottom] {
-            assert_eq!(placement(512, 384, view), (0.0, 0.0, 2.0));
-            assert_eq!(placement(1000, 384, view), (244.0, 0.0, 2.0));
-            assert_eq!(placement(256, 400, view), (0.0, 104.0, 1.0));
+            assert_eq!(placement(512, 384, view, 0), (0.0, 0.0, 2.0));
+            assert_eq!(placement(1000, 384, view, 0), (244.0, 0.0, 2.0));
+            assert_eq!(placement(256, 400, view, 0), (0.0, 104.0, 1.0));
         }
+        // Only the top screen widens.
+        assert_eq!(placement(684, 384, View::Top, 43), (0.0, 0.0, 2.0));
+        assert_eq!(placement(1000, 384, View::Bottom, 43), (244.0, 0.0, 2.0));
+    }
+
+    #[test]
+    fn widescreen_shows_the_bottom_screen_from_the_middle() {
+        assert_eq!(View::Stacked.rect(43), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(View::Top.rect(43), [0.0, 0.0, 1.0, 0.5]);
+        assert_eq!(View::Bottom.rect(0), [0.0, 0.5, 1.0, 0.5]);
+        let [x, y, width, height] = View::Bottom.rect(43);
+        assert_eq!(
+            (x * 342.0, y, width * 342.0, height),
+            (43.0, 0.5, 256.0, 0.5)
+        );
     }
 
     #[test]
     fn stylus_only_maps_the_bottom_screen() {
         let size = winit::dpi::PhysicalSize::new(512, 768);
         let point = PhysicalPosition::new(256.0, 576.0);
-        assert_eq!(View::Stacked.touch(size, point), Some((128, 96)));
+        assert_eq!(View::Stacked.touch(size, point, 0), Some((128, 96)));
         assert_eq!(
-            View::Stacked.touch(size, PhysicalPosition::new(256.0, 192.0)),
+            View::Stacked.touch(size, PhysicalPosition::new(256.0, 192.0), 0),
             None
         );
-        assert_eq!(View::Top.touch(size, point), None);
+        assert_eq!(View::Top.touch(size, point, 0), None);
         let size = winit::dpi::PhysicalSize::new(1000, 384);
         assert_eq!(
-            View::Bottom.touch(size, PhysicalPosition::new(500.0, 192.0)),
+            View::Bottom.touch(size, PhysicalPosition::new(500.0, 192.0), 0),
             Some((128, 96))
         );
         for (x, y) in [(243.0, 0.0), (756.0, 0.0), (244.0, -1.0), (244.0, 384.0)] {
-            assert_eq!(View::Bottom.touch(size, PhysicalPosition::new(x, y)), None);
+            assert_eq!(
+                View::Bottom.touch(size, PhysicalPosition::new(x, y), 0),
+                None
+            );
         }
         assert_eq!(
-            View::Bottom.touch(size, PhysicalPosition::new(244.0, 0.0)),
+            View::Bottom.touch(size, PhysicalPosition::new(244.0, 0.0), 0),
             Some((0, 0))
         );
         assert_eq!(
-            View::Bottom.touch(size, PhysicalPosition::new(755.0, 383.0)),
+            View::Bottom.touch(size, PhysicalPosition::new(755.0, 383.0), 0),
             Some((255, 191))
         );
         assert_eq!(
-            View::Bottom.touch(winit::dpi::PhysicalSize::new(0, 0), point),
+            View::Bottom.touch(winit::dpi::PhysicalSize::new(0, 0), point, 0),
             None
+        );
+        // Widescreen: the bottom screen is centered under the wider top.
+        let size = winit::dpi::PhysicalSize::new(684, 768);
+        assert_eq!(
+            View::Stacked.touch(size, PhysicalPosition::new(342.0, 576.0), 43),
+            Some((128, 96))
+        );
+        for x in [85.0, 598.0] {
+            assert_eq!(
+                View::Stacked.touch(size, PhysicalPosition::new(x, 576.0), 43),
+                None
+            );
+        }
+        assert_eq!(
+            View::Stacked.touch(size, PhysicalPosition::new(86.0, 384.0), 43),
+            Some((0, 0))
         );
     }
 
@@ -1103,6 +1273,7 @@ mod tests {
                 pixels.extend(vec![Composed::fixed(31 << 5).pack(); WIDTH * HEIGHT]);
                 frame.scaled = Some(Box::new(ScaledFrame {
                     pixels,
+                    extra: 0,
                     brightness: [0; 2],
                     three_d: None,
                 }));
@@ -1172,8 +1343,11 @@ mod tests {
                     &gpu.bind_group
                 };
                 pass.set_bind_group(0, bind_group, &[]);
-                let instance = view.instance();
-                pass.draw(0..3, instance..instance + 1);
+                let (rect, rect_group) = rect_bind_group(&gpu.device, &gpu.rect_layout);
+                gpu.queue
+                    .write_buffer(&rect, 0, bytemuck::cast_slice(&view.rect(0)));
+                pass.set_bind_group(1, &rect_group, &[]);
+                pass.draw(0..3, 0..1);
             }
             encoder.copy_texture_to_buffer(
                 output.as_image_copy(),

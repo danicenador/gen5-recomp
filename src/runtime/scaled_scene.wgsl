@@ -6,7 +6,8 @@ struct Scene {
     control: u32,
     alpha_ref: u32,
     w_buffer: u32,
-    _pad: u32,
+    // Widescreen columns on each side of the layer (0 without).
+    extra: u32,
     toon: array<vec4<u32>, 8>,
 };
 
@@ -35,7 +36,8 @@ struct VertexOut {
 @vertex
 fn scene_vertex(in: VertexIn) -> VertexOut {
     let w = in.position.w;
-    let ndc = vec2<f32>(in.position.x / 128.0 - 1.0, 1.0 - in.position.y / 96.0);
+    let half_width = 128.0 + f32(scene.extra);
+    let ndc = vec2<f32>((in.position.x + f32(scene.extra)) / half_width - 1.0, 1.0 - in.position.y / 96.0);
     var out: VertexOut;
     out.position = vec4<f32>(ndc * w, in.position.z * w, w);
     out.color = in.color;

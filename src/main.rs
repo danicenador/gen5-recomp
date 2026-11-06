@@ -209,6 +209,10 @@ fn run() -> Result<(), String> {
                     audio: queue,
                     scale: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(scale)),
                     gpu: false,
+                    // GEN5_WIDESCREEN=1: 16:9 top-screen screenshots.
+                    widescreen: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                        widescreen_from_env(),
+                    )),
                     // GEN5_SPEED=N: fast-forward at N times the game speed,
                     // with sound and key repeat counted at normal speed.
                     speed: std::env::var("GEN5_SPEED")
@@ -226,13 +230,16 @@ fn run() -> Result<(), String> {
                 },
             )
         }
-        Some("run") if (3..=6).contains(&args.len()) => {
+        Some("run") if (3..=7).contains(&args.len()) => {
             let mut scale = None;
             let mut fps = None;
             let mut split_screens = false;
+            let mut widescreen = widescreen_from_env();
             for value in &args[3..] {
                 if value == "--split-screens" {
                     split_screens = true;
+                } else if value == "--widescreen" {
+                    widescreen = true;
                 } else if let Some(mode) = value.strip_prefix("--fps=") {
                     fps = Some(gen5::runtime::pacing::Fps::parse(mode)?);
                 } else {
@@ -258,6 +265,7 @@ fn run() -> Result<(), String> {
                 scale,
                 fps,
                 split_screens,
+                widescreen,
             )
         }
         Some("disasm") if args.len() == 4 => {
@@ -337,6 +345,11 @@ fn inspect(path: &Path) -> Result<(), String> {
 }
 
 /// `first-last:button+button,...` into frame ranges and held buttons.
+/// GEN5_WIDESCREEN=1: draw the top screen 16:9.
+fn widescreen_from_env() -> bool {
+    std::env::var("GEN5_WIDESCREEN").is_ok_and(|value| value == "1")
+}
+
 /// GEN5_SCALE: the resolution multiple to draw at (default 1).
 fn scale_from_env() -> Result<u32, String> {
     match std::env::var("GEN5_SCALE") {
@@ -802,7 +815,7 @@ fn print_usage() {
          gen5 codegen <import-cache-directory>\n\
          gen5 build <import-cache-directory> [c-compiler]\n\
          gen5 boot <import-cache-directory> <rom.nds> [frames [png-directory]]\n\
-         gen5 run <import-cache-directory> <rom.nds> [scale] [--fps=ds|display|uncapped|N] [--split-screens]\n\
+         gen5 run <import-cache-directory> <rom.nds> [scale] [--fps=ds|display|uncapped|N] [--split-screens] [--widescreen]\n\
          gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 help"
