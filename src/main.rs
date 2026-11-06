@@ -227,6 +227,7 @@ fn run() -> Result<(), String> {
                             std::sync::Arc::new(gen5::nds::speed::Speed::fixed(factor))
                         }),
                     real_time: false,
+                    overlays: None,
                 },
             )
         }
