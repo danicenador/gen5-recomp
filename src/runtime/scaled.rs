@@ -16,6 +16,10 @@
 //! target blended with `Max`. Translucent polygon IDs live in the stencil
 //! buffer: opaque pixels store 64, translucent ones their ID, and a
 //! translucent polygon does not draw over its own ID.
+//!
+//! In widescreen the 3D layer and the top screen are `extra` columns wider
+//! on each side (`ScaledFrame::extra`), and the output is that wide, with
+//! the bottom screen in the middle of its half.
 
 use crate::Result;
 use crate::nds::gpu2d::{HEIGHT, ScaledFrame, WIDTH};
@@ -36,7 +40,7 @@ struct SceneUniform {
     control: u32,
     alpha_ref: u32,
     w_buffer: u32,
-    _pad: u32,
+    extra: u32,
     toon: [u32; 32],
 }
 
@@ -46,7 +50,7 @@ struct ScreenUniform {
     scale: u32,
     screen: i32,
     scroll: u32,
-    _pad: u32,
+    extra: u32,
     brightness: [u32; 4],
 }
 
@@ -54,6 +58,7 @@ struct ScreenUniform {
 #[derive(Default)]
 struct Shown {
     brightness: [u16; 2],
+    extra: usize,
     layer: Option<ShownLayer>,
 }
 
@@ -66,9 +71,10 @@ struct ShownLayer {
     clear_depth: f32,
 }
 
-/// Everything sized by the scale.
+/// Everything sized by the scale and the width.
 struct Targets {
     scale: u32,
+    extra: usize,
     color: wgpu::TextureView,
     alpha: wgpu::TextureView,
     depth: wgpu::TextureView,
@@ -92,10 +98,25 @@ pub struct Renderer {
     screen_layout: wgpu::BindGroupLayout,
     screen_pipeline: wgpu::RenderPipeline,
     screen_uniform: wgpu::Buffer,
+    /// The composed 2D pixels, `extra` columns wider on each side.
     composed: wgpu::Texture,
     composed_view: wgpu::TextureView,
+    composed_extra: usize,
     targets: Option<Targets>,
     shown: Shown,
+}
+
+fn composed_texture(device: &wgpu::Device, extra: usize) -> (wgpu::Texture, wgpu::TextureView) {
+    let composed = texture(
+        device,
+        "composed 2D pixels",
+        ((WIDTH + 2 * extra) as u32, 2 * HEIGHT as u32),
+        wgpu::TextureFormat::Rgba32Uint,
+        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        &[],
+    );
+    let view = composed.create_view(&Default::default());
+    (composed, view)
 }
 
 fn texture(
@@ -131,15 +152,19 @@ fn entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// Registers, read by both stages: the 3D layer's vertices need its width.
 fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    entry(
-        binding,
-        wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-    )
+    wgpu::BindGroupLayoutEntry {
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        ..entry(
+            binding,
+            wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+        )
+    }
 }
 
 fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -267,15 +292,7 @@ impl Renderer {
             std::mem::size_of::<ScreenUniform>() as u64,
             wgpu::BufferUsages::UNIFORM,
         );
-        let composed = texture(
-            device,
-            "composed 2D pixels",
-            (WIDTH as u32, 2 * HEIGHT as u32),
-            wgpu::TextureFormat::Rgba32Uint,
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            &[],
-        );
-        let composed_view = composed.create_view(&Default::default());
+        let (composed, composed_view) = composed_texture(device, 0);
         Self {
             device: device.clone(),
             queue: queue.clone(),
@@ -292,19 +309,21 @@ impl Renderer {
             screen_uniform,
             composed,
             composed_view,
+            composed_extra: 0,
             targets: None,
             shown: Shown::default(),
         }
     }
 
     fn targets(&mut self, scale: u32) -> &Targets {
+        let extra = self.composed_extra;
         if self
             .targets
             .as_ref()
-            .is_none_or(|targets| targets.scale != scale)
+            .is_none_or(|targets| (targets.scale, targets.extra) != (scale, extra))
         {
             let device = &self.device;
-            let size = (WIDTH as u32 * scale, HEIGHT as u32 * scale);
+            let size = ((WIDTH + 2 * extra) as u32 * scale, HEIGHT as u32 * scale);
             let attachment =
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
             let color = texture(
@@ -367,6 +386,7 @@ impl Renderer {
             });
             self.targets = Some(Targets {
                 scale,
+                extra,
                 color,
                 alpha,
                 depth,
@@ -482,7 +502,7 @@ impl Renderer {
         })
     }
 
-    fn upload_scene(&mut self, scene: &Scene) {
+    fn upload_scene(&mut self, scene: &Scene, extra: usize) {
         let mut toon = [0; 32];
         for (out, &color) in toon.iter_mut().zip(&scene.toon) {
             *out = u32::from(color);
@@ -491,7 +511,7 @@ impl Renderer {
             control: u32::from(scene.control),
             alpha_ref: u32::from(scene.alpha_ref),
             w_buffer: u32::from(scene.w_buffer),
-            _pad: 0,
+            extra: extra as u32,
             toon,
         };
         self.queue
@@ -526,7 +546,8 @@ impl Renderer {
     }
 
     /// Draw `frame` at `scale` times the DS resolution into the output
-    /// texture: both screens stacked, `256 * scale` by `384 * scale`.
+    /// texture: both screens stacked, `(256 + 2 * frame.extra) * scale` by
+    /// `384 * scale`.
     pub fn render(&mut self, frame: &ScaledFrame, scale: u32) -> &wgpu::Texture {
         self.set_frame(frame);
         self.draw(scale, None, 0.0).0
@@ -535,6 +556,12 @@ impl Renderer {
     /// Take a new frame from the game: its 2D layers, registers and texture
     /// memory. `draw` then draws it, as often as the window presents.
     pub fn set_frame(&mut self, frame: &ScaledFrame) {
+        if frame.extra != self.composed_extra {
+            (self.composed, self.composed_view) = composed_texture(&self.device, frame.extra);
+            self.composed_extra = frame.extra;
+            self.targets = None;
+        }
+        let width = (WIDTH + 2 * frame.extra) as u32;
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.composed,
@@ -545,20 +572,21 @@ impl Renderer {
             bytemuck::cast_slice(&frame.pixels),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(WIDTH as u32 * 16),
+                bytes_per_row: Some(width * 16),
                 rows_per_image: Some(2 * HEIGHT as u32),
             },
             wgpu::Extent3d {
-                width: WIDTH as u32,
+                width,
                 height: 2 * HEIGHT as u32,
                 depth_or_array_layers: 1,
             },
         );
         if let Some(layer) = &frame.three_d {
-            self.upload_scene(&layer.scene);
+            self.upload_scene(&layer.scene, frame.extra);
         }
         self.shown = Shown {
             brightness: frame.brightness,
+            extra: frame.extra,
             layer: frame.three_d.as_ref().map(|layer| ShownLayer {
                 screen: layer.screen,
                 scroll: layer.scroll,
@@ -580,11 +608,12 @@ impl Renderer {
     ) -> (&wgpu::Texture, Matched) {
         let scale = scale.max(1);
         let layer = self.shown.layer.as_ref();
+        let extra = self.shown.extra;
         let uniform = ScreenUniform {
             scale,
             screen: layer.map_or(-1, |layer| layer.screen as i32),
             scroll: layer.map_or(0, |layer| layer.scroll),
-            _pad: 0,
+            extra: extra as u32,
             brightness: [
                 u32::from(self.shown.brightness[0]),
                 u32::from(self.shown.brightness[1]),
@@ -594,7 +623,7 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.screen_uniform, 0, bytemuck::bytes_of(&uniform));
-        let triangles = layer.map(|layer| layer.list.build(next, alpha));
+        let triangles = layer.map(|layer| layer.list.build(next, alpha, extra > 0));
         if let Some(triangles) = &triangles {
             self.upload_vertices(&triangles.vertices);
             for batch in &triangles.batches {
@@ -734,7 +763,8 @@ impl Headless {
         })
     }
 
-    /// Both screens as RGBA8, `256 * scale` by `384 * scale`.
+    /// Both screens as RGBA8, `(256 + 2 * frame.extra) * scale` by
+    /// `384 * scale`, the bottom screen centered in its half.
     pub fn render(&mut self, frame: &ScaledFrame, scale: u32) -> Result<(u32, u32, Vec<u8>)> {
         let output = self.renderer.render(frame, scale);
         let (width, height) = (output.width(), output.height());

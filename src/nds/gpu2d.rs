@@ -5,6 +5,7 @@
 //! Behaviour per GBATEK.
 
 use super::gpu3d::Pixel;
+pub use super::gpu3d::WIDE_EXTRA;
 use super::io::Io;
 use super::memory::Memory;
 use super::vram::{Region, Vram};
@@ -41,10 +42,19 @@ impl Frame {
 /// A frame for a GPU renderer: both screens composed at native resolution
 /// with the 3D layer left open, and the 3D list to draw at any resolution.
 /// 2D layers scale by pixel repetition; only the 3D layer gains detail.
+///
+/// In widescreen (`extra` is `WIDE_EXTRA`) the top screen is `extra`
+/// columns wider on each side. Backgrounds and sprites stay in the middle
+/// 256 columns; the extra ones show the 3D layer over the backdrop, with
+/// the same blending and brightness, where the screen shows 3D, and black
+/// elsewhere. The bottom screen keeps its 256 columns, centered.
 #[derive(Clone)]
 pub struct ScaledFrame {
-    /// 256 x 384 `Composed::pack` pixels, top screen first.
+    /// `(256 + 2 * extra)` x 384 `Composed::pack` pixels, top screen
+    /// first. The bottom screen's extra columns are never shown.
     pub pixels: Vec<[u32; 4]>,
+    /// Columns added on each side of the top screen: 0 or `WIDE_EXTRA`.
+    pub extra: usize,
     /// MASTER_BRIGHT of the top and bottom screens.
     pub brightness: [u16; 2],
     pub three_d: Option<ThreeDLayer>,
@@ -59,14 +69,20 @@ pub struct ThreeDLayer {
     pub scene: super::gpu3d::Scene,
 }
 
-/// Both screens for a GPU renderer.
+/// Both screens for a GPU renderer, the top one widened when the geometry
+/// engine is in widescreen (`Geometry::wide`).
 pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
     let power = io.get16(POWCNT1);
     let blank = vec![Pixel::default(); WIDTH * HEIGHT];
     let mut three_d = None;
-    let mut engine = |b: bool, bit: u16| -> (Vec<Composed>, u16) {
+    // Each engine's screen, and what its widescreen columns show.
+    let mut engine = |b: bool, bit: u16| -> (Vec<Composed>, Composed, u16) {
         if power & bit == 0 {
-            return (vec![Composed::fixed(0); WIDTH * HEIGHT], 0);
+            return (
+                vec![Composed::fixed(0); WIDTH * HEIGHT],
+                Composed::fixed(0),
+                0,
+            );
         }
         let engine = Engine::new(io, memory, b, &blank);
         let dispcnt = engine.reg32(0);
@@ -77,7 +93,7 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
                 .into_iter()
                 .map(Composed::fixed)
                 .collect();
-            return (colors, brightness);
+            return (colors, Composed::fixed(0), brightness);
         }
         let mut composed = vec![Composed::default(); WIDTH * HEIGHT];
         let scroll = std::sync::atomic::AtomicUsize::new(0);
@@ -98,19 +114,30 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
                 io.geometry.scene(io, &memory.vram),
             ));
         }
-        (composed, brightness)
+        (composed, engine.side(dispcnt), brightness)
     };
-    let (a, a_bright) = engine(false, 1 << 1);
-    let (b, b_bright) = engine(true, 1 << 9);
+    let (a, a_side, a_bright) = engine(false, 1 << 1);
+    let (b, b_side, b_bright) = engine(true, 1 << 9);
     // POWCNT1 bit 15 puts engine A on the top screen.
     let a_on_top = power & 0x8000 != 0;
-    let (top, bottom, brightness) = if a_on_top {
-        (a, b, [a_bright, b_bright])
+    let (top, side, bottom, brightness) = if a_on_top {
+        (a, a_side, b, [a_bright, b_bright])
     } else {
-        (b, a, [b_bright, a_bright])
+        (b, b_side, a, [b_bright, a_bright])
     };
+    let extra = if io.geometry.wide { WIDE_EXTRA } else { 0 };
+    let mut pixels = Vec::with_capacity((WIDTH + 2 * extra) * 2 * HEIGHT);
+    for (screen, side) in [(&top, side), (&bottom, Composed::fixed(0))] {
+        let side = side.pack();
+        for row in screen.chunks(WIDTH) {
+            pixels.extend(std::iter::repeat_n(side, extra));
+            pixels.extend(row.iter().map(Composed::pack));
+            pixels.extend(std::iter::repeat_n(side, extra));
+        }
+    }
     ScaledFrame {
-        pixels: top.iter().chain(&bottom).map(Composed::pack).collect(),
+        pixels,
+        extra,
         brightness,
         three_d: three_d.map(|(scroll, scene)| ThreeDLayer {
             screen: usize::from(!a_on_top),
@@ -789,6 +816,42 @@ impl<'a> Engine<'a> {
             };
         }
         scroll
+    }
+
+    /// What widescreen's extra columns show: they are outside every
+    /// window and have no backgrounds or sprites, so the 3D layer, if the
+    /// screen shows it, over the backdrop, or black.
+    fn side(&self, dispcnt: u32) -> Composed {
+        let mask = if dispcnt & 0xE000 == 0 {
+            0x3F
+        } else {
+            self.reg16(0x4A) & 0x3F
+        };
+        if dispcnt & 0x100 == 0 || self.bg_kind(dispcnt, 0) != BgKind::ThreeD || mask & 1 == 0 {
+            return Composed::fixed(0);
+        }
+        let alpha = self.reg16(0x52);
+        let coefficients = Coefficients {
+            eva: (alpha & 0x1F).min(16) as u8,
+            evb: ((alpha >> 8) & 0x1F).min(16) as u8,
+            evy: (self.reg16(0x54) & 0x1F).min(16) as u8,
+        };
+        let backdrop = Layer {
+            color: self.palette(0),
+            layer: LAYER_BACKDROP,
+            semi: false,
+            three_d: false,
+        };
+        let state = BlendState {
+            blend: self.reg16(0x50),
+            effects: mask & 0x20 != 0,
+            coefficients,
+        };
+        Composed {
+            without: state.fixed(None, backdrop, backdrop),
+            with: state.three_d_first(backdrop),
+            coefficients,
+        }
     }
 
     /// Which layers (bits 0-4) and effects (bit 5) each pixel shows.

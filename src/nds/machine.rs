@@ -27,7 +27,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 type GeneratedFunction = unsafe extern "C" fn(*mut Cpu);
@@ -151,6 +151,10 @@ pub struct Options {
     /// Always hand frames to a GPU renderer, at any scale: the window needs
     /// the 3D list to draw frames between game frames.
     pub gpu: bool,
+    /// Draw the top screen 16:9, showing more of the 3D scene to the left
+    /// and right (`Geometry::wide`). Frames then go to a GPU renderer at
+    /// any scale. It can change while the game runs.
+    pub widescreen: Arc<AtomicBool>,
     /// Fast-forward, which can change while the game runs; `None` runs
     /// at normal speed.
     pub speed: Option<Arc<Speed>>,
@@ -556,8 +560,12 @@ impl Machine {
                 && self.options.render_every != 0
                 && self.presented.is_multiple_of(self.options.render_every);
         let rendered_start = Instant::now();
-        let scaled =
-            self.options.scale.load(Ordering::Relaxed) > 1 || self.force_gpu || self.options.gpu;
+        // Lists from now on are culled for the current setting.
+        self.io.geometry.wide = self.options.widescreen.load(Ordering::Relaxed);
+        let scaled = self.options.scale.load(Ordering::Relaxed) > 1
+            || self.force_gpu
+            || self.options.gpu
+            || self.io.geometry.wide;
         let frame =
             (render && self.options.on_frame.is_some() || self.profile.is_some()).then(|| {
                 if scaled {

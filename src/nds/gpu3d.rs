@@ -19,6 +19,24 @@ const WIDTH: usize = 256;
 const HEIGHT: usize = 192;
 type Matrix = [i32; 16];
 
+/// Columns added on each side of the 3D layer and the top screen in
+/// widescreen: 256 + 2 * 43 = 342 by 192 is 16:9.
+pub const WIDE_EXTRA: usize = 43;
+
+/// How far the left and right clip planes reach, as a multiple of w, for a
+/// polygon drawn through `viewport`. In widescreen, a full-width viewport
+/// reaches `WIDE_EXTRA` columns further on each side: the camera sees
+/// more to the left and right, with the same vertical view and everything
+/// the same size on screen, instead of the picture being stretched.
+/// Viewports narrower than the screen keep their edges.
+fn reach(viewport: [u8; 4], wide: bool) -> f64 {
+    if wide && viewport[0] == 0 && viewport[2] == 255 {
+        (128 + WIDE_EXTRA) as f64 / 128.0
+    } else {
+        1.0
+    }
+}
+
 fn identity() -> Matrix {
     let mut m = [0; 16];
     for i in 0..4 {
@@ -228,6 +246,17 @@ pub struct Geometry {
     displayed: Arc<DisplayList>,
     vertices: Vec<Vertex>,
     vertex_count: usize,
+    /// Polygons of the list being built that count against polygon RAM:
+    /// all but those only widescreen shows.
+    stored_polygons: usize,
+    /// Polygons kept only for widescreen's extra columns. They have polygon
+    /// and vertex RAM of their own, so the DS's view never loses polygons
+    /// to them.
+    side_polygons: usize,
+    side_vertices: usize,
+    /// Widescreen: keep and draw what lies beyond the left and right edges
+    /// of the screen (see `reach`).
+    pub wide: bool,
     primitive: Option<u32>,
     strip_index: usize,
     position: [f64; 4],
@@ -294,6 +323,10 @@ impl Default for Geometry {
             displayed: Arc::default(),
             vertices: Vec::new(),
             vertex_count: 0,
+            stored_polygons: 0,
+            side_polygons: 0,
+            side_vertices: 0,
+            wide: false,
             primitive: None,
             strip_index: 0,
             position: [0.0, 0.0, 0.0, 1.0],
@@ -406,7 +439,7 @@ impl Geometry {
     /// Publish the completed list at vblank, retaining it until the next swap.
     pub fn vblank(&mut self) {
         if let Some(flags) = self.swap.take() {
-            self.peak_polygons = self.peak_polygons.max(self.building.len());
+            self.peak_polygons = self.peak_polygons.max(self.stored_polygons);
             self.peak_vertices = self.peak_vertices.max(self.vertex_count);
             self.peak_submitted = self
                 .peak_submitted
@@ -422,6 +455,9 @@ impl Geometry {
             });
             self.occurrences.clear();
             self.vertex_count = 0;
+            self.stored_polygons = 0;
+            self.side_polygons = 0;
+            self.side_vertices = 0;
             if let Some(text) = self.trace.take() {
                 self.traced = Some(text);
             }
@@ -459,7 +495,7 @@ impl Geometry {
 
     pub fn read(&self, address: u32) -> Option<u32> {
         Some(match address & !3 {
-            0x0400_0604 => (self.building.len() as u32) | ((self.vertex_count as u32) << 16),
+            0x0400_0604 => (self.stored_polygons as u32) | ((self.vertex_count as u32) << 16),
             a @ 0x0400_0620..=0x0400_062c => {
                 self.position_result[((a - 0x0400_0620) / 4) as usize] as u32
             }
@@ -677,7 +713,10 @@ impl Geometry {
         let seen = self.occurrences.entry(id).or_default();
         id.occurrence = *seen;
         *seen += 1;
-        let verdict = self.visible(&vertices);
+        let reach = reach(self.viewport, self.wide);
+        let verdict = self.visible(&vertices, reach);
+        // Only widescreen's extra columns show this polygon.
+        let side = reach > 1.0 && verdict.is_ok() && self.visible(&vertices, 1.0).is_err();
         let mut traced = None;
         let stored = if verdict.is_ok() {
             let shared = if self.strip_stored && matches!(primitive, 2 | 3) {
@@ -685,9 +724,15 @@ impl Geometry {
             } else {
                 count
             };
-            let fits = self.building.len() < 2048 && self.vertex_count + shared <= 6144;
+            let (polygons, vertex_count) = if side {
+                (&mut self.side_polygons, &mut self.side_vertices)
+            } else {
+                (&mut self.stored_polygons, &mut self.vertex_count)
+            };
+            let fits = *polygons < 2048 && *vertex_count + shared <= 6144;
             if fits {
-                self.vertex_count += shared;
+                *polygons += 1;
+                *vertex_count += shared;
                 self.building.push(Polygon {
                     vertices: if self.trace.is_some() {
                         vertices.clone()
@@ -701,7 +746,7 @@ impl Geometry {
                     id,
                 });
             }
-            self.overflowed |= !fits;
+            self.overflowed |= !fits && !side;
             if !fits {
                 traced = Some("full");
             }
@@ -711,7 +756,10 @@ impl Geometry {
         };
         if let Some(trace) = &mut self.trace {
             use std::fmt::Write;
-            let status = verdict.err().or(traced).unwrap_or("kept");
+            let status = verdict
+                .err()
+                .or(traced)
+                .unwrap_or(if side { "side" } else { "kept" });
             let _ = write!(
                 trace,
                 "{status:6} attr {:08X} tex {:08X} pal {:04X}:",
@@ -744,10 +792,15 @@ impl Geometry {
     }
 
     /// Whether the hardware would store this polygon: it is not entirely
-    /// outside one clip plane, it does not cross the far plane unless the
-    /// polygon asks for that, and its facing is drawn.
-    fn visible(&self, vertices: &[Vertex]) -> Result<(), &'static str> {
-        if (0..6).any(|plane| vertices.iter().all(|v| plane_distance(v.clip, plane) < 0.0)) {
+    /// outside one clip plane (the left and right ones at `reach`), it does
+    /// not cross the far plane unless the polygon asks for that, and its
+    /// facing is drawn.
+    fn visible(&self, vertices: &[Vertex], reach: f64) -> Result<(), &'static str> {
+        if (0..6).any(|plane| {
+            vertices
+                .iter()
+                .all(|v| plane_distance(v.clip, plane, reach) < 0.0)
+        }) {
             return Err("out");
         }
         if self.attr & (1 << 12) == 0 && vertices.iter().any(|v| v.clip[2] > v.clip[3]) {
@@ -888,8 +941,14 @@ impl Geometry {
                         )
                     })
                     .collect();
-                self.box_result =
-                    !(0..6).any(|plane| corners.iter().all(|c| plane_distance(*c, plane) < 0.0));
+                // Widescreen counts boxes beside the screen as visible, so
+                // objects the game culls with box tests appear there too.
+                let reach = reach(self.viewport, self.wide);
+                self.box_result = !(0..6).any(|plane| {
+                    corners
+                        .iter()
+                        .all(|c| plane_distance(*c, plane, reach) < 0.0)
+                });
                 if let Some(trace) = &mut self.trace {
                     use std::fmt::Write;
                     let _ = writeln!(trace, "box    {values:?} -> {}", self.box_result);
@@ -952,7 +1011,9 @@ impl Geometry {
         // translucent polygon with the same ID; opaque IDs do not.
         let mut ids = vec![64; WIDTH * HEIGHT];
         let state = RenderState::read(io, list.render_w);
-        let triangles = triangles(&list.polygons, list.manual_sort);
+        // The DS's own view: display capture and native-resolution screens
+        // show exactly the screen's 256 columns.
+        let triangles = triangles(&list.polygons, list.manual_sort, false);
         if triangles.is_empty() {
             return pixels;
         }
@@ -997,8 +1058,9 @@ impl Geometry {
 }
 
 /// A list's polygons as triangles in drawing order: clipped, culled, and
-/// sorted as the hardware sorts polygons.
-fn triangles(polygons: &[Polygon], manual_sort: bool) -> Vec<Triangle<'_>> {
+/// sorted as the hardware sorts polygons. `wide` clips them to the
+/// widescreen view (see `reach`) instead of the DS's.
+fn triangles(polygons: &[Polygon], manual_sort: bool, wide: bool) -> Vec<Triangle<'_>> {
     // Opaque polygons precede translucent ones. The hardware sorts
     // opaque polygons, and translucent ones unless SWAP_BUFFERS asked
     // for manual order, by their lowest then highest screen Y. The sort
@@ -1017,7 +1079,7 @@ fn triangles(polygons: &[Polygon], manual_sort: bool) -> Vec<Triangle<'_>> {
             group.sort_by_cached_key(|polygon| sort_key(polygon));
         }
         for polygon in group {
-            let vertices = clip_polygon(&polygon.vertices);
+            let vertices = clip_polygon(&polygon.vertices, reach(polygon.viewport, wide));
             if vertices.len() < 3 {
                 continue;
             }
@@ -1044,12 +1106,14 @@ pub struct Triangles {
 
 impl DisplayList {
     /// The list's triangles in drawing order, in runs that share render
-    /// state, moved `alpha` of the way to `next`.
-    pub fn build(&self, next: Option<&DisplayList>, alpha: f64) -> Triangles {
+    /// state, moved `alpha` of the way to `next`. `wide` keeps what lies in
+    /// widescreen's extra columns, at DS x coordinates from `-WIDE_EXTRA`
+    /// to `256 + WIDE_EXTRA`.
+    pub fn build(&self, next: Option<&DisplayList>, alpha: f64, wide: bool) -> Triangles {
         let (polygons, matched) = self.interpolated(next, alpha);
         let mut vertices = Vec::new();
         let mut batches: Vec<Batch> = Vec::new();
-        for triangle in triangles(&polygons, self.manual_sort) {
+        for triangle in triangles(&polygons, self.manual_sort, wide) {
             let attr = triangle.polygon.attr;
             let batch = Batch {
                 range: 0..0,
@@ -1195,15 +1259,18 @@ fn sort_key(polygon: &Polygon) -> (i32, i32) {
     (low, high)
 }
 
-fn plane_distance(c: [f64; 4], plane: usize) -> f64 {
-    c[3] + if plane & 1 == 0 {
+/// How far inside clip plane `plane` a point is (negative: outside). The
+/// left and right planes (0 and 1) are at `reach` times w.
+fn plane_distance(c: [f64; 4], plane: usize, reach: f64) -> f64 {
+    let w = if plane < 2 { c[3] * reach } else { c[3] };
+    w + if plane & 1 == 0 {
         c[plane / 2]
     } else {
         -c[plane / 2]
     }
 }
 
-fn clip_polygon(input: &[Vertex]) -> Vec<Vertex> {
+fn clip_polygon(input: &[Vertex], reach: f64) -> Vec<Vertex> {
     let mut vertices = input.to_vec();
     for plane in 0..6 {
         let old = std::mem::take(&mut vertices);
@@ -1211,9 +1278,9 @@ fn clip_polygon(input: &[Vertex]) -> Vec<Vertex> {
             break;
         }
         let mut previous = *old.last().unwrap();
-        let mut pd = plane_distance(previous.clip, plane);
+        let mut pd = plane_distance(previous.clip, plane, reach);
         for current in old {
-            let cd = plane_distance(current.clip, plane);
+            let cd = plane_distance(current.clip, plane, reach);
             if (pd < 0.0) != (cd < 0.0) {
                 vertices.push(previous.lerp(current, pd / (pd - cd)));
             }
@@ -1862,22 +1929,22 @@ mod tests {
     #[test]
     fn interpolation_starts_at_the_shown_list_and_moves_toward_the_next() {
         let (shown, next) = (list_at(&[0]), list_at(&[410]));
-        let alone = shown.build(None, 0.0);
-        let start = shown.build(Some(&next), 0.0);
+        let alone = shown.build(None, 0.0, false);
+        let start = shown.build(Some(&next), 0.0, false);
         assert_eq!(
             bytemuck::cast_slice::<_, u8>(&alone.vertices),
             bytemuck::cast_slice::<_, u8>(&start.vertices)
         );
         // -0.5 is x 64; 0.1 further right is 12.8 pixels.
         assert_eq!(left_edges(&alone), [64.0]);
-        let half = shown.build(Some(&next), 0.5);
+        let half = shown.build(Some(&next), 0.5, false);
         assert!(
             (left_edges(&half)[0] - 70.4).abs() < 0.1,
             "{:?}",
             left_edges(&half)
         );
         assert_eq!((half.matched.matched, half.matched.total), (1, 1));
-        let end = left_edges(&shown.build(Some(&next), 1.0))[0];
+        let end = left_edges(&shown.build(Some(&next), 1.0, false))[0];
         assert!((end - 76.8).abs() < 0.1, "{end}");
     }
 
@@ -1888,7 +1955,7 @@ mod tests {
         let shown = list_at(&[0, 819]);
         let next = list_at(&[12288, 1024]);
         assert_eq!(next.polygons.len(), 1);
-        let half = shown.build(Some(&next), 0.5);
+        let half = shown.build(Some(&next), 0.5, false);
         assert_eq!((half.matched.matched, half.matched.total), (1, 2));
         let mut edges = left_edges(&half);
         edges.sort_by(f32::total_cmp);
@@ -1901,7 +1968,7 @@ mod tests {
     #[test]
     fn a_polygon_that_jumps_is_drawn_where_it_is() {
         let (shown, next) = (list_at(&[0]), list_at(&[4096]));
-        let half = shown.build(Some(&next), 0.5);
+        let half = shown.build(Some(&next), 0.5, false);
         assert_eq!(half.matched.matched, 0);
         assert_eq!(left_edges(&half), [64.0]);
     }
@@ -2025,6 +2092,101 @@ mod tests {
                 assert_eq!(one, two, "pixel {x},{y}");
             }
         }
+    }
+
+    /// A red triangle right of the screen, x 1.05 to 1.3, which only
+    /// widescreen's extra columns (up to x 1.336) show: DS columns 262 to
+    /// 294, rows 47 to 143.
+    fn beside_the_screen(g: &mut Geometry) {
+        command(g, 0x29, &[(31 << 16) | 0xc0]);
+        command(g, 0x40, &[0]);
+        command(g, 0x20, &[31]);
+        vertex(g, 4301, -2048, 0);
+        vertex(g, 5325, -2048, 0);
+        vertex(g, 4813, 2048, 0);
+        command(g, 0x41, &[]);
+    }
+
+    #[test]
+    fn widescreen_keeps_what_is_beside_the_screen_outside_polygon_ram() {
+        for wide in [false, true] {
+            let mut g = Geometry {
+                wide,
+                ..Default::default()
+            };
+            triangle(&mut g, 31, 0, 31, 0);
+            beside_the_screen(&mut g);
+            // The game sees only the polygon on the DS's own screen.
+            assert_eq!(g.read(0x0400_0604), Some(1 | (3 << 16)));
+            // A box test beside the screen passes only in widescreen.
+            command(
+                &mut g,
+                0x70,
+                &[
+                    4301 | (u32::from(-2048i16 as u16) << 16),
+                    1024 << 16,
+                    4096 | (1024 << 16),
+                ],
+            );
+            assert_eq!(g.status() & 2 != 0, wide);
+            command(&mut g, 0x50, &[0]);
+            g.vblank();
+            assert_eq!(g.displayed.polygons.len(), if wide { 2 } else { 1 });
+            // A 4:3 build clips it away; a widescreen one draws it beyond
+            // column 256.
+            let right = |triangles: &Triangles| {
+                triangles
+                    .vertices
+                    .iter()
+                    .map(|v| v.position[0])
+                    .fold(f32::NEG_INFINITY, f32::max)
+            };
+            assert_eq!(right(&g.displayed.build(None, 0.0, false)), 192.0);
+            let widened = g.displayed.build(None, 0.0, true);
+            if wide {
+                assert!((right(&widened) - 294.4).abs() < 0.1);
+            } else {
+                assert_eq!(right(&widened), 192.0);
+            }
+        }
+    }
+
+    #[test]
+    fn widescreen_widens_the_top_screen_around_the_same_picture() {
+        let Ok(mut gpu) = crate::runtime::scaled::Headless::new() else {
+            eprintln!("no graphics adapter; skipping");
+            return;
+        };
+        let mut io = io();
+        let mut memory = super::super::memory::Memory::new();
+        io.geometry.wide = true;
+        triangle(&mut io.geometry, 31 << 10, 1024, 31, 0);
+        beside_the_screen(&mut io.geometry);
+        command(&mut io.geometry, 0x50, &[0]);
+        io.advance_to_vblank();
+        io.set16(0x0400_0304, 0x800a); // A on top, 2D + 3D render enabled
+        io.set32(0x0400_0000, 0x10108); // normal display, BG0 3D
+        memory.palette[0..2].copy_from_slice(&(31u16 << 5).to_le_bytes());
+        let software = super::super::gpu2d::render(&io, &memory);
+        let scaled = super::super::gpu2d::render_scaled(&io, &memory);
+        assert_eq!(scaled.extra, WIDE_EXTRA);
+        let (width, height, pixels) = gpu.render(&scaled, 1).unwrap();
+        assert_eq!((width, height), (342, 384));
+        let at = |x: usize, y: usize| &pixels[(y * 342 + x) * 4..][..4];
+        // The middle of the top screen is the DS's picture.
+        for y in 0..192 {
+            for x in 0..256 {
+                let ds = &software.top[(y * 256 + x) * 4..][..4];
+                assert_eq!(at(x + 43, y), ds, "pixel {x},{y}");
+            }
+        }
+        assert_eq!(at(43 + 128, 96), [0, 0, 255, 255]);
+        // Beside it, the top screen shows the 3D layer over the backdrop;
+        // the bottom screen has nothing there.
+        assert_eq!(at(43 + 278, 96), [255, 0, 0, 255]);
+        assert_eq!(at(5, 96), [0, 255, 0, 255]);
+        assert_eq!(at(5, 192 + 96), [0, 0, 0, 255]);
+        assert_eq!(at(341, 192 + 96), [0, 0, 0, 255]);
     }
 
     #[test]

@@ -13,18 +13,21 @@ use std::sync::Arc;
 /// Tab), and the window shows its frames, drawn at `scale` times the DS
 /// resolution (keys 1-8 change it). The window draws as often as `fps`
 /// says, interpolating 3D between game frames. `split_screens` puts each
-/// DS screen in its own window.
+/// DS screen in its own window. `widescreen` draws the top screen 16:9
+/// (H turns it off and on).
 pub fn play_recompiled(
     cache_root: &Path,
     rom: &Path,
     scale: u32,
     fps: pacing::Fps,
     split_screens: bool,
+    widescreen: bool,
 ) -> Result<()> {
     use crate::nds::{input::Input, machine, speed::Speed};
     let scale = Arc::new(std::sync::atomic::AtomicU32::new(
         scale.clamp(1, screen::MAX_SCALE),
     ));
+    let widescreen = Arc::new(std::sync::atomic::AtomicBool::new(widescreen));
     let screens = Arc::new(screen::Screens::default());
     let input = Arc::new(Input::default());
     // GEN5_SPEED=N starts fast-forwarding at N times the game speed.
@@ -53,6 +56,7 @@ pub fn play_recompiled(
         audio: Some(audio.clone()),
         scale: scale.clone(),
         gpu: fps.interpolates(),
+        widescreen: widescreen.clone(),
         speed: Some(speed.clone()),
         real_time: true,
     };
@@ -71,6 +75,7 @@ pub fn play_recompiled(
         fps,
         speed,
         split_screens,
+        widescreen,
     )?;
     // The game threads never return; closing the window ends the program.
     std::process::exit(0);
