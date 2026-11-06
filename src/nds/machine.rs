@@ -146,6 +146,9 @@ pub struct Options {
     /// a `ScaledFrame` for a GPU renderer instead of pixels; GEN5_GPU=1 asks
     /// for that at 1 too. It can change while the game runs.
     pub scale: Arc<AtomicU32>,
+    /// Always hand frames to a GPU renderer, at any scale: the window needs
+    /// the 3D list to draw frames between game frames.
+    pub gpu: bool,
 }
 
 pub struct Machine {
@@ -531,7 +534,8 @@ impl Machine {
             || self.options.render_every != 0
                 && self.presented.is_multiple_of(self.options.render_every);
         let rendered_start = Instant::now();
-        let scaled = self.options.scale.load(Ordering::Relaxed) > 1 || self.force_gpu;
+        let scaled =
+            self.options.scale.load(Ordering::Relaxed) > 1 || self.force_gpu || self.options.gpu;
         let frame =
             (render && self.options.on_frame.is_some() || self.profile.is_some()).then(|| {
                 if scaled {

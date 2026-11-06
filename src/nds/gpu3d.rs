@@ -5,7 +5,9 @@
 //! Commands execute synchronously, except SWAP_BUFFERS which waits for vblank.
 //! This is a functional renderer, not a cycle-accurate FIFO or rasterizer.
 
-use std::collections::VecDeque;
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
@@ -96,6 +98,107 @@ struct Polygon {
     texture: u32,
     palette: u32,
     viewport: [u8; 4],
+    id: PolygonId,
+}
+
+/// What a polygon looks like, and how many polygons that look the same were
+/// submitted before it in its list, culled ones included. The same object
+/// drawn in two consecutive lists gets the same id, so its polygons can be
+/// paired up for interpolation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+struct PolygonId {
+    texture: u32,
+    palette: u32,
+    /// POLYGON_ATTR without the alpha, which games fade.
+    attr: u32,
+    vertices: u8,
+    occurrence: u32,
+}
+
+/// The attr bits that identify a polygon: everything but its alpha.
+const ID_ATTR_MASK: u32 = !(31 << 16);
+
+/// A swapped list: the polygons the rasterizer draws until the next swap.
+#[derive(Clone, Default)]
+pub struct DisplayList {
+    polygons: Vec<Polygon>,
+    render_w: bool,
+    /// SWAP_BUFFERS bit 0: translucent polygons keep submission order
+    /// instead of being sorted by Y.
+    manual_sort: bool,
+    /// The swap that published the list (`Geometry::swaps` after it).
+    pub swap: u64,
+}
+
+/// How many of a list's polygons were paired with the next list.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Matched {
+    pub matched: usize,
+    pub total: usize,
+}
+
+/// A paired polygon that moves further than this many DS pixels between
+/// lists is drawn where it is now: it was a cut or a warp, not motion.
+const SNAP_PIXELS: f64 = 48.0;
+
+impl DisplayList {
+    /// This list's polygons moved `alpha` of the way to where the same
+    /// polygons are in `next`: 0 is this list as it is. Only positions and
+    /// vertex colors move; what is drawn, and how, is this list's, so it
+    /// always matches the textures and registers of the frame shown.
+    fn interpolated(
+        &self,
+        next: Option<&DisplayList>,
+        alpha: f64,
+    ) -> (Cow<'_, [Polygon]>, Matched) {
+        let total = self.polygons.len();
+        let Some(next) = next.filter(|_| alpha > 0.0) else {
+            return (Cow::Borrowed(&self.polygons), Matched { matched: 0, total });
+        };
+        let alpha = alpha.min(1.0);
+        let later: HashMap<PolygonId, &Polygon> = next
+            .polygons
+            .iter()
+            .map(|polygon| (polygon.id, polygon))
+            .collect();
+        let mut matched = 0;
+        let polygons = self
+            .polygons
+            .iter()
+            .map(|polygon| {
+                let mut polygon = polygon.clone();
+                if let Some(after) = later.get(&polygon.id)
+                    && pairs_with(&polygon, after)
+                {
+                    matched += 1;
+                    for (vertex, after) in polygon.vertices.iter_mut().zip(&after.vertices) {
+                        let moved = vertex.lerp(*after, alpha);
+                        vertex.clip = moved.clip;
+                        vertex.color = moved.color;
+                    }
+                }
+                polygon
+            })
+            .collect();
+        (Cow::Owned(polygons), Matched { matched, total })
+    }
+}
+
+/// Whether `before` can be drawn part way to `after`: the same shape, in
+/// front of the camera both times, and not too far apart on screen.
+fn pairs_with(before: &Polygon, after: &Polygon) -> bool {
+    if before.vertices.len() != after.vertices.len() {
+        return false;
+    }
+    before.vertices.iter().zip(&after.vertices).all(|(a, b)| {
+        let (wa, wb) = (a.clip[3], b.clip[3]);
+        if wa <= 0.0 || wb <= 0.0 {
+            return false;
+        }
+        let dx = (a.clip[0] / wa - b.clip[0] / wb) * 128.0;
+        let dy = (a.clip[1] / wa - b.clip[1] / wb) * 96.0;
+        dx.abs() <= SNAP_PIXELS && dy.abs() <= SNAP_PIXELS
+    })
 }
 
 pub struct Geometry {
@@ -115,15 +218,14 @@ pub struct Geometry {
     direct: Option<u8>,
     deferred: VecDeque<(u32, u32)>,
     swap: Option<u32>,
-    render_w: bool,
-    /// SWAP_BUFFERS bit 0: translucent polygons keep submission order
-    /// instead of being sorted by Y.
-    manual_sort: bool,
     /// Whether the previous polygon of the current strip was stored, so the
     /// next one shares its vertices in vertex RAM.
     strip_stored: bool,
     building: Vec<Polygon>,
-    displayed: Vec<Polygon>,
+    /// Polygons submitted to the list being built, by look (`PolygonId`
+    /// without the occurrence), culled ones included.
+    occurrences: HashMap<PolygonId, u32>,
+    displayed: Arc<DisplayList>,
     vertices: Vec<Vertex>,
     vertex_count: usize,
     primitive: Option<u32>,
@@ -186,11 +288,10 @@ impl Default for Geometry {
             direct: None,
             deferred: VecDeque::new(),
             swap: None,
-            render_w: false,
-            manual_sort: false,
             strip_stored: false,
             building: Vec::new(),
-            displayed: Vec::new(),
+            occurrences: HashMap::new(),
+            displayed: Arc::default(),
             vertices: Vec::new(),
             vertex_count: 0,
             primitive: None,
@@ -305,8 +406,6 @@ impl Geometry {
     /// Publish the completed list at vblank, retaining it until the next swap.
     pub fn vblank(&mut self) {
         if let Some(flags) = self.swap.take() {
-            self.render_w = flags & 2 != 0;
-            self.manual_sort = flags & 1 != 0;
             self.peak_polygons = self.peak_polygons.max(self.building.len());
             self.peak_vertices = self.peak_vertices.max(self.vertex_count);
             self.peak_submitted = self
@@ -314,7 +413,14 @@ impl Geometry {
                 .max(self.submitted_polygons - self.list_start);
             self.list_start = self.submitted_polygons;
             self.overflowed_lists += u64::from(std::mem::take(&mut self.overflowed));
-            self.displayed = std::mem::take(&mut self.building);
+            self.swaps += 1;
+            self.displayed = Arc::new(DisplayList {
+                polygons: std::mem::take(&mut self.building),
+                render_w: flags & 2 != 0,
+                manual_sort: flags & 1 != 0,
+                swap: self.swaps,
+            });
+            self.occurrences.clear();
             self.vertex_count = 0;
             if let Some(text) = self.trace.take() {
                 self.traced = Some(text);
@@ -322,7 +428,6 @@ impl Geometry {
             if std::mem::take(&mut self.trace_next) {
                 self.trace = Some(String::new());
             }
-            self.swaps += 1;
             self.drain_commands();
             while self.swap.is_none() {
                 let Some((address, value)) = self.deferred.pop_front() else {
@@ -335,7 +440,7 @@ impl Geometry {
 
     /// Polygons in the list being displayed.
     pub fn displayed_polygons(&self) -> usize {
-        self.displayed.len()
+        self.displayed.polygons.len()
     }
 
     pub fn status(&self) -> u32 {
@@ -562,6 +667,16 @@ impl Geometry {
         // only polygons that survive culling and clipping are stored: a
         // wide scene submits far more than it keeps.
         self.submitted_polygons += 1;
+        let mut id = PolygonId {
+            texture: self.texture,
+            palette: self.palette,
+            attr: self.attr & ID_ATTR_MASK,
+            vertices: count as u8,
+            occurrence: 0,
+        };
+        let seen = self.occurrences.entry(id).or_default();
+        id.occurrence = *seen;
+        *seen += 1;
         let verdict = self.visible(&vertices);
         let mut traced = None;
         let stored = if verdict.is_ok() {
@@ -583,6 +698,7 @@ impl Geometry {
                     texture: self.texture,
                     palette: self.palette,
                     viewport: self.viewport,
+                    id,
                 });
             }
             self.overflowed |= !fits;
@@ -823,8 +939,9 @@ impl Geometry {
             WIDTH * HEIGHT
         ];
         let clear_depth = f64::from(io.get16(0x0400_0354) & 0x7fff) / 32767.0;
+        let list = &*self.displayed;
         let mut depths = vec![
-            if self.render_w {
+            if list.render_w {
                 clear_depth * 4096.0
             } else {
                 clear_depth
@@ -834,8 +951,8 @@ impl Geometry {
         // Only a previously drawn translucent polygon suppresses another
         // translucent polygon with the same ID; opaque IDs do not.
         let mut ids = vec![64; WIDTH * HEIGHT];
-        let state = RenderState::read(io, self.render_w);
-        let triangles = self.triangles();
+        let state = RenderState::read(io, list.render_w);
+        let triangles = triangles(&list.polygons, list.manual_sort);
         if triangles.is_empty() {
             return pixels;
         }
@@ -859,52 +976,80 @@ impl Geometry {
         pixels
     }
 
-    /// The displayed list as triangles in drawing order: clipped, culled,
-    /// and sorted as the hardware sorts polygons.
-    fn triangles(&self) -> Vec<Triangle<'_>> {
-        // Opaque polygons precede translucent ones. The hardware sorts
-        // opaque polygons, and translucent ones unless SWAP_BUFFERS asked
-        // for manual order, by their lowest then highest screen Y. The sort
-        // is stable, like submission order within equal keys.
-        let mut triangles = Vec::new();
-        for translucent in [false, true] {
-            let mut group: Vec<&Polygon> = self
-                .displayed
-                .iter()
-                .filter(|polygon| {
-                    let alpha = (polygon.attr >> 16) & 31;
-                    let format = (polygon.texture >> 26) & 7;
-                    (alpha < 31 || format == 1 || format == 6) == translucent
-                })
-                .collect();
-            if !translucent || !self.manual_sort {
-                group.sort_by_cached_key(|polygon| sort_key(polygon));
-            }
-            for polygon in group {
-                let vertices = clip_polygon(&polygon.vertices);
-                if vertices.len() < 3 {
-                    continue;
-                }
-                for i in 1..vertices.len() - 1 {
-                    triangles.extend(Triangle::new(
-                        [vertices[0], vertices[i], vertices[i + 1]],
-                        polygon,
-                        translucent,
-                    ));
-                }
-            }
-        }
-        triangles
-    }
-
     /// The displayed list for a GPU rasterizer, with the registers and
     /// texture memory it reads.
     pub fn scene(&self, io: &Io, vram: &Vram) -> Scene {
-        let state = RenderState::read(io, self.render_w);
+        let state = RenderState::read(io, self.displayed.render_w);
         let clear = io.get32(0x0400_0350);
+        Scene {
+            list: self.displayed.clone(),
+            clear_color: clear as u16 & 0x7fff,
+            clear_alpha: ((clear >> 16) & 31) as u8,
+            clear_depth: f32::from(io.get16(0x0400_0354) & 0x7fff) / 32767.0,
+            control: state.control,
+            alpha_ref: state.alpha_ref,
+            toon: state.toon,
+            w_buffer: state.w_buffer,
+            texture: vram.snapshot(Region::Texture),
+            texture_palette: vram.snapshot(Region::TexturePalette),
+        }
+    }
+}
+
+/// A list's polygons as triangles in drawing order: clipped, culled, and
+/// sorted as the hardware sorts polygons.
+fn triangles(polygons: &[Polygon], manual_sort: bool) -> Vec<Triangle<'_>> {
+    // Opaque polygons precede translucent ones. The hardware sorts
+    // opaque polygons, and translucent ones unless SWAP_BUFFERS asked
+    // for manual order, by their lowest then highest screen Y. The sort
+    // is stable, like submission order within equal keys.
+    let mut triangles = Vec::new();
+    for translucent in [false, true] {
+        let mut group: Vec<&Polygon> = polygons
+            .iter()
+            .filter(|polygon| {
+                let alpha = (polygon.attr >> 16) & 31;
+                let format = (polygon.texture >> 26) & 7;
+                (alpha < 31 || format == 1 || format == 6) == translucent
+            })
+            .collect();
+        if !translucent || !manual_sort {
+            group.sort_by_cached_key(|polygon| sort_key(polygon));
+        }
+        for polygon in group {
+            let vertices = clip_polygon(&polygon.vertices);
+            if vertices.len() < 3 {
+                continue;
+            }
+            for i in 1..vertices.len() - 1 {
+                triangles.extend(Triangle::new(
+                    [vertices[0], vertices[i], vertices[i + 1]],
+                    polygon,
+                    translucent,
+                ));
+            }
+        }
+    }
+    triangles
+}
+
+/// Triangles for the GPU rasterizer, with the list's polygons part way to
+/// the next list (see `DisplayList::interpolated`).
+#[derive(Clone, Default)]
+pub struct Triangles {
+    pub vertices: Vec<SceneVertex>,
+    pub batches: Vec<Batch>,
+    pub matched: Matched,
+}
+
+impl DisplayList {
+    /// The list's triangles in drawing order, in runs that share render
+    /// state, moved `alpha` of the way to `next`.
+    pub fn build(&self, next: Option<&DisplayList>, alpha: f64) -> Triangles {
+        let (polygons, matched) = self.interpolated(next, alpha);
         let mut vertices = Vec::new();
         let mut batches: Vec<Batch> = Vec::new();
-        for triangle in self.triangles() {
+        for triangle in triangles(&polygons, self.manual_sort) {
             let attr = triangle.polygon.attr;
             let batch = Batch {
                 range: 0..0,
@@ -943,28 +1088,19 @@ impl Geometry {
             }
             batches.last_mut().unwrap().range.end = vertices.len() as u32;
         }
-        Scene {
+        Triangles {
             vertices,
             batches,
-            clear_color: clear as u16 & 0x7fff,
-            clear_alpha: ((clear >> 16) & 31) as u8,
-            clear_depth: f32::from(io.get16(0x0400_0354) & 0x7fff) / 32767.0,
-            control: state.control,
-            alpha_ref: state.alpha_ref,
-            toon: state.toon,
-            w_buffer: state.w_buffer,
-            texture: vram.snapshot(Region::Texture),
-            texture_palette: vram.snapshot(Region::TexturePalette),
+            matched,
         }
     }
 }
 
-/// One frame's 3D list for a GPU rasterizer: triangles in drawing order,
-/// in runs that share render state, and what the rasterizer reads.
+/// One frame's 3D list for a GPU rasterizer, and what the rasterizer reads.
+/// `DisplayList::build` turns the list into triangles.
 #[derive(Clone)]
 pub struct Scene {
-    pub vertices: Vec<SceneVertex>,
-    pub batches: Vec<Batch>,
+    pub list: Arc<DisplayList>,
     pub clear_color: u16,
     pub clear_alpha: u8,
     pub clear_depth: f32,
@@ -1539,17 +1675,17 @@ mod tests {
         let mut g = Geometry::default();
         triangle(&mut g, 31, 0, 31, 0);
         command(&mut g, 0x50, &[0]);
-        assert!(g.displayed.is_empty());
+        assert!(g.displayed.polygons.is_empty());
         triangle(&mut g, 31 << 5, 0, 31, 0);
         command(&mut g, 0x50, &[0]);
         g.vblank();
-        assert_eq!(g.displayed.len(), 1);
-        assert_eq!(g.displayed[0].vertices[0].color, [31.0, 0.0, 0.0]);
+        assert_eq!(g.displayed.polygons.len(), 1);
+        assert_eq!(g.displayed.polygons[0].vertices[0].color, [31.0, 0.0, 0.0]);
         assert_eq!(g.building.len(), 1);
         g.vblank();
-        assert_eq!(g.displayed[0].vertices[0].color, [0.0, 31.0, 0.0]);
+        assert_eq!(g.displayed.polygons[0].vertices[0].color, [0.0, 31.0, 0.0]);
         g.vblank();
-        assert_eq!(g.displayed.len(), 1);
+        assert_eq!(g.displayed.polygons.len(), 1);
         assert_eq!(g.swaps, 2);
     }
 
@@ -1660,7 +1796,7 @@ mod tests {
     #[test]
     fn textured_triangles_interpolate_uv_with_reciprocal_w() {
         let mut g = Geometry::default();
-        g.displayed.push(Polygon {
+        Arc::make_mut(&mut g.displayed).polygons.push(Polygon {
             vertices: vec![
                 Vertex {
                     clip: [-1.0, -1.0, 0.0, 1.0],
@@ -1682,6 +1818,7 @@ mod tests {
             texture: 2 << 26,
             palette: 0,
             viewport: [0, 0, 255, 191],
+            id: PolygonId::default(),
         });
         let mut v = texture_vram();
         v.banks[0] = 0xe4;
@@ -1692,6 +1829,81 @@ mod tests {
         // Affine interpolation would sample texel 4 (red), while correct
         // perspective interpolation samples texel 2 (blue).
         assert_eq!(pixels[130 * WIDTH + 128].color, 31 << 10);
+    }
+
+    /// A swapped list of the test triangle drawn at these x offsets (in
+    /// clip units, 4096 = 1.0), all looking the same.
+    fn list_at(offsets: &[i32]) -> Arc<DisplayList> {
+        let mut g = Geometry::default();
+        command(&mut g, 0x10, &[2]);
+        for &x in offsets {
+            command(&mut g, 0x15, &[]);
+            command(&mut g, 0x1c, &[x as u32, 0, 0]);
+            triangle(&mut g, 31, 0, 31, 0);
+        }
+        command(&mut g, 0x50, &[0]);
+        g.vblank();
+        g.displayed.clone()
+    }
+
+    /// The leftmost screen x of each triangle `build` makes.
+    fn left_edges(triangles: &Triangles) -> Vec<f32> {
+        triangles
+            .vertices
+            .chunks(3)
+            .map(|t| {
+                t.iter()
+                    .map(|v| v.position[0])
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interpolation_starts_at_the_shown_list_and_moves_toward_the_next() {
+        let (shown, next) = (list_at(&[0]), list_at(&[410]));
+        let alone = shown.build(None, 0.0);
+        let start = shown.build(Some(&next), 0.0);
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&alone.vertices),
+            bytemuck::cast_slice::<_, u8>(&start.vertices)
+        );
+        // -0.5 is x 64; 0.1 further right is 12.8 pixels.
+        assert_eq!(left_edges(&alone), [64.0]);
+        let half = shown.build(Some(&next), 0.5);
+        assert!(
+            (left_edges(&half)[0] - 70.4).abs() < 0.1,
+            "{:?}",
+            left_edges(&half)
+        );
+        assert_eq!((half.matched.matched, half.matched.total), (1, 1));
+        let end = left_edges(&shown.build(Some(&next), 1.0))[0];
+        assert!((end - 76.8).abs() < 0.1, "{end}");
+    }
+
+    #[test]
+    fn a_polygon_culled_in_one_list_does_not_shift_the_pairs_after_it() {
+        // The first triangle leaves the view (3.0 is off screen) in the
+        // next list; the second still pairs with itself, not the first.
+        let shown = list_at(&[0, 819]);
+        let next = list_at(&[12288, 1024]);
+        assert_eq!(next.polygons.len(), 1);
+        let half = shown.build(Some(&next), 0.5);
+        assert_eq!((half.matched.matched, half.matched.total), (1, 2));
+        let mut edges = left_edges(&half);
+        edges.sort_by(f32::total_cmp);
+        // The first stays at 64; the second moves from 0.2 to 0.25, so
+        // from 89.6 halfway to 96.
+        assert_eq!(edges[0], 64.0);
+        assert!((edges[1] - 92.8).abs() < 0.1, "{edges:?}");
+    }
+
+    #[test]
+    fn a_polygon_that_jumps_is_drawn_where_it_is() {
+        let (shown, next) = (list_at(&[0]), list_at(&[4096]));
+        let half = shown.build(Some(&next), 0.5);
+        assert_eq!(half.matched.matched, 0);
+        assert_eq!(left_edges(&half), [64.0]);
     }
 
     #[test]
