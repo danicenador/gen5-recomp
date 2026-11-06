@@ -42,6 +42,7 @@ pub fn play_recompiled(
         ),
         Err(_) => Speed::default(),
     });
+    let overlays = Arc::new(machine::LoadedOverlays::default());
     let audio = Arc::new(crate::nds::sound::AudioQueue::default());
     // Kept alive for as long as the window is open.
     let _output = audio::start(audio.clone());
@@ -62,6 +63,7 @@ pub fn play_recompiled(
         widescreen: widescreen.clone(),
         speed: Some(speed.clone()),
         real_time: true,
+        overlays: Some(overlays.clone()),
     };
     let (cache_root, rom): (PathBuf, PathBuf) = (cache_root.into(), rom.into());
     std::thread::spawn(move || {
@@ -80,6 +82,7 @@ pub fn play_recompiled(
         layout,
         auto_scale,
         widescreen,
+        overlays,
     )?;
     // The game threads never return; closing the window ends the program.
     std::process::exit(0);

@@ -154,7 +154,8 @@ Game controllers work too. The face buttons map by position, as on a DS
 on them); the shoulder buttons are L and R, Start and Back/View/Select are
 Start and Select, and the D-pad or left stick move. The right trigger
 turns fast-forward on and off, like Tab, and in single-screen mode the left
-trigger raises and lowers the bottom screen, like Space.
+trigger raises and lowers the bottom screen, like Space, and the right
+stick moves a stylus on it that pressing the stick touches with.
 
 Add `--split-screens` to `run` to put the top and bottom DS screens in
 separate, independently resizable windows. Keyboard controls work in either
@@ -171,7 +172,22 @@ behind it. Pressing again slides it back down; pressing midway turns it
 around. The game keeps running and taking buttons while it is up, and the
 mouse is the stylus on it once it has fully risen. Without a resolution
 multiple, single-screen mode draws at least as many lines as the monitor
-has (6x at 1080 lines) and shrinks to fit. F11 or Alt+Enter switches
+has (6x at 1080 lines) and shrinks to fit.
+
+The bottom screen also follows the scene by itself: it rises in battles and
+menus played on it and drops back on the overworld. The runtime tells
+scenes apart by the ARM9 overlays in RAM (see `scene_wants_panel` in
+`src/runtime/screen.rs`); a scene has to hold for 100 ms first, so map
+transitions pass unnoticed, and scenes it cannot tell (the title screen,
+the opening) leave the bottom screen where it is. L2 or Space still moves
+it at any time; the next scene change takes over again. On a controller,
+the right stick moves a stylus over the raised bottom screen, shown as a
+ring, and pressing the stick in touches with it (the ring fills); it hides
+three seconds after it last moved. `GEN5_OVERLAY_LOG=path` writes, for `run`
+or `boot`, each frame at which the overlays in RAM change, with those
+loaded and unloaded, for finding the overlays of new scenes.
+
+F11 or Alt+Enter switches
 between full screen and a window, in any layout. `--single-screen` and
 `--split-screens` cannot be combined.
 
@@ -288,6 +304,25 @@ in the printed run directory (the helper's default 120-frame interval):
 | 45360 | Player has walked left along the street |
 | 49320 | Player has re-entered the house |
 | 52000 | Interior after returning home |
+
+`./scripts/white2/replay.ps1 -Inputs scripts/white2/battle.inputs -Frames 83000`
+carries on from there to the first battle: through Aspertia to the lookout,
+Tepig from Bianca, the X menu, party, summary and bag, and the battle
+against Hugh, choosing Tackle every turn. The battle's turns and outcome
+vary between runs (the game's random numbers seem to follow the clock), so
+its frames shift by a few hundred; winning or losing both carry the story
+on to the Pokémon Center.
+
+| Frame | Expected visual checkpoint |
+|---|---|
+| 67800 | Bianca holds out the starters' case (bottom screen) |
+| 70600 | X menu |
+| 70900 | Party |
+| 71200 | Tepig's summary |
+| 72200 | Bag ("It's empty.") |
+| 77900 | Battle command menu |
+| 78000 | Move list |
+| 83000 | Walking into the Pokémon Center |
 
 These scripts use the locally imported English White 2 ROM with CRC `95AB5437`
 and its generated game library. They preserve the normal in-game story and map

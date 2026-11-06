@@ -4,7 +4,9 @@
 //! and R, Start and Select (Back, View, Share, -) are themselves, and the
 //! D-pad or the left stick are the D-pad. The right trigger turns
 //! fast-forward on and off, like Tab. In single-screen mode the left trigger
-//! raises and lowers the bottom screen, like Space.
+//! raises and lowers the bottom screen, like Space, and on the raised bottom
+//! screen the right stick moves a stylus that pressing the stick touches
+//! with.
 
 use crate::nds::input;
 use gilrs::{Axis, Button, Gilrs};
@@ -19,7 +21,7 @@ pub struct Gamepads {
 }
 
 /// What the controllers are doing right now.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
 pub struct State {
     /// DS buttons held, using the `input` constants.
     pub buttons: u32,
@@ -28,6 +30,10 @@ pub struct State {
     /// The bottom-screen button (left trigger) was pressed since the last
     /// poll.
     pub toggle_panel: bool,
+    /// The right stick, x right and y up, each -1 to 1.
+    pub right_stick: (f32, f32),
+    /// The right stick is pressed in: the stylus touches.
+    pub touch: bool,
 }
 
 const BUTTONS: [(Button, u32); 12] = [
@@ -81,6 +87,8 @@ impl Gamepads {
         let mut buttons = 0;
         let mut fast_forward = false;
         let mut panel = false;
+        let mut right_stick = (0.0f32, 0.0f32);
+        let mut touch = false;
         for (_, gamepad) in self.gilrs.gamepads() {
             for (button, bit) in BUTTONS {
                 if gamepad.is_pressed(button) {
@@ -90,6 +98,15 @@ impl Gamepads {
             buttons |= stick(gamepad.value(Axis::LeftStickX), gamepad.value(Axis::LeftStickY));
             fast_forward |= gamepad.is_pressed(Button::RightTrigger2);
             panel |= gamepad.is_pressed(Button::LeftTrigger2);
+            touch |= gamepad.is_pressed(Button::RightThumb);
+            // The controller leaning furthest steers.
+            let (x, y) = (
+                gamepad.value(Axis::RightStickX),
+                gamepad.value(Axis::RightStickY),
+            );
+            if x.hypot(y) > right_stick.0.hypot(right_stick.1) {
+                right_stick = (x, y);
+            }
         }
         let toggle_fast_forward = fast_forward && !self.fast_forward_held;
         self.fast_forward_held = fast_forward;
@@ -99,6 +116,8 @@ impl Gamepads {
             buttons,
             toggle_fast_forward,
             toggle_panel,
+            right_stick,
+            touch,
         }
     }
 }

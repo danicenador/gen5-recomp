@@ -162,6 +162,27 @@ pub struct Options {
     /// in real time, as the window does. Headless runs leave it off and
     /// run as fast as they can.
     pub real_time: bool,
+    /// Where to keep the overlays in RAM, brought up to date every frame,
+    /// for telling scenes apart (single-screen mode raises the bottom
+    /// screen in battles and menus).
+    pub overlays: Option<Arc<LoadedOverlays>>,
+}
+
+/// The ARM9 overlays in RAM, sorted by number, as of the last frame.
+#[derive(Default)]
+pub struct LoadedOverlays(std::sync::Mutex<Vec<u16>>);
+
+impl LoadedOverlays {
+    pub fn get(&self) -> Vec<u16> {
+        self.0.lock().map(|ids| ids.clone()).unwrap_or_default()
+    }
+
+    fn set(&self, ids: &[u16]) {
+        if let Ok(mut current) = self.0.lock() {
+            current.clear();
+            current.extend_from_slice(ids);
+        }
+    }
 }
 
 pub struct Machine {
@@ -225,6 +246,13 @@ pub struct Machine {
     /// GEN5_SP_LIMIT: stop when a call is made with the system-mode stack
     /// pointer above this, to catch code that pops more than it pushed.
     sp_limit: Option<u32>,
+    /// The overlays in RAM at the last frame, when anyone asks for them.
+    loaded: Vec<u16>,
+    /// Words that tell each overlay is in RAM (`overlay_signatures`).
+    signatures: Vec<(u16, Vec<(u32, u32)>)>,
+    /// GEN5_OVERLAY_LOG=path: each frame the overlays in RAM change, the
+    /// frame number and the overlays loaded and unloaded.
+    overlay_log: Option<fs::File>,
     _library: Library,
 }
 
@@ -536,6 +564,7 @@ impl Machine {
         if let Some(on_vblank) = &mut self.options.on_vblank {
             on_vblank(self.presented);
         }
+        self.track_overlays();
         // GEN5_SCREEN_RANGE=first-last:every adds denser screenshots in one
         // stretch of a long run.
         static RANGE: std::sync::OnceLock<Option<(u64, u64, u64)>> = std::sync::OnceLock::new();
@@ -1199,6 +1228,57 @@ impl Machine {
             (9, 1, 1) => self.cp15_itcm,
             _ => 0,
         }
+    }
+
+    /// Bring `Options::overlays` and GEN5_OVERLAY_LOG up to date with the
+    /// overlays in RAM.
+    fn track_overlays(&mut self) {
+        if self.options.overlays.is_none() && self.overlay_log.is_none() {
+            return;
+        }
+        if self.signatures.is_empty() {
+            self.signatures = overlay_signatures(&self.overlays);
+        }
+        let signatures = std::mem::take(&mut self.signatures);
+        let loaded: Vec<u16> = signatures
+            .iter()
+            .filter(|(_, words)| {
+                words
+                    .iter()
+                    .all(|&(address, word)| self.read32(address) == word)
+            })
+            .map(|&(id, _)| id)
+            .collect();
+        self.signatures = signatures;
+        if loaded == self.loaded {
+            return;
+        }
+        if let Some(log) = &mut self.overlay_log {
+            let added: Vec<String> = loaded
+                .iter()
+                .filter(|id| !self.loaded.contains(id))
+                .map(|id| format!("+{id}"))
+                .collect();
+            let removed: Vec<String> = self
+                .loaded
+                .iter()
+                .filter(|id| !loaded.contains(id))
+                .map(|id| format!("-{id}"))
+                .collect();
+            let now: Vec<String> = loaded.iter().map(u16::to_string).collect();
+            let _ = writeln!(
+                log,
+                "{}: {} {} => {}",
+                self.presented,
+                added.join(" "),
+                removed.join(" "),
+                now.join(" ")
+            );
+        }
+        if let Some(overlays) = &self.options.overlays {
+            overlays.set(&loaded);
+        }
+        self.loaded = loaded;
     }
 
     // --- Dispatch ----------------------------------------------------
@@ -1895,6 +1975,52 @@ pub(super) extern "C" fn host_undefined(cpu: *mut Cpu, address: u32, raw: u32) {
 // --- Boot ------------------------------------------------------------------------
 
 /// Load the game library and run the game from its ARM9 entry point.
+/// Words spread over each overlay's code, sorted by overlay, that are all
+/// in RAM only while it is: up to `SIGNATURE_WORDS` non-zero words, each
+/// differing from the word other overlays at the same addresses have, so
+/// cleared RAM and an overlay loaded over this one do not pass for it.
+fn overlay_signatures(overlays: &HashMap<u16, (u32, Vec<u8>)>) -> Vec<(u16, Vec<(u32, u32)>)> {
+    const SIGNATURE_WORDS: usize = 8;
+    let word = |image: &[u8], offset: usize| {
+        image
+            .get(offset..offset + 4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+    };
+    let mut signatures: Vec<(u16, Vec<(u32, u32)>)> = overlays
+        .iter()
+        .map(|(&id, (base, image))| {
+            let words = image.len() / 4;
+            let distinct = |index: usize| {
+                let value = word(image, index * 4).unwrap_or(0);
+                let address = base + index as u32 * 4;
+                value != 0
+                    && overlays.iter().all(|(&other, (other_base, other_image))| {
+                        other == id
+                            || address < *other_base
+                            || word(other_image, (address - other_base) as usize) != Some(value)
+                    })
+            };
+            // Evenly spread starting points, each moved on to the next
+            // word that tells this overlay apart.
+            let mut chosen = Vec::new();
+            for slot in 0..SIGNATURE_WORDS {
+                let start = slot * words / SIGNATURE_WORDS;
+                if let Some(index) = (start..words).find(|&index| distinct(index))
+                    && !chosen
+                        .iter()
+                        .any(|&(address, _)| address == base + index as u32 * 4)
+                {
+                    chosen.push((base + index as u32 * 4, word(image, index * 4).unwrap_or(0)));
+                }
+            }
+            (id, chosen)
+        })
+        .filter(|(_, words)| !words.is_empty())
+        .collect();
+    signatures.sort_unstable_by_key(|&(id, _)| id);
+    signatures
+}
+
 pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
     // Keep test playthroughs independent of the player's save and firmware.
     let state_root = std::env::var_os("GEN5_STATE_DIR")
@@ -2023,6 +2149,10 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         sp_limit: std::env::var("GEN5_SP_LIMIT")
             .ok()
             .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok()),
+        loaded: Vec::new(),
+        signatures: Vec::new(),
+        overlay_log: std::env::var_os("GEN5_OVERLAY_LOG")
+            .and_then(|path| fs::File::create(path).ok()),
         _library: library,
     });
 

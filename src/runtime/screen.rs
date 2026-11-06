@@ -14,6 +14,7 @@ use crate::Result;
 use crate::nds::gpu2d::{Frame, HEIGHT, WIDTH};
 use crate::nds::gpu3d::{DisplayList, Matched};
 use crate::nds::input::{self, Input};
+use crate::nds::machine::LoadedOverlays;
 use crate::nds::speed::Speed;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -111,6 +112,7 @@ pub fn run(
     layout: Layout,
     auto_scale: bool,
     widescreen: Arc<AtomicBool>,
+    overlays: Arc<LoadedOverlays>,
 ) -> Result<()> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("could not create event loop: {error}"))?;
@@ -124,6 +126,11 @@ pub fn run(
         layout,
         auto_scale,
         panel: Panel::new(Instant::now()),
+        overlays,
+        scene: SceneWatch::new(Instant::now()),
+        x_menu: false,
+        buttons: 0,
+        pad_cursor: PadCursor::new(Instant::now()),
         alt: false,
         widescreen,
         redraw_pending: false,
@@ -164,6 +171,16 @@ struct App {
     auto_scale: bool,
     /// The bottom screen raised over the top one, in single-screen mode.
     panel: Panel,
+    /// The overlays in RAM, which tell scenes apart.
+    overlays: Arc<LoadedOverlays>,
+    /// Raises and lowers the bottom screen as scenes change.
+    scene: SceneWatch,
+    /// Whether the X menu is open, as far as the keys tell (`x_menu_after`).
+    x_menu: bool,
+    /// The DS buttons held, keyboard and controllers together.
+    buttons: u32,
+    /// The stylus the right stick moves on the raised bottom screen.
+    pad_cursor: PadCursor,
     /// Alt held, for Alt+Enter.
     alt: bool,
     /// Whether the game draws the top screen 16:9; frames say how wide
@@ -360,6 +377,182 @@ impl Panel {
     }
 }
 
+/// The overworld's overlay: in RAM whenever the player walks around (but
+/// not for the moment a map transition takes).
+const FIELD_OVERLAY: u16 = 36;
+
+/// Overlays in RAM throughout a battle, from the moment the screen goes black
+/// after the trainer's challenge until it goes black again at the end.
+const BATTLE_OVERLAYS: &[u16] = &[167, 168, 169, 170];
+
+/// Overlays of menus played on the bottom screen: the bag (142), the party
+/// (165), a Pokémon's summary (207, over the party) and the starter choice
+/// (316). The naming keyboard's 280 is left out: it stays in RAM through the
+/// whole opening, whose speeches are on the top screen.
+const MENU_OVERLAYS: &[u16] = &[142, 165, 207, 316];
+
+/// What the game is doing, going by the overlays in RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scene {
+    /// Walking around, or talking, on the overworld. The X menu opens over
+    /// it without overlays of its own.
+    Field,
+    Battle,
+    Menu,
+    /// The title screen, the opening, a map transition: no telling.
+    Unknown,
+}
+
+fn scene(overlays: &[u16]) -> Scene {
+    let any = |ids: &[u16]| overlays.iter().any(|id| ids.contains(id));
+    if any(BATTLE_OVERLAYS) {
+        Scene::Battle
+    } else if any(MENU_OVERLAYS) {
+        Scene::Menu
+    } else if overlays.contains(&FIELD_OVERLAY) {
+        Scene::Field
+    } else {
+        Scene::Unknown
+    }
+}
+
+/// Whether the bottom screen should be up in `scene`: in battles and menus,
+/// and on the field while the X menu is open.
+fn scene_wants_panel(scene: Scene, x_menu: bool) -> Option<bool> {
+    match scene {
+        Scene::Battle | Scene::Menu => Some(true),
+        Scene::Field => Some(x_menu),
+        Scene::Unknown => None,
+    }
+}
+
+/// Whether the X menu is open after the DS buttons in `pressed` were just
+/// pressed in `scene`. The overlays cannot tell, so this follows the keys:
+/// on the field X opens the menu and closes it, and B closes it. Menus
+/// opened from it come back to it, and a battle closes it.
+fn x_menu_after(open: bool, scene: Scene, pressed: u32) -> bool {
+    match scene {
+        Scene::Field if pressed & input::X != 0 => !open,
+        Scene::Field if pressed & input::B != 0 => false,
+        Scene::Battle => false,
+        _ => open,
+    }
+}
+
+/// How long a scene must hold before the bottom screen follows it.
+const SCENE_SETTLE: Duration = Duration::from_millis(100);
+
+/// Raises and lowers the bottom screen when the scene changes. It acts only
+/// on changes, so L2 can still move the screen in any scene until the next
+/// change; scenes it cannot tell apart leave the screen alone.
+#[derive(Clone, Copy, Debug)]
+struct SceneWatch {
+    /// What it last told the bottom screen to do.
+    decided: Option<bool>,
+    /// What the scene wants now, and since when.
+    wanted: Option<bool>,
+    since: Instant,
+}
+
+impl SceneWatch {
+    fn new(now: Instant) -> Self {
+        Self {
+            decided: None,
+            wanted: None,
+            since: now,
+        }
+    }
+
+    /// Given what the scene wants at `now`, whether the bottom screen should
+    /// now go up (`Some(true)`) or down (`Some(false)`).
+    fn update(&mut self, now: Instant, wanted: Option<bool>) -> Option<bool> {
+        if wanted != self.wanted {
+            self.wanted = wanted;
+            self.since = now;
+            return None;
+        }
+        let wanted = wanted?;
+        if self.decided == Some(wanted) || now.duration_since(self.since) < SCENE_SETTLE {
+            return None;
+        }
+        self.decided = Some(wanted);
+        Some(wanted)
+    }
+}
+
+/// How fast the stick moves the stylus at full lean, in DS pixels a second.
+const CURSOR_SPEED: f32 = 320.0;
+/// How far the stick must lean before the stylus moves.
+const CURSOR_DEAD_ZONE: f32 = 0.2;
+/// How long the stylus stays in sight after the stick last moved it.
+const CURSOR_LINGER: Duration = Duration::from_secs(3);
+
+/// The stylus the right stick moves over the raised bottom screen and
+/// touches with when pressed in.
+#[derive(Clone, Copy, Debug)]
+struct PadCursor {
+    /// Where it points, in DS pixels.
+    x: f32,
+    y: f32,
+    touching: bool,
+    /// Until when it is in sight.
+    shown_until: Option<Instant>,
+    /// When it was last moved on.
+    at: Instant,
+}
+
+impl PadCursor {
+    fn new(now: Instant) -> Self {
+        Self {
+            x: WIDTH as f32 / 2.0,
+            y: HEIGHT as f32 / 2.0,
+            touching: false,
+            shown_until: None,
+            at: now,
+        }
+    }
+
+    /// Move it on to `now` with the stick (x right, y up) and stick button
+    /// as they are. It only moves and touches on a raised bottom screen
+    /// (`active`).
+    fn update(&mut self, now: Instant, stick: (f32, f32), pressed: bool, active: bool) {
+        let elapsed = now
+            .saturating_duration_since(self.at)
+            .as_secs_f32()
+            .min(0.1);
+        self.at = now;
+        if !active {
+            self.touching = false;
+            self.shown_until = None;
+            return;
+        }
+        let lean = stick.0.hypot(stick.1);
+        if lean > CURSOR_DEAD_ZONE {
+            // Gentle near the middle for aiming, fast at the edge.
+            let speed = CURSOR_SPEED
+                * ((lean - CURSOR_DEAD_ZONE) / (1.0 - CURSOR_DEAD_ZONE))
+                    .min(1.0)
+                    .powi(2);
+            let step = speed * elapsed / lean;
+            self.x = (self.x + stick.0 * step).clamp(0.0, WIDTH as f32 - 0.01);
+            self.y = (self.y - stick.1 * step).clamp(0.0, HEIGHT as f32 - 0.01);
+        }
+        self.touching = pressed;
+        if lean > CURSOR_DEAD_ZONE || pressed {
+            self.shown_until = Some(now + CURSOR_LINGER);
+        }
+    }
+
+    fn shown(&self, now: Instant) -> bool {
+        self.shown_until.is_some_and(|until| now < until)
+    }
+
+    /// The DS touch-screen point it is on.
+    fn point(&self) -> (u8, u8) {
+        (self.x as u8, self.y as u8)
+    }
+}
+
 /// Where the bottom screen is drawn in a single-screen window of this size,
 /// `raised` (0 to 1) of the way up: x, y, width, height. Its lower edge
 /// starts at the top screen's and it rises its own height; whatever lies
@@ -435,8 +628,14 @@ impl App {
         }
     }
 
-    fn update_buttons(&self) {
-        self.input.set_buttons(self.pressed | self.pad_pressed);
+    fn update_buttons(&mut self) {
+        let buttons = self.pressed | self.pad_pressed;
+        let pressed = buttons & !self.buttons;
+        self.buttons = buttons;
+        if pressed != 0 && self.layout == Layout::Single {
+            self.x_menu = x_menu_after(self.x_menu, scene(&self.overlays.get()), pressed);
+        }
+        self.input.set_buttons(buttons);
     }
 
     fn poll_gamepads(&mut self) {
@@ -450,6 +649,21 @@ impl App {
         }
         if state.toggle_panel {
             self.toggle_panel();
+        }
+        if self.layout == Layout::Single {
+            let touching = self.pad_cursor.touching;
+            let point = self.pad_cursor.point();
+            self.pad_cursor.update(
+                Instant::now(),
+                state.right_stick,
+                state.touch,
+                self.panel.touchable(),
+            );
+            if self.pad_cursor.touching != touching
+                || self.pad_cursor.touching && self.pad_cursor.point() != point
+            {
+                self.update_touch();
+            }
         }
         if state.buttons != self.pad_pressed {
             self.pad_pressed = state.buttons;
@@ -488,6 +702,10 @@ impl App {
                 view => view.touch(size, cursor, extra),
             }
         });
+        // The mouse first, then the stick's stylus.
+        let point = point.or_else(|| {
+            (self.pad_cursor.touching && self.panel.touchable()).then(|| self.pad_cursor.point())
+        });
         self.input.set_touch(point);
     }
 
@@ -513,8 +731,21 @@ impl App {
         if self.gpu.is_none() {
             return Ok(());
         }
+        let now = Instant::now();
         let touchable = self.panel.touchable();
-        self.panel.advance(Instant::now());
+        let scene = scene(&self.overlays.get());
+        if scene == Scene::Battle {
+            self.x_menu = false;
+        }
+        if self.layout == Layout::Single
+            && let Some(up) = self
+                .scene
+                .update(now, scene_wants_panel(scene, self.x_menu))
+            && up != self.panel.up
+        {
+            self.panel.toggle(now);
+        }
+        self.panel.advance(now);
         if self.panel.touchable() != touchable {
             self.update_touch();
         }
@@ -522,6 +753,10 @@ impl App {
             return Ok(());
         };
         gpu.panel = self.panel.raised();
+        gpu.cursor = (self.panel.touchable() && self.pad_cursor.shown(now)).then_some((
+            (self.pad_cursor.x, self.pad_cursor.y),
+            self.pad_cursor.touching,
+        ));
         self.history.extend(self.screens.take());
         let scale = self.scale.load(Ordering::Relaxed);
         if !self.history.is_empty() {
@@ -937,6 +1172,11 @@ struct Gpu {
     blend_pipeline: wgpu::RenderPipeline,
     /// How far the bottom screen is raised in single-screen windows, 0 to 1.
     panel: f32,
+    /// The stick's stylus on the raised bottom screen, in DS pixels, and
+    /// whether it touches.
+    cursor: Option<((f32, f32), bool)>,
+    /// Draw the stylus, up and touching.
+    cursor_pipelines: [wgpu::RenderPipeline; 2],
     /// The single-screen window's blur, for its current size.
     blur: Option<Blur>,
 }
@@ -953,6 +1193,49 @@ struct SurfaceTarget {
     panel_rect: wgpu::Buffer,
     panel_bind_group: wgpu::BindGroup,
 }
+
+/// The stick's stylus: a light ring with a dark edge, filled while it
+/// touches, drawn over a square viewport.
+const CURSOR_SHADER: &str = r"
+struct Out {
+    @builtin(position) position: vec4<f32>,
+    @location(0) at: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> Out {
+    let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
+    var out: Out;
+    out.position = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    // -1 to 1 across the viewport.
+    out.at = uv * 2.0 - 1.0;
+    return out;
+}
+
+fn cursor(at: vec2<f32>, inner: f32) -> vec4<f32> {
+    let r = length(at);
+    let edge = fwidth(r);
+    let alpha = 0.9 * (1.0 - smoothstep(1.0 - edge, 1.0, r)) * smoothstep(inner - edge, inner, r);
+    // Dark at the rim and round the hole, light between.
+    let rim = smoothstep(0.75 - edge, 0.75, r);
+    let hole = select(0.0, 1.0 - smoothstep(inner + 0.2 - edge, inner + 0.2, r), inner > 0.0);
+    let shade = mix(vec3<f32>(0.08), vec3<f32>(1.0), 1.0 - max(rim, hole));
+    return vec4<f32>(shade * alpha, alpha);
+}
+
+@fragment
+fn fs_up(in: Out) -> @location(0) vec4<f32> {
+    return cursor(in.at, 0.45);
+}
+
+@fragment
+fn fs_touching(in: Out) -> @location(0) vec4<f32> {
+    return cursor(in.at, 0.0);
+}
+";
+
+/// The stick's stylus's radius, in DS pixels.
+const CURSOR_RADIUS: f32 = 5.0;
 
 /// Lines the top screen is blurred at, at most; the blur then halves this
 /// `BLUR_LEVELS` times and doubles back up, so it looks the same at any
@@ -1465,6 +1748,42 @@ impl Gpu {
             alpha: wgpu::BlendComponent::REPLACE,
         }));
         let pipeline = pipeline(None);
+        let cursor_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("stylus shader"),
+            source: wgpu::ShaderSource::Wgsl(CURSOR_SHADER.into()),
+        });
+        let cursor_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("stylus pipeline layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let cursor_pipelines = ["fs_up", "fs_touching"].map(|entry| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("stylus pipeline"),
+                layout: Some(&cursor_layout),
+                vertex: wgpu::VertexState {
+                    module: &cursor_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &cursor_shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
         Ok(Self {
             targets,
             device,
@@ -1484,6 +1803,8 @@ impl Gpu {
             smooth,
             blend_pipeline,
             panel: 0.0,
+            cursor: None,
+            cursor_pipelines,
             blur: None,
         })
     }
@@ -1733,6 +2054,16 @@ impl Gpu {
         pass.set_bind_group(0, self.screens_group(panel_height / HEIGHT as f32), &[]);
         pass.set_bind_group(1, &target.panel_bind_group, &[]);
         pass.draw(0..3, 0..1);
+        // The stick's stylus, its middle on the point it touches.
+        if let Some(((cursor_x, cursor_y), touching)) = self.cursor {
+            let scale = panel_height / HEIGHT as f32;
+            let radius = (CURSOR_RADIUS * scale).round();
+            let x = panel_x + (cursor_x.floor() + 0.5) * scale;
+            let y = panel_y + (cursor_y.floor() + 0.5) * scale;
+            pass.set_viewport(x - radius, y - radius, 2.0 * radius, 2.0 * radius, 0.0, 1.0);
+            pass.set_pipeline(&self.cursor_pipelines[usize::from(touching)]);
+            pass.draw(0..3, 0..1);
+        }
     }
 }
 
@@ -1857,6 +2188,123 @@ mod tests {
     }
 
     #[test]
+    fn scenes_raise_and_lower_the_bottom_screen_once_settled() {
+        let start = Instant::now();
+        let mut watch = SceneWatch::new(start);
+        let field = Some(false);
+        // Nothing until a scene has held for a moment.
+        assert_eq!(watch.update(start, field), None);
+        assert_eq!(watch.update(start + SCENE_SETTLE / 2, field), None);
+        assert_eq!(watch.update(start + SCENE_SETTLE, field), Some(false));
+        // Then only on a change.
+        assert_eq!(watch.update(start + 2 * SCENE_SETTLE, field), None);
+        // A map transition (no telling) is too short to count, and coming
+        // back to the field changes nothing.
+        let t = start + 3 * SCENE_SETTLE;
+        assert_eq!(watch.update(t, None), None);
+        assert_eq!(watch.update(t + SCENE_SETTLE * 3, None), None);
+        assert_eq!(watch.update(t + SCENE_SETTLE * 4, field), None);
+        assert_eq!(watch.update(t + SCENE_SETTLE * 6, field), None);
+        // A battle raises it, and the field after it lowers it.
+        let t = t + SCENE_SETTLE * 10;
+        assert_eq!(watch.update(t, Some(true)), None);
+        assert_eq!(watch.update(t + SCENE_SETTLE, Some(true)), Some(true));
+        assert_eq!(watch.update(t + SCENE_SETTLE * 2, field), None);
+        assert_eq!(watch.update(t + SCENE_SETTLE * 3, field), Some(false));
+    }
+
+    #[test]
+    fn overlays_tell_the_field_from_scenes_on_the_bottom_screen() {
+        // Sets seen replaying White 2 to the first battle.
+        let field = [12, 27, 33, 35, 36, 66, 74, 80, 112, 279, 281];
+        assert_eq!(scene(&field), Scene::Field);
+        // The trainer's challenge still runs on the field.
+        let challenge = [12, 27, 33, 35, 36, 66, 74, 80, 112, 146, 147, 279];
+        assert_eq!(scene(&challenge), Scene::Field);
+        let battle = [12, 27, 33, 146, 147, 167, 168, 169, 170, 338];
+        assert_eq!(scene(&battle), Scene::Battle);
+        let party = [12, 27, 33, 35, 66, 74, 80, 112, 165, 279, 281];
+        assert_eq!(scene(&party), Scene::Menu);
+        let summary = [12, 27, 33, 35, 66, 74, 80, 112, 165, 207, 279, 281];
+        assert_eq!(scene(&summary), Scene::Menu);
+        let bag = [12, 27, 33, 35, 66, 74, 80, 112, 142, 279, 281];
+        assert_eq!(scene(&bag), Scene::Menu);
+        let starter = [12, 27, 33, 35, 66, 74, 80, 112, 279, 281, 316];
+        assert_eq!(scene(&starter), Scene::Menu);
+        // A map transition, the opening (with the naming keyboard's 280).
+        assert_eq!(
+            scene(&[12, 27, 29, 139, 162, 280, 281, 294, 331]),
+            Scene::Unknown
+        );
+        assert_eq!(
+            scene(&[12, 27, 33, 35, 66, 74, 80, 112, 279, 281]),
+            Scene::Unknown
+        );
+        assert_eq!(scene(&[12, 27, 29, 331]), Scene::Unknown);
+
+        assert_eq!(scene_wants_panel(Scene::Field, false), Some(false));
+        assert_eq!(scene_wants_panel(Scene::Field, true), Some(true));
+        assert_eq!(scene_wants_panel(Scene::Battle, false), Some(true));
+        assert_eq!(scene_wants_panel(Scene::Menu, false), Some(true));
+        assert_eq!(scene_wants_panel(Scene::Unknown, true), None);
+    }
+
+    #[test]
+    fn keys_tell_when_the_x_menu_is_open() {
+        // X on the field opens it; menus from it come back to it.
+        let open = x_menu_after(false, Scene::Field, input::X);
+        assert!(open);
+        assert!(x_menu_after(open, Scene::Field, input::A | input::DOWN));
+        assert!(x_menu_after(open, Scene::Menu, input::B));
+        // B or X closes it; B alone on the field (running) keeps it shut.
+        assert!(!x_menu_after(open, Scene::Field, input::B));
+        assert!(!x_menu_after(open, Scene::Field, input::X));
+        assert!(!x_menu_after(false, Scene::Field, input::B));
+        // Keys elsewhere do not open it, and a battle closes it.
+        assert!(!x_menu_after(false, Scene::Menu, input::X));
+        assert!(!x_menu_after(false, Scene::Unknown, input::X));
+        assert!(!x_menu_after(true, Scene::Battle, input::A));
+    }
+
+    #[test]
+    fn stick_moves_and_touches_with_the_stylus() {
+        let start = Instant::now();
+        let mut cursor = PadCursor::new(start);
+        assert_eq!(cursor.point(), (128, 96));
+        assert!(!cursor.shown(start));
+        // Inside the dead zone it stays put and out of sight.
+        cursor.update(start + Duration::from_millis(50), (0.1, 0.1), false, true);
+        assert_eq!(cursor.point(), (128, 96));
+        assert!(!cursor.shown(start + Duration::from_millis(50)));
+        // Full lean right moves it at full speed; up is up on screen.
+        let t = start + Duration::from_millis(100);
+        cursor.update(t, (1.0, 0.0), false, true);
+        assert_eq!(cursor.point(), (144, 96));
+        assert!(cursor.shown(t));
+        cursor.update(t + Duration::from_millis(50), (0.0, 1.0), false, true);
+        assert_eq!(cursor.point(), (144, 80));
+        // It stops at the edges.
+        for step in 1..=20 {
+            cursor.update(
+                t + Duration::from_millis(50 + 100 * step),
+                (-1.0, -1.0),
+                false,
+                true,
+            );
+        }
+        assert_eq!(cursor.point(), (0, 191));
+        // Pressing the stick touches, and keeps it in sight.
+        let t = t + Duration::from_secs(10);
+        cursor.update(t, (0.0, 0.0), true, true);
+        assert!(cursor.touching && cursor.shown(t));
+        assert!(!cursor.shown(t + CURSOR_LINGER));
+        // With the bottom screen down it lets go and hides.
+        cursor.update(t, (1.0, 0.0), true, false);
+        assert!(!cursor.touching && !cursor.shown(t));
+        assert_eq!(cursor.point(), (0, 191));
+    }
+
+    #[test]
     fn bottom_screen_rises_from_under_the_top_one() {
         // 1080p: the top screen fills the width; the bottom one is 720
         // lines high (give or take rounding of the 16:9 top screen),
@@ -1956,6 +2404,17 @@ mod tests {
                         );
                     }
                 }
+                // The stick's stylus touching the middle of the bottom
+                // screen (4/3 window pixels per DS pixel): light in the
+                // middle, dark at the rim, the bottom screen around it.
+                gpu.cursor = Some(((128.0, 96.0), true));
+                let pixels = render_window(&mut gpu, size);
+                let at = |x: usize, y: usize| pixels[y * 512 + x];
+                let middle = at(257, 256);
+                assert!(middle[0] > 200 && middle[2] > 200, "{middle:?}");
+                let rim = at(263, 256);
+                assert!(rim[0] < 100 && rim[1] < 200, "{rim:?}");
+                assert_eq!(at(257 + 12, 256), [0, 255, 0, 255]);
                 event_loop.exit();
             }
 
