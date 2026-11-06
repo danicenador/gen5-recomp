@@ -19,8 +19,9 @@
 
 use crate::Result;
 use crate::nds::gpu2d::{HEIGHT, ScaledFrame, WIDTH};
-use crate::nds::gpu3d::{Batch, Scene, SceneVertex};
+use crate::nds::gpu3d::{Batch, DisplayList, Matched, Scene, SceneVertex};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const ALPHA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
@@ -47,6 +48,22 @@ struct ScreenUniform {
     scroll: u32,
     _pad: u32,
     brightness: [u32; 4],
+}
+
+/// What `set_frame` keeps for drawing the frame, perhaps several times.
+#[derive(Default)]
+struct Shown {
+    brightness: [u16; 2],
+    layer: Option<ShownLayer>,
+}
+
+struct ShownLayer {
+    screen: usize,
+    scroll: u32,
+    list: Arc<DisplayList>,
+    clear_color: u16,
+    clear_alpha: u8,
+    clear_depth: f32,
 }
 
 /// Everything sized by the scale.
@@ -78,6 +95,7 @@ pub struct Renderer {
     composed: wgpu::Texture,
     composed_view: wgpu::TextureView,
     targets: Option<Targets>,
+    shown: Shown,
 }
 
 fn texture(
@@ -275,6 +293,7 @@ impl Renderer {
             composed,
             composed_view,
             targets: None,
+            shown: Shown::default(),
         }
     }
 
@@ -481,7 +500,10 @@ impl Renderer {
             .write_buffer(&self.texture_memory, 0, &scene.texture);
         self.queue
             .write_buffer(&self.palette_memory, 0, &scene.texture_palette);
-        let bytes: &[u8] = bytemuck::cast_slice(&scene.vertices);
+    }
+
+    fn upload_vertices(&mut self, vertices: &[SceneVertex]) {
+        let bytes: &[u8] = bytemuck::cast_slice(vertices);
         let size = (bytes.len() as u64).max(64);
         if self
             .vertices
@@ -506,7 +528,13 @@ impl Renderer {
     /// Draw `frame` at `scale` times the DS resolution into the output
     /// texture: both screens stacked, `256 * scale` by `384 * scale`.
     pub fn render(&mut self, frame: &ScaledFrame, scale: u32) -> &wgpu::Texture {
-        let scale = scale.max(1);
+        self.set_frame(frame);
+        self.draw(scale, None, 0.0).0
+    }
+
+    /// Take a new frame from the game: its 2D layers, registers and texture
+    /// memory. `draw` then draws it, as often as the window presents.
+    pub fn set_frame(&mut self, frame: &ScaledFrame) {
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.composed,
@@ -526,24 +554,50 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
-        let three_d = frame.three_d.as_ref();
+        if let Some(layer) = &frame.three_d {
+            self.upload_scene(&layer.scene);
+        }
+        self.shown = Shown {
+            brightness: frame.brightness,
+            layer: frame.three_d.as_ref().map(|layer| ShownLayer {
+                screen: layer.screen,
+                scroll: layer.scroll,
+                list: layer.scene.list.clone(),
+                clear_color: layer.scene.clear_color,
+                clear_alpha: layer.scene.clear_alpha,
+                clear_depth: layer.scene.clear_depth,
+            }),
+        };
+    }
+
+    /// Draw the frame `set_frame` took, its 3D list moved `alpha` of the
+    /// way to `next` (see `DisplayList::build`).
+    pub fn draw(
+        &mut self,
+        scale: u32,
+        next: Option<&DisplayList>,
+        alpha: f64,
+    ) -> (&wgpu::Texture, Matched) {
+        let scale = scale.max(1);
+        let layer = self.shown.layer.as_ref();
         let uniform = ScreenUniform {
             scale,
-            screen: three_d.map_or(-1, |layer| layer.screen as i32),
-            scroll: three_d.map_or(0, |layer| layer.scroll),
+            screen: layer.map_or(-1, |layer| layer.screen as i32),
+            scroll: layer.map_or(0, |layer| layer.scroll),
             _pad: 0,
             brightness: [
-                u32::from(frame.brightness[0]),
-                u32::from(frame.brightness[1]),
+                u32::from(self.shown.brightness[0]),
+                u32::from(self.shown.brightness[1]),
                 0,
                 0,
             ],
         };
         self.queue
             .write_buffer(&self.screen_uniform, 0, bytemuck::bytes_of(&uniform));
-        if let Some(layer) = three_d {
-            self.upload_scene(&layer.scene);
-            for batch in &layer.scene.batches {
+        let triangles = layer.map(|layer| layer.list.build(next, alpha));
+        if let Some(triangles) = &triangles {
+            self.upload_vertices(&triangles.vertices);
+            for batch in &triangles.batches {
                 self.pipeline(batch);
             }
         }
@@ -554,8 +608,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("scaled frame"),
             });
-        if let Some(layer) = three_d {
-            let scene = &layer.scene;
+        if let (Some(scene), Some(triangles)) = (self.shown.layer.as_ref(), &triangles) {
             let clear = if scene.clear_alpha != 0 {
                 let c = scene.clear_color;
                 let channel = |shift: u16| f64::from((c >> shift) & 31) / 31.0;
@@ -612,11 +665,11 @@ impl Renderer {
                 multiview_mask: None,
             });
             if let Some((vertices, _)) = &self.vertices
-                && !scene.vertices.is_empty()
+                && !triangles.vertices.is_empty()
             {
                 pass.set_vertex_buffer(0, vertices.slice(..));
                 pass.set_bind_group(0, &self.scene_bind_group, &[]);
-                for batch in &scene.batches {
+                for batch in &triangles.batches {
                     let key = (batch.translucent, batch.depth_equal, batch.depth_write);
                     pass.set_pipeline(&self.pipelines[&key]);
                     pass.set_stencil_reference(u32::from(batch.id));
@@ -646,7 +699,10 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
-        &targets.output
+        let matched = triangles
+            .map(|triangles| triangles.matched)
+            .unwrap_or_default();
+        (&targets.output, matched)
     }
 }
 

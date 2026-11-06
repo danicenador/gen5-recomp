@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod pacing;
 pub mod scaled;
 pub mod screen;
 
@@ -9,8 +10,9 @@ use std::time::Instant;
 
 /// Play the recompiled game in a window: the game runs on its own threads,
 /// paced to the DS frame rate, and the window shows its frames, drawn at
-/// `scale` times the DS resolution (keys 1-8 change it).
-pub fn play_recompiled(cache_root: &Path, rom: &Path, scale: u32) -> Result<()> {
+/// `scale` times the DS resolution (keys 1-8 change it). The window draws
+/// as often as `fps` says, interpolating 3D between game frames.
+pub fn play_recompiled(cache_root: &Path, rom: &Path, scale: u32, fps: pacing::Fps) -> Result<()> {
     use crate::nds::{input::Input, machine};
     let scale = Arc::new(std::sync::atomic::AtomicU32::new(
         scale.clamp(1, screen::MAX_SCALE),
@@ -23,15 +25,18 @@ pub fn play_recompiled(cache_root: &Path, rom: &Path, scale: u32) -> Result<()> 
     let mut next = Instant::now();
     let sink = screens.clone();
     let on_frame: machine::FrameSink = Box::new(move |number, frame| {
-        sink.publish(number, frame);
         // Hold the game to 59.83 frames per second; after a long stall
         // (loading, a slow host), carry on from now instead of catching up.
+        // The frame is due on screen when the game moves on: the window
+        // times interpolation by these steady deadlines.
         next += screen::FRAME_TIME;
         let now = Instant::now();
+        if now > next && now - next > screen::FRAME_TIME * 6 {
+            next = now;
+        }
+        sink.publish(number, frame, next);
         if next > now {
             std::thread::sleep(next - now);
-        } else if now - next > screen::FRAME_TIME * 6 {
-            next = now;
         }
     });
     let options = machine::Options {
@@ -43,6 +48,7 @@ pub fn play_recompiled(cache_root: &Path, rom: &Path, scale: u32) -> Result<()> 
         input: Some(input.clone()),
         audio: Some(audio.clone()),
         scale: scale.clone(),
+        gpu: fps.interpolates(),
     };
     let (cache_root, rom): (PathBuf, PathBuf) = (cache_root.into(), rom.into());
     std::thread::spawn(move || {
@@ -51,7 +57,7 @@ pub fn play_recompiled(cache_root: &Path, rom: &Path, scale: u32) -> Result<()> 
             std::process::exit(1);
         }
     });
-    screen::run("Gen5 Recomp", screens, input, scale)?;
+    screen::run("Gen5 Recomp", screens, input, scale, fps)?;
     // The game threads never return; closing the window ends the program.
     std::process::exit(0);
 }

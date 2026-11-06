@@ -1,11 +1,15 @@
 //! A window for the recompiled game: both DS screens stacked, scaled to
 //! fit with square pixels, keyboard buttons and the mouse as the stylus.
 //! The game runs on its own threads and hands frames over through
-//! `Screens`; this side only presents the latest one and records input.
+//! `Screens`; this side presents them and records input. With an `Fps`
+//! other than `Ds` it draws between game frames too (see `pacing`).
 
+use super::pacing::{self, Fps, FrameTime, Pick};
 use crate::Result;
 use crate::nds::gpu2d::{Frame, HEIGHT, WIDTH};
+use crate::nds::gpu3d::{DisplayList, Matched};
 use crate::nds::input::{self, Input};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,27 +20,66 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-/// The latest frame from the game, with a count so unchanged frames are not
-/// uploaded again.
+/// Frames from the game that the window has not taken yet.
 #[derive(Default)]
 pub struct Screens {
-    latest: Mutex<Option<(u64, Frame)>>,
+    queue: Mutex<VecDeque<Published>>,
 }
 
+/// A game frame, numbered, and when it is due on screen.
+pub struct Published {
+    pub number: u64,
+    pub frame: Frame,
+    pub deadline: Instant,
+}
+
+impl Published {
+    fn list(&self) -> Option<&Arc<DisplayList>> {
+        let layer = self.frame.scaled.as_ref()?.three_d.as_ref()?;
+        Some(&layer.scene.list)
+    }
+
+    fn time(&self) -> FrameTime {
+        FrameTime {
+            deadline: self.deadline,
+            list: self.list().map(|list| list.swap),
+        }
+    }
+}
+
+/// Frames held for a window that stopped taking them (minimized, say).
+const QUEUE: usize = 8;
+
 impl Screens {
-    pub fn publish(&self, number: u64, frame: &Frame) {
-        if let Ok(mut latest) = self.latest.lock() {
-            *latest = Some((number, frame.clone()));
+    /// Hand over frame `number`, due on screen at `deadline`.
+    pub fn publish(&self, number: u64, frame: &Frame, deadline: Instant) {
+        let published = Published {
+            number,
+            frame: frame.clone(),
+            deadline,
+        };
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.push_back(published);
+            while queue.len() > QUEUE {
+                queue.pop_front();
+            }
         }
     }
 
-    fn take_newer(&self, than: u64) -> Option<(u64, Frame)> {
-        let latest = self.latest.lock().ok()?;
-        latest
-            .as_ref()
-            .filter(|(number, _)| *number != than)
-            .cloned()
+    fn take(&self) -> Vec<Published> {
+        self.queue
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
     }
+}
+
+/// Presents and interpolation over the last half second, for the title.
+struct Rate {
+    since: Instant,
+    presents: u32,
+    matched: Matched,
+    shown: String,
 }
 
 /// DS display refresh: 33.51 MHz / (355 * 263 * 6) ≈ 59.83 Hz.
@@ -46,12 +89,14 @@ pub const FRAME_TIME: Duration = Duration::from_nanos(16_715_646);
 pub const MAX_SCALE: u32 = 8;
 
 /// Run the window until it is closed; then the process exits. `scale` is
-/// the resolution multiple frames are drawn at; keys 1-8 change it.
+/// the resolution multiple frames are drawn at; keys 1-8 change it. `fps`
+/// is how often it draws; F turns interpolation off and on to compare.
 pub fn run(
     title: &str,
     screens: Arc<Screens>,
     input: Arc<Input>,
     scale: Arc<AtomicU32>,
+    fps: Fps,
 ) -> Result<()> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("could not create event loop: {error}"))?;
@@ -67,6 +112,17 @@ pub fn run(
         pen_down: false,
         shown: u64::MAX,
         error: None,
+        fps,
+        interpolate: fps.interpolates(),
+        history: VecDeque::new(),
+        drawn: None,
+        next_present: Instant::now(),
+        rate: Rate {
+            since: Instant::now(),
+            presents: 0,
+            matched: Matched::default(),
+            shown: String::new(),
+        },
     };
     event_loop
         .run_app(&mut app)
@@ -86,6 +142,16 @@ struct App {
     pen_down: bool,
     shown: u64,
     error: Option<String>,
+    fps: Fps,
+    /// Drawing between game frames; F toggles it.
+    interpolate: bool,
+    /// Frames taken from the game, oldest first, that may still be shown.
+    history: VecDeque<Published>,
+    /// What the scaled renderer last drew: frame, next list, alpha, scale.
+    drawn: Option<(u64, Option<u64>, u64, u32)>,
+    /// With a frame-rate cap, when to present next.
+    next_present: Instant,
+    rate: Rate,
 }
 
 fn button(key: KeyCode) -> Option<u32> {
@@ -131,18 +197,75 @@ impl App {
         let (Some(window), Some(gpu)) = (&self.window, &mut self.gpu) else {
             return Ok(());
         };
-        if let Some((number, frame)) = self.screens.take_newer(self.shown) {
-            self.shown = number;
-            gpu.upload(&frame, self.scale.load(Ordering::Relaxed));
+        self.history.extend(self.screens.take());
+        let scale = self.scale.load(Ordering::Relaxed);
+        if !self.history.is_empty() {
+            let pick = if self.interpolate {
+                let times: Vec<FrameTime> = self.history.iter().map(Published::time).collect();
+                pacing::pick(&times, Instant::now())
+            } else {
+                Pick::newest(self.history.len())
+            };
+            let shown = &self.history[pick.shown];
+            if shown.number != self.shown {
+                self.shown = shown.number;
+                gpu.upload(&shown.frame);
+            }
+            if gpu.showing_scaled {
+                let next = pick.next.and_then(|next| self.history[next].list());
+                let key = (
+                    self.shown,
+                    next.map(|list| list.swap),
+                    pick.alpha.to_bits(),
+                    scale,
+                );
+                if self.drawn != Some(key) {
+                    self.drawn = Some(key);
+                    let matched = gpu.render_scaled(scale, next.map(|list| &**list), pick.alpha);
+                    if pick.next.is_some() {
+                        self.rate.matched.matched += matched.matched;
+                        self.rate.matched.total += matched.total;
+                    }
+                }
+            }
+            self.history.drain(..pick.keep_from);
         }
-        gpu.draw(window.inner_size())
+        gpu.draw(window.inner_size())?;
+        self.rate.presents += 1;
+        let elapsed = self.rate.since.elapsed();
+        if self.fps.interpolates() && elapsed >= Duration::from_millis(500) {
+            let presents = f64::from(self.rate.presents) / elapsed.as_secs_f64();
+            let matched = self.rate.matched;
+            let shown = if !self.interpolate {
+                format!("{presents:.0} fps, interpolation off (F)")
+            } else if let Some(percent) = (matched.matched * 100).checked_div(matched.total) {
+                format!("{presents:.0} fps, {percent}% of 3D interpolated")
+            } else {
+                format!("{presents:.0} fps")
+            };
+            self.rate = Rate {
+                since: Instant::now(),
+                presents: 0,
+                matched: Matched::default(),
+                shown,
+            };
+            let title = self.window_title();
+            if let Some(window) = &self.window {
+                window.set_title(&title);
+            }
+        }
+        Ok(())
     }
 
     fn window_title(&self) -> String {
-        match self.scale.load(Ordering::Relaxed) {
+        let mut title = match self.scale.load(Ordering::Relaxed) {
             1 => self.title.clone(),
             scale => format!("{} - {scale}x resolution", self.title),
+        };
+        if !self.rate.shown.is_empty() {
+            title = format!("{title} - {}", self.rate.shown);
         }
+        title
     }
 }
 
@@ -193,7 +316,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        match pollster::block_on(Gpu::new(window.clone())) {
+        match pollster::block_on(Gpu::new(window.clone(), self.fps)) {
             Ok(gpu) => self.gpu = Some(gpu),
             Err(error) => {
                 self.error = Some(error);
@@ -211,6 +334,14 @@ impl ApplicationHandler for App {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if code == KeyCode::Escape {
                         event_loop.exit();
+                        return;
+                    }
+                    if code == KeyCode::KeyF
+                        && event.state == ElementState::Pressed
+                        && !event.repeat
+                        && self.fps.interpolates()
+                    {
+                        self.interpolate = !self.interpolate;
                         return;
                     }
                     if let Some(scale) = scale_key(code)
@@ -264,10 +395,30 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        let Some(window) = &self.window else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_TIME / 2));
+            return;
+        };
+        match self.fps {
+            Fps::Ds => {
+                window.request_redraw();
+                event_loop
+                    .set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_TIME / 2));
+            }
+            // Vsync, or nothing, paces the presents.
+            Fps::Display | Fps::Uncapped => {
+                window.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+            Fps::Cap(rate) => {
+                let now = Instant::now();
+                if now >= self.next_present {
+                    self.next_present = pacing::next_present(self.next_present, now, rate);
+                    window.request_redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_present));
+            }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_TIME / 2));
     }
 }
 
@@ -338,7 +489,7 @@ fn screens_bind_group(
 }
 
 impl Gpu {
-    async fn new(window: Arc<Window>) -> Result<Self> {
+    async fn new(window: Arc<Window>, fps: Fps) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
             .create_surface(window.clone())
@@ -358,9 +509,14 @@ impl Gpu {
             .await
             .map_err(|error| format!("could not create graphics device: {error}"))?;
         let size = window.inner_size();
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| "graphics surface has no supported configuration".to_owned())?;
+        config.present_mode = if fps.vsync() {
+            wgpu::PresentMode::Fifo
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
         surface.configure(&device, &config);
 
         // Frames are sRGB colours; match the surface so they pass through.
@@ -482,29 +638,13 @@ impl Gpu {
         })
     }
 
-    fn upload(&mut self, frame: &Frame, scale: u32) {
+    /// Take the frame to show. A scaled frame is drawn by `render_scaled`.
+    fn upload(&mut self, frame: &Frame) {
         self.showing_scaled = frame.scaled.is_some();
         if let Some(scaled) = &frame.scaled {
-            let scale = scale.clamp(1, MAX_SCALE);
-            let renderer = self
-                .scaled
-                .get_or_insert_with(|| super::scaled::Renderer::new(&self.device, &self.queue));
-            let output = renderer.render(scaled, scale);
-            if self
-                .scaled_view
-                .as_ref()
-                .is_none_or(|(shown, _, _)| *shown != scale)
-            {
-                // Sample through the same format as software frames, so
-                // sRGB surfaces pass colors through unchanged.
-                let view = output.create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(self.texture.format()),
-                    ..Default::default()
-                });
-                let nearest = screens_bind_group(&self.device, &self.layout, &view, &self.nearest);
-                let linear = screens_bind_group(&self.device, &self.layout, &view, &self.linear);
-                self.scaled_view = Some((scale, nearest, linear));
-            }
+            self.scaled
+                .get_or_insert_with(|| super::scaled::Renderer::new(&self.device, &self.queue))
+                .set_frame(scaled);
             return;
         }
         let mut pixels = frame.top.clone();
@@ -528,6 +668,32 @@ impl Gpu {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    /// Draw the uploaded scaled frame, its 3D moved `alpha` of the way to
+    /// `next`.
+    fn render_scaled(&mut self, scale: u32, next: Option<&DisplayList>, alpha: f64) -> Matched {
+        let scale = scale.clamp(1, MAX_SCALE);
+        let Some(renderer) = self.scaled.as_mut() else {
+            return Matched::default();
+        };
+        let (output, matched) = renderer.draw(scale, next, alpha);
+        if self
+            .scaled_view
+            .as_ref()
+            .is_none_or(|(shown, _, _)| *shown != scale)
+        {
+            // Sample through the same format as software frames, so
+            // sRGB surfaces pass colors through unchanged.
+            let view = output.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.texture.format()),
+                ..Default::default()
+            });
+            let nearest = screens_bind_group(&self.device, &self.layout, &view, &self.nearest);
+            let linear = screens_bind_group(&self.device, &self.layout, &view, &self.linear);
+            self.scaled_view = Some((scale, nearest, linear));
+        }
+        matched
     }
 
     fn draw(&mut self, size: winit::dpi::PhysicalSize<u32>) -> Result<()> {

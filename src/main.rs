@@ -208,18 +208,34 @@ fn run() -> Result<(), String> {
                     input: Some(input),
                     audio: queue,
                     scale: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(scale)),
+                    gpu: false,
                 },
             )
         }
-        Some("run") if args.len() == 3 || args.len() == 4 => {
-            let scale = match args.get(3) {
-                Some(value) => value
-                    .trim_start_matches("--scale=")
-                    .parse()
-                    .map_err(|_| format!("invalid scale: {value}"))?,
+        Some("run") if (3..=5).contains(&args.len()) => {
+            let mut scale = None;
+            let mut fps = None;
+            for value in &args[3..] {
+                if let Some(mode) = value.strip_prefix("--fps=") {
+                    fps = Some(gen5::runtime::pacing::Fps::parse(mode)?);
+                } else {
+                    scale = Some(
+                        value
+                            .trim_start_matches("--scale=")
+                            .parse()
+                            .map_err(|_| format!("invalid scale: {value}"))?,
+                    );
+                }
+            }
+            let scale = match scale {
+                Some(scale) => scale,
                 None => scale_from_env()?,
             };
-            gen5::runtime::play_recompiled(Path::new(&args[1]), Path::new(&args[2]), scale)
+            let fps = match fps {
+                Some(fps) => fps,
+                None => fps_from_env()?,
+            };
+            gen5::runtime::play_recompiled(Path::new(&args[1]), Path::new(&args[2]), scale, fps)
         }
         Some("disasm") if args.len() == 4 => {
             let module = args[2].parse::<ModuleId>()?;
@@ -306,6 +322,15 @@ fn scale_from_env() -> Result<u32, String> {
             _ => Err(format!("invalid GEN5_SCALE {value}: expected 1 to 8")),
         },
         Err(_) => Ok(1),
+    }
+}
+
+/// GEN5_FPS: how often the game window draws (default `ds`, once per game
+/// frame); `display`, `uncapped` or a number interpolate 3D in between.
+fn fps_from_env() -> Result<gen5::runtime::pacing::Fps, String> {
+    match std::env::var("GEN5_FPS") {
+        Ok(value) => gen5::runtime::pacing::Fps::parse(&value),
+        Err(_) => Ok(gen5::runtime::pacing::Fps::Ds),
     }
 }
 
@@ -754,7 +779,7 @@ fn print_usage() {
          gen5 codegen <import-cache-directory>\n\
          gen5 build <import-cache-directory> [c-compiler]\n\
          gen5 boot <import-cache-directory> <rom.nds> [frames [png-directory]]\n\
-         gen5 run <import-cache-directory> <rom.nds> [scale]\n\
+         gen5 run <import-cache-directory> <rom.nds> [scale] [--fps=ds|display|uncapped|N]\n\
          gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 help"
