@@ -147,7 +147,13 @@ cargo run --release -- boot ".gen5-cache/pokemon-white-2/95AB5437" "roms/Pokemon
 `run` opens a window with both screens stacked, paced to the DS's 59.83
 frames per second. Keys: arrows for the D-pad, X = A, Z = B, S = X, A = Y,
 Q = L, W = R, Enter = Start, Right Shift or Backspace = Select, and the
-mouse on the lower screen as the stylus. Escape quits.
+mouse on the lower screen as the stylus. Escape asks whether to quit.
+
+Game controllers work too. The face buttons map by position, as on a DS
+(bottom = B, right = A, top = X, left = Y, whatever the controller prints
+on them); the shoulder buttons are L and R, Start and Back/View/Select are
+Start and Select, and the D-pad or left stick move. The right trigger
+turns fast-forward on and off, like Tab.
 
 Add `--split-screens` to `run` to put the top and bottom DS screens in
 separate, independently resizable windows. Keyboard controls work in either
