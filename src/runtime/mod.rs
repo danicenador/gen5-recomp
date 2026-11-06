@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod gamepad;
 pub mod pacing;
 pub mod scaled;
 pub mod screen;

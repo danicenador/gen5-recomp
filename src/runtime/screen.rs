@@ -1,9 +1,11 @@
 //! Windows for the recompiled game: DS screens stacked or separate, scaled to
-//! fit with square pixels, keyboard buttons and the mouse as the stylus.
+//! fit with square pixels, keyboard or controller buttons and the mouse as
+//! the stylus. Esc asks before quitting.
 //! The game runs on its own threads and hands frames over through
 //! `Screens`; this side presents them and records input. With an `Fps`
 //! other than `Ds` it draws between game frames too (see `pacing`).
 
+use super::gamepad::Gamepads;
 use super::pacing::{self, Fps, FrameTime, Pick};
 use crate::Result;
 use crate::nds::gpu2d::{Frame, HEIGHT, WIDTH};
@@ -115,6 +117,8 @@ pub fn run(
         redraw_pending: false,
         gpu: None,
         pressed: 0,
+        gamepads: Gamepads::new(),
+        pad_pressed: 0,
         cursor: None,
         pen_down: false,
         shown: u64::MAX,
@@ -147,7 +151,11 @@ struct App {
     split_screens: bool,
     redraw_pending: bool,
     gpu: Option<Gpu>,
+    /// Buttons held on the keyboard.
     pressed: u32,
+    gamepads: Option<Gamepads>,
+    /// Buttons held on controllers.
+    pad_pressed: u32,
     cursor: Option<PhysicalPosition<f64>>,
     pen_down: bool,
     shown: u64,
@@ -244,6 +252,41 @@ impl App {
         } else {
             View::Bottom
         }
+    }
+
+    fn update_buttons(&self) {
+        self.input.set_buttons(self.pressed | self.pad_pressed);
+    }
+
+    fn poll_gamepads(&mut self) {
+        let Some(gamepads) = &mut self.gamepads else {
+            return;
+        };
+        let state = gamepads.poll();
+        if state.toggle_fast_forward {
+            self.speed.toggle();
+            self.update_title();
+        }
+        if state.buttons != self.pad_pressed {
+            self.pad_pressed = state.buttons;
+            self.update_buttons();
+        }
+    }
+
+    /// Ask whether to quit, over window `index`. Keys and buttons held when
+    /// the dialog opened are let go, as their releases go to the dialog.
+    fn confirm_quit(&mut self, index: usize) -> bool {
+        self.pressed = 0;
+        self.update_buttons();
+        let mut dialog = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title(&self.title)
+            .set_description("Quit the game? Progress since your last save will be lost.")
+            .set_buttons(rfd::MessageButtons::YesNo);
+        if let Some(window) = self.windows.get(index) {
+            dialog = dialog.set_parent(&**window);
+        }
+        dialog.show() == rfd::MessageDialogResult::Yes
     }
 
     fn update_touch(&self) {
@@ -453,7 +496,12 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if code == KeyCode::Escape {
-                        event_loop.exit();
+                        if event.state == ElementState::Pressed
+                            && !event.repeat
+                            && self.confirm_quit(index)
+                        {
+                            event_loop.exit();
+                        }
                         return;
                     }
                     if code == KeyCode::KeyF
@@ -483,7 +531,7 @@ impl ApplicationHandler for App {
                             ElementState::Pressed => self.pressed |= bit,
                             ElementState::Released => self.pressed &= !bit,
                         }
-                        self.input.set_buttons(self.pressed);
+                        self.update_buttons();
                     }
                 }
             }
@@ -505,7 +553,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(false) => {
                 self.pressed = 0;
-                self.input.set_buttons(0);
+                self.update_buttons();
                 if touch_window {
                     self.pen_down = false;
                     self.cursor = None;
@@ -532,6 +580,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_gamepads();
         if self.windows.is_empty() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_TIME / 2));
             return;
