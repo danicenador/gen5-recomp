@@ -155,7 +155,7 @@ fn run() -> Result<(), String> {
             let scale = scale_from_env()?;
             let mut gpu: Option<gen5::runtime::scaled::Headless> = None;
             let on_frame = directory.map(|directory| {
-                Box::new(move |number: u64, frame: &gen5::nds::gpu2d::Frame| {
+                Box::new(move |number: u64, frame: &gen5::nds::gpu2d::Frame, _| {
                     let (width, height, pixels) = match &frame.scaled {
                         Some(scaled) => {
                             if gpu.is_none() {
@@ -209,6 +209,20 @@ fn run() -> Result<(), String> {
                     audio: queue,
                     scale: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(scale)),
                     gpu: false,
+                    // GEN5_SPEED=N: fast-forward at N times the game speed,
+                    // with sound and key repeat counted at normal speed.
+                    speed: std::env::var("GEN5_SPEED")
+                        .ok()
+                        .map(|value| {
+                            value
+                                .parse::<u32>()
+                                .map_err(|_| "invalid GEN5_SPEED".to_owned())
+                        })
+                        .transpose()?
+                        .map(|factor| {
+                            std::sync::Arc::new(gen5::nds::speed::Speed::fixed(factor))
+                        }),
+                    real_time: false,
                 },
             )
         }

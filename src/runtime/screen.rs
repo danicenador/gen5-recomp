@@ -9,15 +9,16 @@ use crate::Result;
 use crate::nds::gpu2d::{Frame, HEIGHT, WIDTH};
 use crate::nds::gpu3d::{DisplayList, Matched};
 use crate::nds::input::{self, Input};
+use crate::nds::speed::Speed;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 /// Frames from the game that the window has not taken yet.
@@ -82,8 +83,7 @@ struct Rate {
     shown: String,
 }
 
-/// DS display refresh: 33.51 MHz / (355 * 263 * 6) ≈ 59.83 Hz.
-pub const FRAME_TIME: Duration = Duration::from_nanos(16_715_646);
+pub use crate::nds::speed::FRAME_TIME;
 
 /// The largest resolution multiple keys 1-8 select.
 pub const MAX_SCALE: u32 = 8;
@@ -91,12 +91,14 @@ pub const MAX_SCALE: u32 = 8;
 /// Run the window until it is closed; then the process exits. `scale` is
 /// the resolution multiple frames are drawn at; keys 1-8 change it. `fps`
 /// is how often it draws; F turns interpolation off and on to compare.
+/// Tab turns fast-forward on and off, and + and - change its speed.
 pub fn run(
     title: &str,
     screens: Arc<Screens>,
     input: Arc<Input>,
     scale: Arc<AtomicU32>,
     fps: Fps,
+    speed: Arc<Speed>,
 ) -> Result<()> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("could not create event loop: {error}"))?;
@@ -105,6 +107,7 @@ pub fn run(
         screens,
         input,
         scale,
+        speed,
         window: None,
         gpu: None,
         pressed: 0,
@@ -135,6 +138,7 @@ struct App {
     screens: Arc<Screens>,
     input: Arc<Input>,
     scale: Arc<AtomicU32>,
+    speed: Arc<Speed>,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     pressed: u32,
@@ -262,10 +266,50 @@ impl App {
             1 => self.title.clone(),
             scale => format!("{} - {scale}x resolution", self.title),
         };
+        if self.speed.is_fast() {
+            title = format!("{title} - fast-forward {}x", self.speed.factor());
+        }
         if !self.rate.shown.is_empty() {
             title = format!("{title} - {}", self.rate.shown);
         }
         title
+    }
+
+    fn update_title(&self) {
+        if let Some(window) = &self.window {
+            window.set_title(&self.window_title());
+        }
+    }
+
+    /// Tab turns fast-forward on and off; + and - change its speed (and
+    /// turn it on, so the change can be seen). + and - are matched by what
+    /// the key types, so they work on any keyboard layout (and = counts as
+    /// +, being + unshifted on US keyboards), as do the numpad keys.
+    fn speed_key(&self, event: &KeyEvent) -> bool {
+        let typed = match &event.logical_key {
+            Key::Character(text) => text.as_str(),
+            _ => "",
+        };
+        let code = match event.physical_key {
+            PhysicalKey::Code(code) => Some(code),
+            PhysicalKey::Unidentified(_) => None,
+        };
+        let factor = self.speed.factor();
+        let new_factor = if code == Some(KeyCode::Tab) {
+            self.speed.toggle();
+            return true;
+        } else if code == Some(KeyCode::NumpadAdd) || typed == "+" || typed == "=" {
+            factor + 1
+        } else if code == Some(KeyCode::NumpadSubtract) || typed == "-" {
+            factor.saturating_sub(1)
+        } else {
+            return false;
+        };
+        self.speed.set_factor(new_factor);
+        if !self.speed.is_fast() {
+            self.speed.toggle();
+        }
+        true
     }
 }
 
@@ -348,9 +392,14 @@ impl ApplicationHandler for App {
                         && event.state == ElementState::Pressed
                     {
                         self.scale.store(scale, Ordering::Relaxed);
-                        if let Some(window) = &self.window {
-                            window.set_title(&self.window_title());
-                        }
+                        self.update_title();
+                        return;
+                    }
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && self.speed_key(&event)
+                    {
+                        self.update_title();
                         return;
                     }
                     if let Some(bit) = button(code) {

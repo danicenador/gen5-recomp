@@ -161,6 +161,28 @@ pixels back.
 `boot` saves screenshots at the same multiple with `GEN5_SCALE`, and
 `GEN5_GPU=1` uses the GPU renderer at 1, to compare it with the software one.
 
+Tab turns fast-forward on and off, and + and - (on any keyboard layout, or
+the numpad) set its speed (2x to 8x, 3x to begin with; the window title
+shows it). Fast-forward runs the game that
+many frames per DS frame of real time, so walking, battles, text and
+animations speed up, but it leaves two things at normal speed:
+
+- Music and sound effects. The sound driver and mixer follow real time
+  instead of the game's frames, so music keeps its tempo and pitch. Fades
+  and jingles the game times itself still happen sooner.
+- Menu key repeat. Holding a direction in a menu moves the cursor as often
+  as at normal speed, and a short tap does not repeat. The runtime finds the
+  repeat countdown of GameFreak's key update by its instructions (the same
+  in Black 2 and White 2) and holds it back on the extra frames. Keys the
+  game reads directly while held, such as walking, are not slowed down.
+
+The window shows about one frame per DS frame of real time while
+fast-forwarding, which leaves more time for the game; how fast it can go
+depends on the host. `GEN5_SPEED=N` starts `run` fast-forwarding at N, and
+makes `boot` run as if fast-forwarding at N, counting each frame as 1/N of a
+DS frame of real time for sound and key repeat, so `GEN5_AUDIO_WAV` records
+the music at normal speed.
+
 `boot` runs headless for a number of frames and ends with a report; with a
 directory it also saves both screens as PNG every 30 frames.
 `GEN5_INPUT=first-last:button+button,...` holds buttons over frame ranges,
@@ -190,7 +212,8 @@ with one entry per line and `#` comments, replacing `GEN5_INPUT`. It reloads
 every 60 frames so a diagnostic run can be extended in progress. The replay
 helper copies its input file into the run directory before starting.
 `GEN5_BOOT_FPS` optionally caps headless frame progression for live diagnosis
-(0, the default, runs as fast as possible); windowed play keeps its normal pacing.
+(0, the default, runs as fast as possible); windowed play keeps its normal pacing
+(see fast-forward above for `GEN5_SPEED`).
 `GEN5_AUDIO_WAV=path` records a headless run's sound as a 16-bit stereo WAV
 at the DS mixer rate. `GEN5_SOUND=off` acknowledges sound commands without
 playing them, to rule sound in or out when diagnosing. `GEN5_STOP_FILE=path`
@@ -273,6 +296,8 @@ The `nds` module provides:
   Main-memory display FIFO capture is not implemented.
 - `input`: buttons and touch screen, shared between the window and the
   machine.
+- `speed`: frame pacing and fast-forward, with real time kept for the sound
+  driver and for the key update's repeat countdown.
 - `io`: I/O registers. Display timing advances when the game polls it, and
   there are vblank and interrupt flags, immediate DMA, the divider and
   square-root units, and IPCSYNC and the IPC FIFO.

@@ -11,6 +11,8 @@
 //! - `input`: buttons and touch screen shared with the window.
 //! - `interpreter`: fallback for code without a recompiled function.
 //! - `sound`: the ARM7's sound driver and the sound hardware's mixer.
+//! - `speed`: frame pacing and fast-forward that keeps music and menu key
+//!   repeat at normal speed.
 //! - `threads`: NitroSDK threads as host threads taking turns.
 //! - `machine`: boot, call dispatch across overlays, interrupts, BIOS calls.
 
@@ -26,5 +28,6 @@ pub mod io;
 pub mod machine;
 pub mod memory;
 pub mod sound;
+pub mod speed;
 mod threads;
 pub mod vram;
