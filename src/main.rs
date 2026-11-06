@@ -230,14 +230,25 @@ fn run() -> Result<(), String> {
                 },
             )
         }
-        Some("run") if (3..=7).contains(&args.len()) => {
+        Some("run") if (3..=8).contains(&args.len()) => {
+            use gen5::runtime::screen::Layout;
             let mut scale = None;
             let mut fps = None;
-            let mut split_screens = false;
+            let mut layout = Layout::Stacked;
             let mut widescreen = widescreen_from_env();
             for value in &args[3..] {
-                if value == "--split-screens" {
-                    split_screens = true;
+                let chosen = match value.as_str() {
+                    "--split-screens" => Some(Layout::Split),
+                    "--single-screen" => Some(Layout::Single),
+                    _ => None,
+                };
+                if let Some(chosen) = chosen {
+                    if layout != Layout::Stacked && layout != chosen {
+                        return Err(
+                            "--split-screens and --single-screen cannot be combined".to_owned()
+                        );
+                    }
+                    layout = chosen;
                 } else if value == "--widescreen" {
                     widescreen = true;
                 } else if let Some(mode) = value.strip_prefix("--fps=") {
@@ -251,9 +262,14 @@ fn run() -> Result<(), String> {
                     );
                 }
             }
+            // Single-screen mode picks a resolution for the monitor unless
+            // told one.
             let scale = match scale {
-                Some(scale) => scale,
-                None => scale_from_env()?,
+                Some(scale) => Some(scale),
+                None if layout == Layout::Single && std::env::var_os("GEN5_SCALE").is_none() => {
+                    None
+                }
+                None => Some(scale_from_env()?),
             };
             let fps = match fps {
                 Some(fps) => fps,
@@ -264,8 +280,9 @@ fn run() -> Result<(), String> {
                 Path::new(&args[2]),
                 scale,
                 fps,
-                split_screens,
-                widescreen,
+                layout,
+                // Single-screen mode is built around a 16:9 top screen.
+                widescreen || layout == Layout::Single,
             )
         }
         Some("disasm") if args.len() == 4 => {
@@ -815,7 +832,7 @@ fn print_usage() {
          gen5 codegen <import-cache-directory>\n\
          gen5 build <import-cache-directory> [c-compiler]\n\
          gen5 boot <import-cache-directory> <rom.nds> [frames [png-directory]]\n\
-         gen5 run <import-cache-directory> <rom.nds> [scale] [--fps=ds|display|uncapped|N] [--split-screens] [--widescreen]\n\
+         gen5 run <import-cache-directory> <rom.nds> [scale] [--fps=ds|display|uncapped|N] [--split-screens | --single-screen] [--widescreen]\n\
          gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
          gen5 help"

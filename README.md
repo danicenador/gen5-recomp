@@ -153,12 +153,27 @@ Game controllers work too. The face buttons map by position, as on a DS
 (bottom = B, right = A, top = X, left = Y, whatever the controller prints
 on them); the shoulder buttons are L and R, Start and Back/View/Select are
 Start and Select, and the D-pad or left stick move. The right trigger
-turns fast-forward on and off, like Tab.
+turns fast-forward on and off, like Tab, and in single-screen mode the left
+trigger raises and lowers the bottom screen, like Space.
 
 Add `--split-screens` to `run` to put the top and bottom DS screens in
 separate, independently resizable windows. Keyboard controls work in either
 window; the mouse acts as the stylus only in the bottom-screen window.
 Closing either window quits. Without the flag, both screens remain stacked.
+
+Add `--single-screen` to `run` to play on one screen. The window opens full
+screen, and the 16:9 top screen fills it (as with `--widescreen`; H still
+switches it to 4:3). The bottom screen is hidden until the left trigger (L2)
+or Space is pressed: then it slides up from the lower edge in 180 ms, 4:3
+and two thirds as tall as the top screen (720 lines on a 1080-line monitor),
+centered with its lower edge on the screen's, and the top screen blurs
+behind it. Pressing again slides it back down; pressing midway turns it
+around. The game keeps running and taking buttons while it is up, and the
+mouse is the stylus on it once it has fully risen. Without a resolution
+multiple, single-screen mode draws at least as many lines as the monitor
+has (6x at 1080 lines) and shrinks to fit. F11 or Alt+Enter switches
+between full screen and a window, in any layout. `--single-screen` and
+`--split-screens` cannot be combined.
 
 Add `--widescreen` (or set `GEN5_WIDESCREEN=1`) to draw the top screen at
 16:9, 342x192 per DS-sized screen, and press H to switch between 16:9 and
