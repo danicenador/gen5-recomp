@@ -1,7 +1,9 @@
 //! Windows for the recompiled game: DS screens stacked or separate, scaled to
 //! fit with square pixels, keyboard or controller buttons and the mouse as
-//! the stylus. Esc asks before quitting. In widescreen the top screen is
-//! 16:9 and the bottom one sits centered under it.
+//! the stylus. Esc asks before quitting; F11 or Alt+Enter switches full
+//! screen. In widescreen the top screen is 16:9 and the bottom one sits
+//! centered under it. In single-screen mode the top screen fills the window
+//! and L2 or Space slides the bottom one up over it, blurring the top one.
 //! The game runs on its own threads and hands frames over through
 //! `Screens`; this side presents them and records input. With an `Fps`
 //! other than `Ds` it draws between game frames too (see `pacing`).
@@ -95,7 +97,8 @@ pub const MAX_SCALE: u32 = 8;
 /// the resolution multiple frames are drawn at; keys 1-8 change it. `fps`
 /// is how often it draws; F turns interpolation off and on to compare.
 /// Tab turns fast-forward on and off, and + and - change its speed.
-/// `split_screens` gives each screen its own window instead of stacking them.
+/// `layout` says how the screens are shown; `auto_scale` lets single-screen
+/// mode pick the resolution multiple for the monitor.
 /// `widescreen` makes the top screen 16:9; H turns it off and on.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -105,7 +108,8 @@ pub fn run(
     scale: Arc<AtomicU32>,
     fps: Fps,
     speed: Arc<Speed>,
-    split_screens: bool,
+    layout: Layout,
+    auto_scale: bool,
     widescreen: Arc<AtomicBool>,
 ) -> Result<()> {
     let event_loop =
@@ -117,7 +121,10 @@ pub fn run(
         scale,
         speed,
         windows: Vec::new(),
-        split_screens,
+        layout,
+        auto_scale,
+        panel: Panel::new(Instant::now()),
+        alt: false,
         widescreen,
         redraw_pending: false,
         gpu: None,
@@ -153,7 +160,12 @@ struct App {
     scale: Arc<AtomicU32>,
     speed: Arc<Speed>,
     windows: Vec<Arc<Window>>,
-    split_screens: bool,
+    layout: Layout,
+    auto_scale: bool,
+    /// The bottom screen raised over the top one, in single-screen mode.
+    panel: Panel,
+    /// Alt held, for Alt+Enter.
+    alt: bool,
     /// Whether the game draws the top screen 16:9; frames say how wide
     /// they are, so this only decides new frames and window sizes.
     widescreen: Arc<AtomicBool>,
@@ -198,11 +210,26 @@ fn button(key: KeyCode) -> Option<u32> {
     })
 }
 
+/// How the DS screens are shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// One window, the top screen over the bottom one.
+    Stacked,
+    /// Each screen in its own window.
+    Split,
+    /// One window, normally full screen, that the top screen fills. L2 or
+    /// Space slides the bottom screen up over it and back down; while it is
+    /// up the top screen is blurred behind it.
+    Single,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Stacked,
     Top,
     Bottom,
+    /// The top screen, with the bottom one raised over it on demand.
+    Single,
 }
 
 impl View {
@@ -231,18 +258,20 @@ impl View {
         let total = (WIDTH + 2 * extra) as f32;
         match self {
             Self::Stacked => [0.0, 0.0, 1.0, 1.0],
-            Self::Top => [0.0, 0.0, 1.0, 0.5],
+            Self::Top | Self::Single => [0.0, 0.0, 1.0, 0.5],
             Self::Bottom => [extra as f32 / total, 0.5, WIDTH as f32 / total, 0.5],
         }
     }
 
+    /// The DS touch-screen point under `cursor`. Single-screen windows
+    /// touch through the raised bottom screen instead (`Panel`).
     fn touch(
         self,
         size: winit::dpi::PhysicalSize<u32>,
         cursor: PhysicalPosition<f64>,
         extra: usize,
     ) -> Option<(u8, u8)> {
-        if self == Self::Top || size.width == 0 || size.height == 0 {
+        if matches!(self, Self::Top | Self::Single) || size.width == 0 || size.height == 0 {
             return None;
         }
         let (x, y, scale) = placement(size.width, size.height, self, extra);
@@ -273,6 +302,98 @@ fn placement(width: u32, height: u32, view: View, extra: usize) -> (f32, f32, f3
     (x, y, scale)
 }
 
+/// How long the bottom screen takes to rise all the way, or to drop.
+const PANEL_TIME: Duration = Duration::from_millis(180);
+
+/// The raised bottom screen's height, as a share of the top screen's: 720
+/// lines over a 1080-line top screen.
+const PANEL_HEIGHT: f32 = 2.0 / 3.0;
+
+/// The bottom screen in single-screen mode: down out of sight, or raised
+/// over the top screen, and how far along it is in between.
+#[derive(Clone, Copy, Debug)]
+struct Panel {
+    /// Where it is heading: up or down.
+    up: bool,
+    /// How far up it is, from 0 (out of sight) to 1 (raised), in time:
+    /// it moves by `PANEL_TIME` per unit.
+    travel: f32,
+    /// When `travel` was last brought up to date.
+    at: Instant,
+}
+
+impl Panel {
+    fn new(now: Instant) -> Self {
+        Self {
+            up: false,
+            travel: 0.0,
+            at: now,
+        }
+    }
+
+    /// Move it on to `now`.
+    fn advance(&mut self, now: Instant) {
+        let step = now.saturating_duration_since(self.at).as_secs_f32() / PANEL_TIME.as_secs_f32();
+        self.at = now;
+        self.travel = if self.up {
+            (self.travel + step).min(1.0)
+        } else {
+            (self.travel - step).max(0.0)
+        };
+    }
+
+    /// Send it the other way, from wherever it is.
+    fn toggle(&mut self, now: Instant) {
+        self.advance(now);
+        self.up = !self.up;
+    }
+
+    /// How much of it shows, from 0 to 1. It eases out as it rises and in as
+    /// it drops, and turning back midway carries on from where it is.
+    fn raised(&self) -> f32 {
+        1.0 - (1.0 - self.travel).powi(3)
+    }
+
+    /// The stylus only reaches it once it has fully risen.
+    fn touchable(&self) -> bool {
+        self.up && self.travel >= 1.0
+    }
+}
+
+/// Where the bottom screen is drawn in a single-screen window of this size,
+/// `raised` (0 to 1) of the way up: x, y, width, height. Its lower edge
+/// starts at the top screen's and it rises its own height; whatever lies
+/// below the top screen is not shown.
+fn panel_rect(width: u32, height: u32, extra: usize, raised: f32) -> [f32; 4] {
+    let (x, y, scale) = placement(width, height, View::Single, extra);
+    let top_width = View::Single.width(extra) as f32 * scale;
+    let top_height = HEIGHT as f32 * scale;
+    let panel_height = (top_height * PANEL_HEIGHT).round();
+    let panel_width = (panel_height * WIDTH as f32 / HEIGHT as f32).round();
+    [
+        (x + (top_width - panel_width) / 2.0).round(),
+        (y + top_height - raised * panel_height).round(),
+        panel_width,
+        panel_height,
+    ]
+}
+
+/// The DS touch-screen point under `cursor` on a raised bottom screen.
+fn panel_touch(
+    size: winit::dpi::PhysicalSize<u32>,
+    cursor: PhysicalPosition<f64>,
+    extra: usize,
+) -> Option<(u8, u8)> {
+    if size.width == 0 || size.height == 0 {
+        return None;
+    }
+    let [x, y, width, height] = panel_rect(size.width, size.height, extra, 1.0);
+    let px = ((cursor.x as f32 - x) / width * WIDTH as f32).floor();
+    let py = ((cursor.y as f32 - y) / height * HEIGHT as f32).floor();
+    ((0.0..WIDTH as f32).contains(&px) && (0.0..HEIGHT as f32).contains(&py))
+        .then_some((px as u8, py as u8))
+}
+
 /// The widescreen columns on each side of the top screen.
 fn extra_columns(widescreen: bool) -> usize {
     if widescreen {
@@ -284,12 +405,33 @@ fn extra_columns(widescreen: bool) -> usize {
 
 impl App {
     fn view(&self, index: usize) -> View {
-        if !self.split_screens {
-            View::Stacked
-        } else if index == 0 {
-            View::Top
-        } else {
-            View::Bottom
+        match self.layout {
+            Layout::Stacked => View::Stacked,
+            Layout::Single => View::Single,
+            Layout::Split if index == 0 => View::Top,
+            Layout::Split => View::Bottom,
+        }
+    }
+
+    /// L2 or Space: slide the bottom screen up, or back down.
+    fn toggle_panel(&mut self) {
+        if self.layout != Layout::Single {
+            return;
+        }
+        self.panel.toggle(Instant::now());
+        // A dropping screen lets go of the stylus at once.
+        self.update_touch();
+    }
+
+    /// F11 or Alt+Enter: switch window `index` between full screen and a
+    /// window.
+    fn toggle_fullscreen(&self, index: usize) {
+        if let Some(window) = self.windows.get(index) {
+            let fullscreen = window
+                .fullscreen()
+                .is_none()
+                .then_some(winit::window::Fullscreen::Borderless(None));
+            window.set_fullscreen(fullscreen);
         }
     }
 
@@ -305,6 +447,9 @@ impl App {
         if state.toggle_fast_forward {
             self.speed.toggle();
             self.update_title();
+        }
+        if state.toggle_panel {
+            self.toggle_panel();
         }
         if state.buttons != self.pad_pressed {
             self.pad_pressed = state.buttons;
@@ -332,9 +477,16 @@ impl App {
         // Where the screens are is decided by the frame shown.
         let extra = self.gpu.as_ref().map_or(0, |gpu| gpu.extra);
         let point = self.cursor.filter(|_| self.pen_down).and_then(|cursor| {
-            let index = usize::from(self.split_screens);
-            self.view(index)
-                .touch(self.windows.get(index)?.inner_size(), cursor, extra)
+            let index = usize::from(self.layout == Layout::Split);
+            let size = self.windows.get(index)?.inner_size();
+            match self.view(index) {
+                View::Single => self
+                    .panel
+                    .touchable()
+                    .then(|| panel_touch(size, cursor, extra))
+                    .flatten(),
+                view => view.touch(size, cursor, extra),
+            }
         });
         self.input.set_touch(point);
     }
@@ -358,9 +510,18 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
+        if self.gpu.is_none() {
+            return Ok(());
+        }
+        let touchable = self.panel.touchable();
+        self.panel.advance(Instant::now());
+        if self.panel.touchable() != touchable {
+            self.update_touch();
+        }
         let Some(gpu) = &mut self.gpu else {
             return Ok(());
         };
+        gpu.panel = self.panel.raised();
         self.history.extend(self.screens.take());
         let scale = self.scale.load(Ordering::Relaxed);
         if !self.history.is_empty() {
@@ -446,7 +607,7 @@ impl App {
     fn output_title(&self, index: usize) -> String {
         let title = self.window_title();
         match self.view(index) {
-            View::Stacked => title,
+            View::Stacked | View::Single => title,
             View::Top => format!("{title} - Top screen"),
             View::Bottom => format!("{title} - Bottom screen"),
         }
@@ -511,10 +672,20 @@ impl ApplicationHandler for App {
         if !self.windows.is_empty() {
             return;
         }
+        // Single-screen mode draws at least as many lines as the monitor
+        // has (6x for 1080 lines), then shrinks to fit.
+        if self.layout == Layout::Single
+            && self.auto_scale
+            && let Some(monitor) = event_loop.primary_monitor()
+        {
+            let scale = monitor.size().height.div_ceil(HEIGHT as u32);
+            self.scale
+                .store(scale.clamp(1, MAX_SCALE), Ordering::Relaxed);
+        }
         // Big enough to show the chosen resolution, within the monitor.
         let scale = self.scale.load(Ordering::Relaxed);
         let extra = extra_columns(self.widescreen.load(Ordering::Relaxed));
-        for index in 0..if self.split_screens { 2 } else { 1 } {
+        for index in 0..if self.layout == Layout::Split { 2 } else { 1 } {
             let view = self.view(index);
             let height = view.height() as u32;
             let width = view.width(extra) as u32;
@@ -534,6 +705,10 @@ impl ApplicationHandler for App {
                 }
                 attributes = attributes.with_inner_size(size);
             }
+            if view == View::Single {
+                attributes =
+                    attributes.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            }
             let window = match event_loop.create_window(attributes) {
                 Ok(window) => Arc::new(window),
                 Err(error) => {
@@ -544,7 +719,10 @@ impl ApplicationHandler for App {
             };
             self.windows.push(window);
         }
-        match pollster::block_on(Gpu::new(&self.windows, self.fps)) {
+        let views: Vec<View> = (0..self.windows.len())
+            .map(|index| self.view(index))
+            .collect();
+        match pollster::block_on(Gpu::new(&self.windows, &views, self.fps)) {
             Ok(gpu) => self.gpu = Some(gpu),
             Err(error) => {
                 self.error = Some(error);
@@ -586,6 +764,18 @@ impl ApplicationHandler for App {
                         }
                         return;
                     }
+                    if code == KeyCode::F11 || (code == KeyCode::Enter && self.alt) {
+                        if event.state == ElementState::Pressed && !event.repeat {
+                            self.toggle_fullscreen(index);
+                        }
+                        return;
+                    }
+                    if code == KeyCode::Space && self.layout == Layout::Single {
+                        if event.state == ElementState::Pressed && !event.repeat {
+                            self.toggle_panel();
+                        }
+                        return;
+                    }
                     if let Some(scale) = scale_key(code)
                         && event.state == ElementState::Pressed
                     {
@@ -609,6 +799,9 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.alt = modifiers.state().alt_key();
+            }
             WindowEvent::CursorMoved { position, .. } if touch_window => {
                 self.cursor = Some(position);
                 self.update_touch();
@@ -626,6 +819,7 @@ impl ApplicationHandler for App {
                 self.update_touch();
             }
             WindowEvent::Focused(false) => {
+                self.alt = false;
                 self.pressed = 0;
                 self.update_buttons();
                 if touch_window {
@@ -733,9 +927,18 @@ struct Gpu {
     showing_scaled: bool,
     /// The widescreen columns on each side of the shown frame's top screen.
     extra: usize,
-    /// For the screen tests, which draw views no window has.
-    #[cfg_attr(not(test), allow(dead_code))]
     rect_layout: wgpu::BindGroupLayout,
+    /// The windows' colour format, which drawing in between uses too.
+    format: wgpu::TextureFormat,
+    /// Bilinear both ways, for the blur.
+    smooth: wgpu::Sampler,
+    /// Draws like `pipeline`, mixed over what is there by the blend
+    /// constant: the blurred top screen over the sharp one.
+    blend_pipeline: wgpu::RenderPipeline,
+    /// How far the bottom screen is raised in single-screen windows, 0 to 1.
+    panel: f32,
+    /// The single-screen window's blur, for its current size.
+    blur: Option<Blur>,
 }
 
 struct SurfaceTarget {
@@ -745,6 +948,283 @@ struct SurfaceTarget {
     /// What part of the screens the window shows (`View::rect`).
     rect: wgpu::Buffer,
     rect_bind_group: wgpu::BindGroup,
+    /// The bottom screen's part, raised over the top one in single-screen
+    /// windows.
+    panel_rect: wgpu::Buffer,
+    panel_bind_group: wgpu::BindGroup,
+}
+
+/// Lines the top screen is blurred at, at most; the blur then halves this
+/// `BLUR_LEVELS` times and doubles back up, so it looks the same at any
+/// window size from 540 lines up.
+const BLUR_HEIGHT: u32 = 540;
+const BLUR_LEVELS: usize = 2;
+
+const BLUR_SHADER: &str = r"
+struct Out {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> Out {
+    let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
+    var out: Out;
+    out.position = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@group(0) @binding(0) var source: texture_2d<f32>;
+@group(0) @binding(1) var source_sampler: sampler;
+// How far apart the taps are, in texture coordinates (x and y).
+@group(0) @binding(2) var<uniform> spread: vec4<f32>;
+
+fn tap(uv: vec2<f32>) -> vec4<f32> {
+    return textureSample(source, source_sampler, uv);
+}
+
+// Halve: the middle and four diagonal taps, each bilinear.
+@fragment
+fn fs_down(in: Out) -> @location(0) vec4<f32> {
+    let d = spread.xy;
+    let sum = tap(in.uv) * 4.0 + tap(in.uv - d) + tap(in.uv + d)
+        + tap(in.uv + vec2<f32>(d.x, -d.y)) + tap(in.uv + vec2<f32>(-d.x, d.y));
+    return sum / 8.0;
+}
+
+// Double: a ring of eight taps, the diagonal ones weighed twice.
+@fragment
+fn fs_up(in: Out) -> @location(0) vec4<f32> {
+    let d = spread.xy;
+    var sum = tap(in.uv + vec2<f32>(-2.0 * d.x, 0.0)) + tap(in.uv + vec2<f32>(2.0 * d.x, 0.0))
+        + tap(in.uv + vec2<f32>(0.0, -2.0 * d.y)) + tap(in.uv + vec2<f32>(0.0, 2.0 * d.y));
+    sum += 2.0 * (tap(in.uv + d) + tap(in.uv - d)
+        + tap(in.uv + vec2<f32>(d.x, -d.y)) + tap(in.uv + vec2<f32>(-d.x, d.y)));
+    return sum / 12.0;
+}
+";
+
+/// The top screen blurred behind the raised bottom screen: drawn into the
+/// first of a chain of textures, each half the size of the one before,
+/// halved down the chain and doubled back up it (a dual Kawase blur), so
+/// the first ends up blurred.
+struct Blur {
+    /// The first texture's size.
+    size: (u32, u32),
+    levels: Vec<wgpu::TextureView>,
+    down: wgpu::RenderPipeline,
+    up: wgpu::RenderPipeline,
+    /// Reading level `i`, to draw level `i + 1`.
+    down_groups: Vec<wgpu::BindGroup>,
+    /// Reading level `i + 1`, to draw level `i`.
+    up_groups: Vec<wgpu::BindGroup>,
+    /// The first level, for drawing over the window.
+    shown: wgpu::BindGroup,
+    /// All of the first level (`View::rect` for it).
+    whole: wgpu::BindGroup,
+}
+
+impl Blur {
+    fn new(gpu: &Gpu, size: (u32, u32)) -> Self {
+        let device = &gpu.device;
+        let mut levels = Vec::new();
+        let mut sizes = Vec::new();
+        for level in 0..=BLUR_LEVELS {
+            let (width, height) = ((size.0 >> level).max(1), (size.1 >> level).max(1));
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("top screen blur"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: gpu.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            levels.push(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+            sizes.push((width as f32, height as f32));
+        }
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("top screen blur layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let group = |source: usize, spread: f32| {
+            let (width, height) = sizes[source];
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("top screen blur spread"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.queue.write_buffer(
+                &buffer,
+                0,
+                bytemuck::cast_slice(&[spread / width, spread / height, 0.0, 0.0]),
+            );
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("top screen blur bind group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&levels[source]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&gpu.smooth),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        // Down a texel from the middle of each 2x2 block; back up half a
+        // texel of the smaller level.
+        let down_groups = (0..BLUR_LEVELS).map(|level| group(level, 1.0)).collect();
+        let up_groups = (0..BLUR_LEVELS)
+            .map(|level| group(level + 1, 0.5))
+            .collect();
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("top screen blur shader"),
+            source: wgpu::ShaderSource::Wgsl(BLUR_SHADER.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("top screen blur pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |entry: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("top screen blur pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: gpu.format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let shown = screens_bind_group(device, &gpu.layout, &levels[0], &gpu.smooth);
+        let (whole_rect, whole) = rect_bind_group(device, &gpu.rect_layout);
+        gpu.queue.write_buffer(
+            &whole_rect,
+            0,
+            bytemuck::cast_slice(&[0.0f32, 0.0, 1.0, 1.0]),
+        );
+        Self {
+            size,
+            down: pipeline("fs_down"),
+            up: pipeline("fs_up"),
+            levels,
+            down_groups,
+            up_groups,
+            shown,
+            whole,
+        }
+    }
+
+    /// The first level's size for a top screen drawn `width` by `height`.
+    fn size_for(width: f32, height: f32) -> (u32, u32) {
+        let lines = (height.round() as u32).clamp(1, BLUR_HEIGHT);
+        let columns = ((width * lines as f32 / height).round() as u32).max(1);
+        (columns, lines)
+    }
+
+    /// Blur what has been drawn into the first level.
+    fn run(&self, encoder: &mut wgpu::CommandEncoder) {
+        let pass = |encoder: &mut wgpu::CommandEncoder,
+                    pipeline: &wgpu::RenderPipeline,
+                    group: &wgpu::BindGroup,
+                    target: &wgpu::TextureView| {
+            let colors = [Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("blur top screen"),
+                color_attachments: &colors,
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, group, &[]);
+            pass.draw(0..3, 0..1);
+        };
+        for level in 0..BLUR_LEVELS {
+            pass(
+                encoder,
+                &self.down,
+                &self.down_groups[level],
+                &self.levels[level + 1],
+            );
+        }
+        for level in (0..BLUR_LEVELS).rev() {
+            pass(
+                encoder,
+                &self.up,
+                &self.up_groups[level],
+                &self.levels[level],
+            );
+        }
+    }
 }
 
 fn rect_bind_group(
@@ -791,7 +1271,8 @@ fn screens_bind_group(
 }
 
 impl Gpu {
-    async fn new(windows: &[Arc<Window>], fps: Fps) -> Result<Self> {
+    /// Draw into `windows`, each showing its `views` entry.
+    async fn new(windows: &[Arc<Window>], views: &[View], fps: Fps) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surfaces = windows
             .iter()
@@ -852,19 +1333,16 @@ impl Gpu {
             target_config.format = config.format;
             target_config.present_mode = present_mode;
             surface.configure(&device, &target_config);
+            let (panel_rect, panel_bind_group) = rect_bind_group(&device, &rect_layout);
             let (rect, rect_bind_group) = rect_bind_group(&device, &rect_layout);
             targets.push(SurfaceTarget {
                 surface,
                 config: target_config,
-                view: if windows.len() == 1 {
-                    View::Stacked
-                } else if index == 0 {
-                    View::Top
-                } else {
-                    View::Bottom
-                },
+                view: views[index],
                 rect,
                 rect_bind_group,
+                panel_rect,
+                panel_bind_group,
             });
         }
 
@@ -898,6 +1376,12 @@ impl Gpu {
         let linear = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("DS screens linear sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let smooth = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("DS screens blur sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
@@ -945,31 +1429,42 @@ impl Gpu {
             bind_group_layouts: &[Some(&layout), Some(&rect_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("DS screens pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
+        let pipeline = |blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("DS screens pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let blend_pipeline = pipeline(Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Constant,
+                dst_factor: wgpu::BlendFactor::OneMinusConstant,
+                operation: wgpu::BlendOperation::Add,
             },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+            alpha: wgpu::BlendComponent::REPLACE,
+        }));
+        let pipeline = pipeline(None);
         Ok(Self {
             targets,
             device,
@@ -985,6 +1480,11 @@ impl Gpu {
             showing_scaled: false,
             extra: 0,
             rect_layout,
+            format: config.format,
+            smooth,
+            blend_pipeline,
+            panel: 0.0,
+            blur: None,
         })
     }
 
@@ -1048,16 +1548,28 @@ impl Gpu {
         matched
     }
 
+    /// The screens as last drawn, sampled to suit showing them at `shown`
+    /// window pixels per DS pixel.
+    fn screens_group(&self, shown: f32) -> &wgpu::BindGroup {
+        match &self.scaled_view {
+            // Shrinking a large output: average texels rather than skip them.
+            Some(((scale, _), nearest, linear)) if self.showing_scaled => {
+                if (*scale as f32) > shown {
+                    linear
+                } else {
+                    nearest
+                }
+            }
+            _ => &self.bind_group,
+        }
+    }
+
     fn draw(&mut self, index: usize, size: winit::dpi::PhysicalSize<u32>) -> Result<()> {
         if size.width == 0 || size.height == 0 {
             return Ok(());
         }
+        self.prepare(index, size);
         let target = &mut self.targets[index];
-        self.queue.write_buffer(
-            &target.rect,
-            0,
-            bytemuck::cast_slice(&target.view.rect(self.extra)),
-        );
         if (size.width, size.height) != (target.config.width, target.config.height) {
             target.config.width = size.width;
             target.config.height = size.height;
@@ -1085,9 +1597,62 @@ impl Gpu {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("DS screens frame"),
             });
-        {
+        self.encode(index, &view, size, &mut encoder);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.present(frame);
+        Ok(())
+    }
+
+    /// Bring window `index`'s rects up to date, and the blur when a
+    /// single-screen window shows it, for drawing at `size`.
+    fn prepare(&mut self, index: usize, size: winit::dpi::PhysicalSize<u32>) {
+        let target = &self.targets[index];
+        let view = target.view;
+        self.queue.write_buffer(
+            &target.rect,
+            0,
+            bytemuck::cast_slice(&view.rect(self.extra)),
+        );
+        if view != View::Single {
+            return;
+        }
+        self.queue.write_buffer(
+            &target.panel_rect,
+            0,
+            bytemuck::cast_slice(&View::Bottom.rect(self.extra)),
+        );
+        if self.panel > 0.0 {
+            let (_, _, scale) = placement(size.width, size.height, view, self.extra);
+            let wanted = Blur::size_for(
+                view.width(self.extra) as f32 * scale,
+                view.height() as f32 * scale,
+            );
+            if self.blur.as_ref().is_none_or(|blur| blur.size != wanted) {
+                self.blur = Some(Blur::new(self, wanted));
+            }
+        }
+    }
+
+    /// Record drawing window `index`, `size` big, into `output`.
+    fn encode(
+        &self,
+        index: usize,
+        output: &wgpu::TextureView,
+        size: winit::dpi::PhysicalSize<u32>,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        let target = &self.targets[index];
+        let (x, y, scale) = placement(size.width, size.height, target.view, self.extra);
+        let width = target.view.width(self.extra) as f32 * scale;
+        let height = target.view.height() as f32 * scale;
+        let blur = self
+            .blur
+            .as_ref()
+            .filter(|_| target.view == View::Single && self.panel > 0.0);
+        if let Some(blur) = blur {
+            // The top screen, small, into the blur's first level.
             let colors = [Some(wgpu::RenderPassColorAttachment {
-                view: &view,
+                view: &blur.levels[0],
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -1096,41 +1661,78 @@ impl Gpu {
                 },
             })];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("draw DS screens"),
+                label: Some("shrink top screen for blur"),
                 color_attachments: &colors,
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let (x, y, scale) = placement(size.width, size.height, target.view, self.extra);
-            pass.set_viewport(
-                x,
-                y,
-                target.view.width(self.extra) as f32 * scale,
-                target.view.height() as f32 * scale,
-                0.0,
-                1.0,
-            );
             pass.set_pipeline(&self.pipeline);
-            let bind_group = match &self.scaled_view {
-                // Shrinking a large output: average texels rather than skip them.
-                Some(((shown, _), nearest, linear)) if self.showing_scaled => {
-                    if (*shown as f32) > scale {
-                        linear
-                    } else {
-                        nearest
-                    }
-                }
-                _ => &self.bind_group,
-            };
-            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_bind_group(
+                0,
+                self.screens_group(blur.size.1 as f32 / HEIGHT as f32),
+                &[],
+            );
             pass.set_bind_group(1, &target.rect_bind_group, &[]);
             pass.draw(0..3, 0..1);
+            drop(pass);
+            blur.run(encoder);
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
-        self.queue.present(frame);
-        Ok(())
+        let colors = [Some(wgpu::RenderPassColorAttachment {
+            view: output,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("draw DS screens"),
+            color_attachments: &colors,
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_viewport(x, y, width, height, 0.0, 1.0);
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, self.screens_group(scale), &[]);
+        pass.set_bind_group(1, &target.rect_bind_group, &[]);
+        pass.draw(0..3, 0..1);
+        let Some(blur) = blur else {
+            return;
+        };
+        // The blurred top screen over the sharp one, as much as the bottom
+        // screen has risen.
+        let amount = f64::from(self.panel);
+        pass.set_pipeline(&self.blend_pipeline);
+        pass.set_blend_constant(wgpu::Color {
+            r: amount,
+            g: amount,
+            b: amount,
+            a: amount,
+        });
+        pass.set_bind_group(0, &blur.shown, &[]);
+        pass.set_bind_group(1, &blur.whole, &[]);
+        pass.draw(0..3, 0..1);
+        // The bottom screen, cut off at the top screen's lower edge.
+        let [panel_x, panel_y, panel_width, panel_height] =
+            panel_rect(size.width, size.height, self.extra, self.panel);
+        let left = (panel_x.max(0.0) as u32).min(size.width);
+        let right = ((panel_x + panel_width).max(0.0) as u32).min(size.width);
+        let top = (panel_y.max(0.0) as u32).min(size.height);
+        let bottom = ((y + height).round().max(0.0) as u32).min(size.height);
+        if right <= left || bottom <= top {
+            return;
+        }
+        pass.set_scissor_rect(left, top, right - left, bottom - top);
+        pass.set_viewport(panel_x, panel_y, panel_width, panel_height, 0.0, 1.0);
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, self.screens_group(panel_height / HEIGHT as f32), &[]);
+        pass.set_bind_group(1, &target.panel_bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
@@ -1223,6 +1825,214 @@ mod tests {
             View::Stacked.touch(size, PhysicalPosition::new(86.0, 384.0), 43),
             Some((0, 0))
         );
+        // Single-screen windows touch only through the raised bottom screen.
+        assert_eq!(View::Single.touch(size, point, 43), None);
+    }
+
+    #[test]
+    fn bottom_screen_rises_eases_and_turns_back() {
+        let start = Instant::now();
+        let mut panel = Panel::new(start);
+        panel.advance(start + PANEL_TIME);
+        assert_eq!(panel.raised(), 0.0);
+        panel.toggle(start + PANEL_TIME);
+        // Halfway through in time, it has risen most of the way.
+        panel.advance(start + PANEL_TIME + PANEL_TIME / 2);
+        assert!((panel.raised() - 0.875).abs() < 1e-4, "{}", panel.raised());
+        assert!(!panel.touchable());
+        // Turning back carries on from where it is, without a jump.
+        let before = panel.raised();
+        panel.toggle(start + PANEL_TIME + PANEL_TIME / 2);
+        assert_eq!(panel.raised(), before);
+        panel.advance(start + 3 * PANEL_TIME);
+        assert_eq!(panel.raised(), 0.0);
+        // All the way up, and only then, the stylus reaches it.
+        panel.toggle(start + 3 * PANEL_TIME);
+        panel.advance(start + 5 * PANEL_TIME);
+        assert_eq!(panel.raised(), 1.0);
+        assert!(panel.touchable());
+        // Dropping lets go at once.
+        panel.toggle(start + 5 * PANEL_TIME);
+        assert!(!panel.touchable());
+    }
+
+    #[test]
+    fn bottom_screen_rises_from_under_the_top_one() {
+        // 1080p: the top screen fills the width; the bottom one is 720
+        // lines high (give or take rounding of the 16:9 top screen),
+        // centered, its lower edge on the top screen's.
+        assert_eq!(
+            panel_rect(1920, 1080, 43, 1.0),
+            [481.0, 360.0, 959.0, 719.0]
+        );
+        // At rest it waits under the top screen, whose 342x192 leaves a
+        // line of black above and below at 1920x1080.
+        assert_eq!(panel_rect(1920, 1080, 43, 0.0)[1], 1079.0);
+        // Twice the DS size: the top screen fills a 684x384 window.
+        assert_eq!(panel_rect(684, 384, 43, 1.0), [172.0, 128.0, 341.0, 256.0]);
+        assert_eq!(panel_rect(684, 384, 43, 0.5), [172.0, 256.0, 341.0, 256.0]);
+        // A 4:3 top screen in a 16:9 window: centered under it.
+        assert_eq!(panel_rect(684, 384, 0, 1.0), [172.0, 128.0, 341.0, 256.0]);
+    }
+
+    #[test]
+    fn stylus_maps_the_raised_bottom_screen() {
+        let size = winit::dpi::PhysicalSize::new(684, 384);
+        let touch = |x, y| panel_touch(size, PhysicalPosition::new(x, y), 43);
+        assert_eq!(touch(172.0, 128.0), Some((0, 0)));
+        assert_eq!(touch(342.5, 256.0), Some((128, 96)));
+        assert_eq!(touch(512.9, 383.9), Some((255, 191)));
+        for (x, y) in [
+            (171.9, 200.0),
+            (513.0, 200.0),
+            (300.0, 127.9),
+            (300.0, 384.0),
+        ] {
+            assert_eq!(touch(x, y), None, "{x}, {y}");
+        }
+        assert_eq!(
+            panel_touch(
+                winit::dpi::PhysicalSize::new(0, 0),
+                PhysicalPosition::new(0.0, 0.0),
+                43
+            ),
+            None
+        );
+    }
+
+    /// The single-screen window at rest, halfway and raised: the bottom
+    /// screen (green) shows only as far as it has risen, cut off at the
+    /// window's lower edge, and the top screen (red) stays red through
+    /// the blur.
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires a Windows desktop and graphics adapter"]
+    fn single_screen_raises_the_bottom_screen_over_the_blurred_top() {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        struct Smoke;
+        impl ApplicationHandler for Smoke {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                let size = winit::dpi::PhysicalSize::new(512, 384);
+                let window = Arc::new(
+                    event_loop
+                        .create_window(
+                            Window::default_attributes()
+                                .with_title("Single test")
+                                .with_inner_size(size),
+                        )
+                        .unwrap(),
+                );
+                let mut gpu =
+                    pollster::block_on(Gpu::new(&[window], &[View::Single], Fps::Ds)).unwrap();
+                let mut frame = Frame::blank();
+                for pixel in frame.top.chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&[255, 0, 0, 255]);
+                }
+                for pixel in frame.bottom.chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&[0, 255, 0, 255]);
+                }
+                gpu.upload(&frame);
+                // A 4:3 top screen fills 512x384; the bottom screen is
+                // 341x256 at x 86, its top at 384 - 256 * raised.
+                for (raised, panel_top) in [(0.0, 384), (0.5, 256), (1.0, 128)] {
+                    gpu.panel = raised;
+                    let pixels = render_window(&mut gpu, size);
+                    for (index, actual) in pixels.iter().enumerate() {
+                        let (x, y) = (index % 512, index / 512);
+                        let panel = (86..427).contains(&x) && y >= panel_top;
+                        let expected = if panel {
+                            [0, 255, 0, 255]
+                        } else {
+                            [255, 0, 0, 255]
+                        };
+                        let close = actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(&a, e)| a.abs_diff(e) <= 2);
+                        assert!(
+                            close,
+                            "raised {raised}, pixel {x}, {y}: {actual:?}, expected {expected:?}"
+                        );
+                    }
+                }
+                event_loop.exit();
+            }
+
+            fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+        }
+
+        let event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
+        event_loop.run_app(&mut Smoke).unwrap();
+    }
+
+    /// Draw window 0 into a texture `size` big and read it back as RGBA.
+    #[cfg(target_os = "windows")]
+    fn render_window(gpu: &mut Gpu, size: winit::dpi::PhysicalSize<u32>) -> Vec<[u8; 4]> {
+        let format = gpu.targets[0].config.format;
+        let output = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("window test"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("window test readback"),
+            size: u64::from(size.width * size.height * 4),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        gpu.prepare(0, size);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        gpu.encode(
+            0,
+            &output.create_view(&Default::default()),
+            size,
+            &mut encoder,
+        );
+        encoder.copy_texture_to_buffer(
+            output.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size.width * 4),
+                    rows_per_image: Some(size.height),
+                },
+            },
+            output.size(),
+        );
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                sender.send(result).unwrap();
+            });
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        receiver.recv().unwrap().unwrap();
+        let data = buffer.slice(..).get_mapped_range().unwrap();
+        data.chunks_exact(4)
+            .map(|pixel| match format {
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+                    [pixel[2], pixel[1], pixel[0], pixel[3]]
+                }
+                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {
+                    [pixel[0], pixel[1], pixel[2], pixel[3]]
+                }
+                _ => panic!("unexpected test surface format: {format:?}"),
+            })
+            .collect()
     }
 
     #[cfg(target_os = "windows")]
@@ -1248,7 +2058,9 @@ mod tests {
                         )
                     })
                     .collect();
-                let mut gpu = pollster::block_on(Gpu::new(&windows, Fps::Ds)).unwrap();
+                let mut gpu =
+                    pollster::block_on(Gpu::new(&windows, &[View::Top, View::Bottom], Fps::Ds))
+                        .unwrap();
                 assert_eq!(gpu.targets.len(), 2);
                 assert_eq!(gpu.targets[0].view, View::Top);
                 assert_eq!(gpu.targets[1].view, View::Bottom);

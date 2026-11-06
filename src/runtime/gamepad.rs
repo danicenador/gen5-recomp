@@ -3,7 +3,8 @@
 //! Y, whatever the controller prints on them. The shoulder buttons are L
 //! and R, Start and Select (Back, View, Share, -) are themselves, and the
 //! D-pad or the left stick are the D-pad. The right trigger turns
-//! fast-forward on and off, like Tab.
+//! fast-forward on and off, like Tab. In single-screen mode the left trigger
+//! raises and lowers the bottom screen, like Space.
 
 use crate::nds::input;
 use gilrs::{Axis, Button, Gilrs};
@@ -14,6 +15,7 @@ const STICK_THRESHOLD: f32 = 0.5;
 pub struct Gamepads {
     gilrs: Gilrs,
     fast_forward_held: bool,
+    panel_held: bool,
 }
 
 /// What the controllers are doing right now.
@@ -23,6 +25,9 @@ pub struct State {
     pub buttons: u32,
     /// The fast-forward button was pressed since the last poll.
     pub toggle_fast_forward: bool,
+    /// The bottom-screen button (left trigger) was pressed since the last
+    /// poll.
+    pub toggle_panel: bool,
 }
 
 const BUTTONS: [(Button, u32); 12] = [
@@ -52,6 +57,7 @@ impl Gamepads {
                 Some(Self {
                     gilrs,
                     fast_forward_held: false,
+                    panel_held: false,
                 })
             }
             Err(error) => {
@@ -74,6 +80,7 @@ impl Gamepads {
         }
         let mut buttons = 0;
         let mut fast_forward = false;
+        let mut panel = false;
         for (_, gamepad) in self.gilrs.gamepads() {
             for (button, bit) in BUTTONS {
                 if gamepad.is_pressed(button) {
@@ -82,12 +89,16 @@ impl Gamepads {
             }
             buttons |= stick(gamepad.value(Axis::LeftStickX), gamepad.value(Axis::LeftStickY));
             fast_forward |= gamepad.is_pressed(Button::RightTrigger2);
+            panel |= gamepad.is_pressed(Button::LeftTrigger2);
         }
         let toggle_fast_forward = fast_forward && !self.fast_forward_held;
         self.fast_forward_held = fast_forward;
+        let toggle_panel = panel && !self.panel_held;
+        self.panel_held = panel;
         State {
             buttons,
             toggle_fast_forward,
+            toggle_panel,
         }
     }
 }

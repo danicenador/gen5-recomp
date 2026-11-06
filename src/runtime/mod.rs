@@ -12,20 +12,23 @@ use std::sync::Arc;
 /// paced to the DS frame rate (or a multiple of it while fast-forwarding,
 /// Tab), and the window shows its frames, drawn at `scale` times the DS
 /// resolution (keys 1-8 change it). The window draws as often as `fps`
-/// says, interpolating 3D between game frames. `split_screens` puts each
-/// DS screen in its own window. `widescreen` draws the top screen 16:9
-/// (H turns it off and on).
+/// says, interpolating 3D between game frames. `layout` stacks the DS
+/// screens in one window, puts each in its own, or shows the top one with
+/// the bottom one raised over it on demand. `widescreen` draws the top
+/// screen 16:9 (H turns it off and on). With no `scale`, single-screen mode
+/// picks one for the monitor.
 pub fn play_recompiled(
     cache_root: &Path,
     rom: &Path,
-    scale: u32,
+    scale: Option<u32>,
     fps: pacing::Fps,
-    split_screens: bool,
+    layout: screen::Layout,
     widescreen: bool,
 ) -> Result<()> {
     use crate::nds::{input::Input, machine, speed::Speed};
+    let auto_scale = scale.is_none();
     let scale = Arc::new(std::sync::atomic::AtomicU32::new(
-        scale.clamp(1, screen::MAX_SCALE),
+        scale.unwrap_or(1).clamp(1, screen::MAX_SCALE),
     ));
     let widescreen = Arc::new(std::sync::atomic::AtomicBool::new(widescreen));
     let screens = Arc::new(screen::Screens::default());
@@ -74,7 +77,8 @@ pub fn play_recompiled(
         scale,
         fps,
         speed,
-        split_screens,
+        layout,
+        auto_scale,
         widescreen,
     )?;
     // The game threads never return; closing the window ends the program.
