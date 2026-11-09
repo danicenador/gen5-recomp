@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Route 20",
+  "reproduction": "after catch tutorial",
+  "source": "debug/runs/1794257517842197800-5312/history/frame-0000061828",
+  "frame": 61828,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
