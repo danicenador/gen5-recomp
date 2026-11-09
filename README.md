@@ -286,23 +286,38 @@ Tab turns fast-forward on and off, and + and - (on any keyboard layout, or
 the numpad) set its speed (2x to 8x, 3x to begin with; the window title
 shows it). Fast-forward runs the game that
 many frames per DS frame of real time, so walking, battles, text and
-animations speed up, but it leaves two things at normal speed:
+animations speed up, but it leaves three things at normal speed:
 
 - Music and sound effects. The sound driver and mixer follow real time
   instead of the game's frames, so music keeps its tempo and pitch. Fades
   and jingles the game times itself still happen sooner.
-- Menu key repeat. Holding a direction in a menu moves the cursor as often
-  as at normal speed, and a short tap does not repeat. The runtime finds the
-  repeat countdown of GameFreak's key update by its instructions (the same
-  in Black 2 and White 2) and holds it back on the extra frames. Keys the
-  game reads directly while held, such as walking, are not slowed down.
+- Key repeat in the field's menus (the X menu, shops, yes/no boxes).
+  Holding a direction moves the cursor as often as at normal speed, and a
+  short tap does not repeat. The runtime finds the repeat countdown of
+  GameFreak's key update by its instructions (the same in Black 2 and
+  White 2) and holds it back on the extra frames. Keys the game reads
+  directly while held, such as walking, are not slowed down.
+- Menus that replace the field, such as the bag, options and Pokédex. They
+  count held keys their own way, in game frames: options and the Pokédex
+  list keep their own counters, and the bag takes a repeat only once its
+  pocket has finished sliding. So while one of these menus runs and a
+  direction, L or R pressed in it is held, the game runs at normal speed,
+  and the cursor moves as it would without fast-forward. The runtime tells
+  them from the field by the UI update count in the same key system: the
+  field map clears it on each of its 30-per-second steps, so on the field
+  it only reads 0 or 1, while elsewhere it counts on. Battles, the title
+  screen and the fade through a door count on too, so a direction pressed
+  there also runs at normal speed while held. A key still held from the
+  field when it gives way, such as walking through a door or into a wild
+  battle, keeps the game fast until it is released.
 
 The window shows about one frame per DS frame of real time while
 fast-forwarding, which leaves more time for the game; how fast it can go
 depends on the host. `GEN5_SPEED=N` starts `run` fast-forwarding at N, and
 makes `boot` run as if fast-forwarding at N, counting each frame as 1/N of a
-DS frame of real time for sound and key repeat, so `GEN5_AUDIO_WAV` records
-the music at normal speed.
+DS frame of real time for sound and key repeat (or as a whole one where a
+key pressed in a menu away from the field runs it at normal speed), so
+`GEN5_AUDIO_WAV` records the music at normal speed.
 
 `boot` runs headless for a number of frames and ends with a report; with a
 directory it also saves both screens as PNG every 30 frames.
@@ -446,7 +461,8 @@ The `nds` module provides:
 - `input`: buttons and touch screen, shared between the window and the
   machine.
 - `speed`: frame pacing and fast-forward, with real time kept for the sound
-  driver and for the key update's repeat countdown.
+  driver, for the key update's repeat countdown, and for held keys in the
+  menus that replace the field.
 - `io`: I/O registers. Display timing advances when the game polls it, and
   there are vblank and interrupt flags, immediate DMA, the divider and
   square-root units, and IPCSYNC and the IPC FIFO.

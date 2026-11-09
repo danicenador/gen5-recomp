@@ -2,17 +2,27 @@
 //!
 //! While fast-forwarding, the game runs `factor` frames for every DS frame
 //! of real time, so walking, battles, text and animations all speed up.
-//! Two things keep following real time instead:
+//! Three things keep following real time instead:
 //!
 //! - Sound: the ARM7's driver and mixer are run for the real time that has
 //!   passed rather than for the frames the game ran, so music and sound
 //!   effects keep their tempo and pitch.
 //! - Key repeat: GameFreak's UI library counts frames while a key is held
 //!   before repeating it. Its countdown is held back on the extra frames, so
-//!   holding a direction in a menu moves the cursor as often as at normal
-//!   speed and a short tap does not repeat. Code that reads held keys
-//!   directly, such as walking, still runs at the faster speed.
+//!   holding a direction in a field menu (the X menu, a shop, a yes/no box)
+//!   moves the cursor as often as at normal speed and a short tap does not
+//!   repeat. Code that reads held keys directly, such as walking, still runs
+//!   at the faster speed.
+//! - Menus away from the field: the bag, options, Pokédex and the other
+//!   menus that replace the field count held keys their own way (their own
+//!   frame counters on held keys, or repeats taken only once a page has
+//!   finished sliding), all in game frames. While one of them is running
+//!   and a direction, L or R pressed there is held, the game runs at normal
+//!   speed, so these menus move as at normal speed too. A key still held
+//!   from walking when the field gives way (a door, a wild battle) keeps
+//!   the game fast until it is released.
 
+use super::input;
 use super::io::CYCLES_PER_FRAME;
 use super::memory::Memory;
 use std::sync::Arc;
@@ -134,9 +144,10 @@ impl Pace {
         }
     }
 
-    /// Called as each frame starts.
-    pub fn start(&mut self) -> Step {
-        let factor = self.speed.current();
+    /// Called as each frame starts; `normal` runs it at normal speed even
+    /// while fast-forwarding.
+    pub fn start(&mut self, normal: bool) -> Step {
+        let factor = if normal { 1 } else { self.speed.current() };
         let real = if self.real_time {
             let now = Instant::now();
             let real = (now - self.last).min(MAX_STEP);
@@ -221,11 +232,25 @@ const KEY_UPDATE_START: [u8; 4] = [0x38, 0xB5, 0x05, 0x1C];
 
 /// In the key work: the repeat countdown.
 const REPEAT_COUNTDOWN: u32 = 0x3C;
-/// In the UI system: a byte counting UI updates (one per game frame).
+/// In the UI system: a byte counting UI updates (one per game frame). The
+/// field map clears it on each of its steps (it runs at 30 frames per
+/// second), so it only reads 0 or 1 while the field runs, and counts on
+/// through 2 and up in the menus and other scenes that replace the field.
 const UPDATE_COUNT: u32 = 0x3E;
 
+/// Frames in a row the update count must disagree with the scene before
+/// the scene is taken to have changed: a menu's count passes through 0 and
+/// 1 when it wraps, for longer if the game lags there (a frame in which it
+/// does not update reads the same count again), and the field's can reach
+/// 2 in a frame it lags. At 3x, six game frames are two real ones.
+const SCENE_FRAMES: u8 = 6;
+
+/// Keys held to move through menus: the D-pad, L and R.
+const MENU_KEYS: u32 = input::UP | input::DOWN | input::LEFT | input::RIGHT | input::L | input::R;
+
 /// Holds the game's key repeat countdown to real time while
-/// fast-forwarding.
+/// fast-forwarding, and tells when the game is in a menu away from the
+/// field.
 #[derive(Debug, Default)]
 pub struct KeyRepeat {
     /// Where the game keeps its pointer to the UI system, whose first word
@@ -236,6 +261,15 @@ pub struct KeyRepeat {
     /// What was done before the last frame, to undo if the game did not
     /// update its keys in it (it took longer than a frame).
     last: Option<Last>,
+    /// A scene other than the field (a menu, a battle, the title screen)
+    /// is running, going by the update count.
+    away_from_field: bool,
+    /// Frames in a row whose update count disagreed with `away_from_field`.
+    disagreeing: u8,
+    /// Menu keys held since before the scene left the field, such as a
+    /// direction still held from walking through a door or into tall grass.
+    /// They do not call for normal speed until they are released.
+    carried: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -260,6 +294,25 @@ impl KeyRepeat {
         self.system_pointer.is_some()
     }
 
+    /// Called as each frame starts with the `buttons` held (the constants
+    /// in `input`): whether the frame should run at normal speed. It does
+    /// while a direction, L or R pressed in a scene that is not the field
+    /// is held. Menus there count held keys in game frames in ways of their
+    /// own, so only real time keeps them at normal speed. Walking, and the
+    /// field's own menus, whose key repeat is held back instead, stay fast,
+    /// and so does a key still held from the field when the scene changes
+    /// (walking through a door, or into a wild battle), until it is
+    /// released.
+    pub fn wants_normal_speed(&mut self, buttons: u32) -> bool {
+        let held = buttons & MENU_KEYS;
+        if !self.away_from_field {
+            self.carried = held;
+            return false;
+        }
+        self.carried &= held;
+        held & !self.carried != 0
+    }
+
     /// Called as each frame starts, before the game updates its keys.
     pub fn frame(&mut self, ram: &mut [u8], step: Option<&Step>) {
         let Some(pointer) = self.system_pointer else {
@@ -269,6 +322,7 @@ impl KeyRepeat {
         let work = in_main_ram(system).then(|| read32(ram, system));
         let work = work.filter(|&work| in_main_ram(work));
         let count = ram[Memory::main_offset(system + UPDATE_COUNT)];
+        self.follow_scene(work.map(|_| count));
         // If the game did not update its keys in the last frame, a step held
         // back must not carry over, and credit spent was not used.
         if let Some(last) = self.last.take()
@@ -309,6 +363,25 @@ impl KeyRepeat {
                 count,
                 held: true,
             });
+        }
+    }
+
+    /// Follow the scene by the UI update `count` (`None` before the UI
+    /// exists, which counts as the field: nothing to slow down for).
+    fn follow_scene(&mut self, count: Option<u8>) {
+        let Some(count) = count else {
+            self.away_from_field = false;
+            self.disagreeing = 0;
+            return;
+        };
+        if (count > 1) == self.away_from_field {
+            self.disagreeing = 0;
+            return;
+        }
+        self.disagreeing += 1;
+        if self.disagreeing >= SCENE_FRAMES {
+            self.away_from_field = !self.away_from_field;
+            self.disagreeing = 0;
         }
     }
 }
@@ -532,11 +605,139 @@ mod tests {
     #[test]
     fn headless_steps_count_a_fraction_of_a_frame() {
         let mut pace = Pace::new(Arc::new(Speed::fixed(4)), false);
-        let steps: Vec<Step> = (0..4).map(|_| pace.start()).collect();
+        let steps: Vec<Step> = (0..4).map(|_| pace.start(false)).collect();
         assert!(steps.iter().all(|step| step.factor == 4 && pace.show(step)));
         let cycles: u64 = steps.iter().map(|step| step.sound_cycles).sum();
         assert!(cycles.abs_diff(CYCLES_PER_FRAME) <= 1);
         let mut pace = Pace::new(Arc::new(Speed::default()), false);
-        assert_eq!(pace.start().sound_cycles, CYCLES_PER_FRAME);
+        assert_eq!(pace.start(false).sound_cycles, CYCLES_PER_FRAME);
+    }
+
+    #[test]
+    fn a_frame_at_normal_speed_takes_a_whole_frame() {
+        let mut pace = Pace::new(Arc::new(Speed::fixed(4)), false);
+        let step = pace.start(true);
+        assert!(!step.is_fast());
+        assert_eq!(step.real_frames, 1.0);
+        assert_eq!(step.sound_cycles, CYCLES_PER_FRAME);
+        assert_eq!(pace.start(false).factor, 4);
+    }
+
+    /// The update count as the field leaves it (0 and 1 in turn) and as a
+    /// menu does (counting on and wrapping).
+    fn field_counts(frames: usize) -> impl Iterator<Item = u8> {
+        (0..frames).map(|frame| (frame % 2) as u8)
+    }
+
+    fn menu_counts(first: u8, frames: usize) -> impl Iterator<Item = u8> {
+        (0..frames).map(move |frame| first.wrapping_add(frame as u8))
+    }
+
+    fn follow(repeat: &mut KeyRepeat, counts: impl Iterator<Item = u8>) {
+        for count in counts {
+            repeat.follow_scene(Some(count));
+        }
+    }
+
+    #[test]
+    fn menus_away_from_the_field_are_told_by_the_update_count() {
+        let mut repeat = KeyRepeat::default();
+        follow(&mut repeat, field_counts(100));
+        assert!(!repeat.away_from_field);
+        // A lagging field frame lets the count reach 2 once.
+        follow(&mut repeat, [0, 1, 2, 0, 1].into_iter());
+        assert!(!repeat.away_from_field);
+        // The bag opens: the count runs on, and from its sixth frame past
+        // 1 the bag is taken to be running.
+        follow(&mut repeat, menu_counts(0, 7));
+        assert!(!repeat.away_from_field);
+        follow(&mut repeat, menu_counts(7, 1));
+        assert!(repeat.away_from_field);
+        // It wraps through 0 and 1 without leaving the menu.
+        follow(&mut repeat, menu_counts(5, 600));
+        assert!(repeat.away_from_field);
+        // Back on the field.
+        follow(&mut repeat, field_counts(5));
+        assert!(repeat.away_from_field);
+        follow(&mut repeat, field_counts(1));
+        assert!(!repeat.away_from_field);
+        // Before the UI exists there is nothing to tell.
+        follow(&mut repeat, menu_counts(0, 10));
+        repeat.follow_scene(None);
+        assert!(!repeat.away_from_field);
+    }
+
+    #[test]
+    fn held_directions_in_menus_run_at_normal_speed() {
+        let mut repeat = KeyRepeat::default();
+        follow(&mut repeat, field_counts(10));
+        // Walking stays fast.
+        assert!(!repeat.wants_normal_speed(input::LEFT));
+        follow(&mut repeat, menu_counts(2, 10));
+        for key in [
+            input::UP,
+            input::DOWN,
+            input::LEFT,
+            input::RIGHT,
+            input::L,
+            input::R,
+        ] {
+            assert!(repeat.wants_normal_speed(key | input::B));
+        }
+        // Nothing held, or only buttons that advance text: still fast.
+        assert!(!repeat.wants_normal_speed(0));
+        assert!(!repeat.wants_normal_speed(input::A | input::B | input::X | input::START));
+    }
+
+    #[test]
+    fn keys_held_from_the_field_stay_fast_until_released() {
+        let mut repeat = KeyRepeat::default();
+        // Walking down through a door: the field gives way to the warp
+        // while Down is still held.
+        for count in field_counts(10) {
+            repeat.follow_scene(Some(count));
+            assert!(!repeat.wants_normal_speed(input::DOWN));
+        }
+        for count in menu_counts(2, 60) {
+            repeat.follow_scene(Some(count));
+            assert!(!repeat.wants_normal_speed(input::DOWN));
+        }
+        assert!(repeat.away_from_field);
+        // Another key pressed there does call for normal speed, while the
+        // one carried over still does not.
+        assert!(repeat.wants_normal_speed(input::DOWN | input::LEFT));
+        assert!(!repeat.wants_normal_speed(input::DOWN));
+        // Released and pressed again, it is a key pressed in this scene.
+        assert!(!repeat.wants_normal_speed(0));
+        assert!(repeat.wants_normal_speed(input::DOWN));
+    }
+
+    #[test]
+    fn a_menu_lagging_as_its_count_wraps_stays_slow() {
+        let mut repeat = KeyRepeat::default();
+        follow(&mut repeat, field_counts(10));
+        follow(&mut repeat, menu_counts(2, 30));
+        assert!(repeat.wants_normal_speed(input::DOWN));
+        // Lag frames repeat the 0 and the 1 the count wraps through.
+        for count in [254, 255, 0, 0, 0, 1, 1, 2, 3] {
+            repeat.follow_scene(Some(count));
+            assert!(repeat.away_from_field);
+            assert!(repeat.wants_normal_speed(input::DOWN));
+        }
+    }
+
+    #[test]
+    fn the_scene_is_followed_from_the_ui_system() {
+        let mut ram = ram();
+        let mut repeat = KeyRepeat {
+            system_pointer: Some(POINTER),
+            ..KeyRepeat::default()
+        };
+        let count = Memory::main_offset(SYSTEM + UPDATE_COUNT);
+        for frame in 0..10 {
+            ram[count] = 5 + frame;
+            repeat.frame(&mut ram, None);
+        }
+        assert!(repeat.wants_normal_speed(input::DOWN));
     }
 }

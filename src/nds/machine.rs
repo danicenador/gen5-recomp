@@ -235,7 +235,9 @@ pub struct Machine {
     sound_frame: u64,
     /// Real time per frame, for pacing and fast-forward.
     pace: Option<Pace>,
-    /// Keeps menu key repeat at normal speed while fast-forwarding.
+    /// Keeps menu key repeat at normal speed while fast-forwarding, and
+    /// tells when held keys in a menu away from the field call for normal
+    /// speed.
     key_repeat: KeyRepeat,
     backup: Backup,
     firmware: Firmware,
@@ -526,7 +528,13 @@ impl Machine {
         // The ARM7 counts vertical blanks for OS_GetVBlankCount.
         let count = self.read32(VBLANK_COUNT);
         self.write32(VBLANK_COUNT, count.wrapping_add(1));
-        let step = self.pace.as_mut().map(Pace::start);
+        let buttons = self
+            .options
+            .input
+            .as_ref()
+            .map_or(0, |input| input.buttons());
+        let normal = self.key_repeat.wants_normal_speed(buttons);
+        let step = self.pace.as_mut().map(|pace| pace.start(normal));
         if let Some(input) = &self.options.input {
             let (keys, button_xy) = (input.keyinput(), input.button_xy());
             self.io.set16(io::KEYINPUT, keys);
