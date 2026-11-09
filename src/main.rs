@@ -5,6 +5,8 @@ use gen5::recomp::program::{ModuleId, Program, Resolution};
 use std::env;
 use std::path::{Path, PathBuf};
 
+mod help;
+
 fn main() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("gen5=info"));
@@ -20,6 +22,10 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if let Some(help) = help::requested(&args) {
+        println!("{}", help?);
+        return Ok(());
+    }
     match args.first().map(String::as_str) {
         Some("debug") => gen5::debug::launch(&args[1..]),
         Some("checkpoint") if args.len() == 5 => {
@@ -321,14 +327,14 @@ fn run() -> Result<(), String> {
                 .map_or_else(|| Path::new(".gen5-cache"), |path| Path::new(path));
             import(Path::new(&args[1]), cache_path)
         }
-        Some("help" | "--help" | "-h") if args.len() == 1 => {
-            print_usage();
-            Ok(())
-        }
-        _ => {
-            print_usage();
-            Err("invalid command or arguments".to_owned())
-        }
+        Some(name) => match help::command(name) {
+            Some(command) => Err(format!(
+                "wrong arguments for '{name}'\n\nUsage: {}\n\nRun `gen5 help {name}` for more.",
+                command.usage
+            )),
+            None => Err(format!("unknown command '{name}'\n\n{}", help::usage())),
+        },
+        None => unreachable!("no arguments print the help"),
     }
 }
 
@@ -810,8 +816,9 @@ fn import(path: &Path, cache_path: &Path) -> Result<(), String> {
     let report = importer::import_rom(rom, cache_path)?;
     println!("Imported {}", report.game.display_name());
     println!("ROM CRC-32: {:08X}", report.rom_crc32);
+    println!("Cache: {}", report.cache_path.display());
     if report.files_written == 0 {
-        println!("Cache already exists at {}", report.cache_path.display());
+        println!("Already imported; nothing was written");
     } else {
         println!(
             "Wrote {} original files ({}) to {}",
@@ -824,6 +831,7 @@ fn import(path: &Path, cache_path: &Path) -> Result<(), String> {
             report.cache_path.join("manifest.json").display()
         );
     }
+    println!("Next: gen5 analyze \"{}\"", report.cache_path.display());
     Ok(())
 }
 
@@ -840,24 +848,4 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{value:.2} {}", UNITS[unit])
     }
-}
-
-fn print_usage() {
-    eprintln!(
-        "gen5 — Pokémon Gen V ROM importer and static recompiler\n\n\
-         Usage:\n\
-         gen5 inspect <rom.nds>\n\
-         gen5 list <rom.nds> [path-prefix]\n\
-         gen5 code-info <rom.nds>\n\
-         gen5 analyze <import-cache-directory>\n\
-         gen5 codegen <import-cache-directory>\n\
-         gen5 build <import-cache-directory> [c-compiler]\n\
-         gen5 boot <import-cache-directory> <rom.nds> [frames [png-directory]]\n\
-         gen5 run <import-cache-directory> <rom.nds> [scale] [--fps=ds|display|uncapped|N] [--split-screens | --single-screen] [--widescreen]\n\
-         gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
-         gen5 import <rom.nds> [cache-directory]\n\
-         gen5 debug run|boot <import-cache-directory> <rom.nds> [--checkpoint=<directory>] [normal arguments]\n\
-         gen5 checkpoint <snapshot-directory> <destination-directory> \"description\" \"reproduction steps\"\n\
-         gen5 help"
-    );
 }

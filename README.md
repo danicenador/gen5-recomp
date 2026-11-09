@@ -8,6 +8,23 @@ An earlier prototype re-implemented the game by hand (map preview, field
 movement, an NPC script VM). It was removed in favour of recompilation and is
 kept at the `native-port-draft` tag.
 
+## Quick start
+
+You need Rust and a C compiler (gcc; MinGW-w64 on Windows) on `PATH`, and a
+dump of the game. Each step takes the cache directory that `import` prints:
+
+```text
+cargo run --release -- import "roms/Pokemon White Version 2.nds"
+cargo run --release -- analyze ".gen5-cache/pokemon-white-2/95AB5437"
+cargo run --release -- codegen ".gen5-cache/pokemon-white-2/95AB5437"
+cargo run --release -- build ".gen5-cache/pokemon-white-2/95AB5437"
+cargo run --release -- run ".gen5-cache/pokemon-white-2/95AB5437" "roms/Pokemon White Version 2.nds"
+```
+
+`gen5 help` (`cargo run --release -- help`) lists every command, and
+`gen5 help <command>` or `gen5 <command> --help` shows a command's
+arguments, options and, for `run`, the keys.
+
 ## ROM explorer and importer
 
 The CLI validates the NDS header checksums, checks the ROM section ranges, parses
