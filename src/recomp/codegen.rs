@@ -7,6 +7,8 @@
 //!
 //! - A call sets `lr` and calls the callee's C function directly when the
 //!   callee is known, or `rt_call` otherwise. A return is a C `return`.
+//! - An overlay function starts by checking that RAM still holds the bytes
+//!   it was compiled from, and otherwise goes through `rt_call`.
 //! - Tail calls call the target and return.
 //! - Switch tables become C `switch` statements over the known targets.
 //! - Words loaded from literal pools are folded into constants.
@@ -197,6 +199,7 @@ pub fn emit_function(analysis: &Analysis, module: &Module, function: &Function) 
         "void {}(Cpu *cpu) {{\n    uint32_t *r = cpu->r;\n    const uint32_t entry_sp = r[13];\n    (void)r;\n    (void)entry_sp;",
         function_name(function.key())
     );
+    out.push_str(&entry_guard(module, function));
     let checked_return = format!("RT_RETURN(0x{:08X}u);", function.address);
     // Code inside its caller's frame (a shared epilogue) moves sp itself.
     let epilogue = super::analysis::inside_caller_frame(module, function.address, function.thumb);
@@ -224,6 +227,54 @@ pub fn emit_function(analysis: &Analysis, module: &Module, function: &Function) 
     }
     out.push_str("}\n");
     out
+}
+
+/// How many bytes at the start of an overlay function its entry guard
+/// compares, as many as the runtime compares to pick a function to call.
+const GUARD_BYTES: u32 = 16;
+
+/// Overlay code can change while its overlay is loaded: Black 2 and White 2
+/// decrypt some functions in RAM before calling them, and encrypted bytes
+/// often decode as valid instructions, so a direct call can reach code
+/// compiled from bytes that are no longer there. An overlay function
+/// therefore starts by checking that RAM still holds the bytes it was
+/// compiled from; if not, it hands the call to the runtime, which runs what
+/// is really in RAM (another overlay's function, or the interpreter) and
+/// never picks this function, since it compares the same bytes and more.
+/// Main and autoload code never changes and is not checked.
+fn entry_guard(module: &Module, function: &Function) -> String {
+    if !matches!(module.id, ModuleId::Overlay(_)) {
+        return String::new();
+    }
+    let image_end = module.base + module.bytes.len() as u32;
+    let end = (function.address + GUARD_BYTES)
+        .min(function.end.max(function.address + 2))
+        .min(image_end);
+    let byte = |address: u32| u32::from(module.bytes[(address - module.base) as usize]);
+    let mut checks = Vec::new();
+    let mut address = function.address;
+    while address + 2 <= end {
+        if address.is_multiple_of(4) && address + 4 <= end {
+            let word = byte(address)
+                | byte(address + 1) << 8
+                | byte(address + 2) << 16
+                | byte(address + 3) << 24;
+            checks.push(format!("read32(cpu, {}) != {}", hex(address), hex(word)));
+            address += 4;
+        } else {
+            let half = byte(address) | byte(address + 1) << 8;
+            checks.push(format!("read16(cpu, {}) != {}", hex(address), hex(half)));
+            address += 2;
+        }
+    }
+    if checks.is_empty() {
+        return String::new();
+    }
+    format!(
+        "    if ({}) {{\n        rt_call(cpu, {});\n        return;\n    }}\n",
+        checks.join(" ||\n        "),
+        hex(function.address | u32::from(function.thumb))
+    )
 }
 
 impl Context<'_> {

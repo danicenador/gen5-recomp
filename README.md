@@ -135,6 +135,10 @@ Each instruction becomes a block of C, with labels at branch targets:
 
 - Direct calls set `lr` and call the callee's C function, and a return is a C
   `return`.
+- An overlay function first checks that RAM still holds the first 16 bytes
+  it was compiled from (fewer for a shorter function). If they changed
+  (another overlay is loaded there, or the game rewrote the code), it hands
+  the call to the runtime instead.
 - Switch tables become C `switch` statements.
 - Literal-pool loads are folded into constants.
 - Indirect calls, ambiguous cross-overlay calls, BIOS calls (`swi`) and
@@ -142,8 +146,8 @@ Each instruction becomes a block of C, with labels at branch targets:
 
 Unit tests compile generated code with gcc and run it to check ARM semantics:
 flags, shifter carry, unaligned and signed loads, writeback, push and pop, long
-multiplies, switch tables and runtime calls. The tests are skipped if gcc is
-not installed.
+multiplies, switch tables, runtime calls and the overlay entry check. The
+tests are skipped if gcc is not installed.
 
 For White 2, the generator emits 39,948 functions (209 MB of C in 260 files) in
 about 7 seconds. All files compile with `gcc -O1 -Wall` without warnings. The
@@ -485,9 +489,13 @@ The `nds` module provides:
 - `interpreter`: runs code with no recompiled function, such as routines the
   game copies to ITCM before running them, or jumps into a function's middle.
   Calls from it go back to native code. Black 2 and White 2 keep some overlay
-  functions encrypted and decrypt them in RAM before calling them; calls to
-  callees that do not decode cleanly go through the runtime, which sees the
-  decrypted code in RAM and interprets it.
+  functions encrypted and decrypt them in RAM before calling them (the party
+  screen's anti-piracy checks). The recompiled code for those functions comes
+  from the encrypted bytes, so it must not run. Calls to callees that do not
+  decode cleanly go through the runtime. Every overlay function also checks
+  its bytes in RAM when it is entered, so a direct call to code that was
+  decrypted is caught as well. In both cases the runtime finds the decrypted
+  code in RAM and interprets it.
 
 The ARM7 is not run. A stand-in answers the shared-RAM boot handshakes and
 the PXI start-up handshake, and serves the ARM7 services the game asks for

@@ -38,6 +38,17 @@ void rt_stack_mismatch(Cpu *c, uint32_t f, uint32_t sp) { (void)c; printf("stack
 /// Compile the function at BASE with gcc, run it after the `setup` C
 /// statements, and return the final state by name.
 fn run(name: &str, code: &[u8], thumb: bool, setup: &str) -> Option<HashMap<String, u32>> {
+    run_in(ModuleId::Main, name, code, thumb, setup)
+}
+
+/// `run` with the code in module `id` (an overlay gets an entry guard).
+fn run_in(
+    id: ModuleId,
+    name: &str,
+    code: &[u8],
+    thumb: bool,
+    setup: &str,
+) -> Option<HashMap<String, u32>> {
     if Command::new("gcc").arg("--version").output().is_err() {
         eprintln!("gcc not found; skipping codegen execution test");
         return None;
@@ -45,7 +56,7 @@ fn run(name: &str, code: &[u8], thumb: bool, setup: &str) -> Option<HashMap<Stri
     let program = Program {
         entry: BASE,
         modules: vec![Module {
-            id: ModuleId::Main,
+            id,
             base: BASE,
             bytes: code.to_vec(),
             bss_size: 0,
@@ -53,7 +64,7 @@ fn run(name: &str, code: &[u8], thumb: bool, setup: &str) -> Option<HashMap<Stri
         }],
     };
     let key = FunctionKey {
-        module: ModuleId::Main,
+        module: id,
         address: BASE,
     };
     let function = analyze_function(&program, key, thumb, &HashSet::new());
@@ -311,4 +322,36 @@ fn callee_with_decode_problems_goes_through_runtime() {
     let source = emit(true);
     assert!(!source.contains(&direct), "{source}");
     assert!(source.contains("rt_call(cpu, 0x02000010u)"), "{source}");
+}
+
+#[test]
+fn overlay_function_runs_only_while_ram_holds_its_code() {
+    // mov r0, #1 ; bx lr, in an overlay.
+    let code = arm(&[0xE3A0_0001, BX_LR]);
+    let overlay = ModuleId::Overlay(165);
+    let Some(s) = run_in(overlay, "guard_same", &code, false, "r[0] = 7;") else {
+        return;
+    };
+    assert_eq!(s["r0"], 1);
+    assert!(!s.contains_key("call"));
+
+    // The game rewrote the function in RAM (Black 2 and White 2 decrypt
+    // code in place): the code compiled from the old bytes must not run;
+    // the runtime is asked to run what is there instead.
+    let setup = "r[0] = 7; uint32_t w = 0xE3A00002; memcpy(ram, &w, 4);";
+    let s = run_in(overlay, "guard_arm", &code, false, setup).unwrap();
+    assert_eq!((s["r0"], s["call"]), (7, BASE));
+
+    // Thumb (movs r0, #1 ; nop ; nop ; bx lr): the call keeps the Thumb
+    // bit, and a change past the first word is seen too.
+    let code = thumb(&[0x2001, 0x46C0, 0x46C0, 0x4770]);
+    let s = run_in(overlay, "guard_thumb_same", &code, true, "r[0] = 7;").unwrap();
+    assert_eq!(s["r0"], 1);
+    let s = run_in(overlay, "guard_thumb", &code, true, "r[0] = 7; ram[4] = 0;").unwrap();
+    assert_eq!((s["r0"], s["call"]), (7, BASE | 1));
+
+    // Main code never changes and has no guard.
+    let setup = "r[0] = 7; uint32_t w = 0xE3A00002; memcpy(ram, &w, 4);";
+    let s = run("guard_main", &arm(&[0xE3A0_0001, BX_LR]), false, setup).unwrap();
+    assert_eq!(s["r0"], 1);
 }
