@@ -9,6 +9,7 @@
 use super::backup::{self, Backup};
 use super::card::{self, Card};
 use super::cpu::{Banks, Cpu, MODE_IRQ, MODE_SVC, MODE_SYSTEM};
+use super::field_menu::{self, FieldMenu};
 use super::firmware::{self, Firmware};
 use super::gpu2d::{self, Frame};
 use super::input::Input;
@@ -162,26 +163,35 @@ pub struct Options {
     /// in real time, as the window does. Headless runs leave it off and
     /// run as fast as they can.
     pub real_time: bool,
-    /// Where to keep the overlays in RAM, brought up to date every frame,
-    /// for telling scenes apart (single-screen mode raises the bottom
-    /// screen in battles and menus).
+    /// Where to keep the overlays in RAM and whether the field menu is
+    /// open, brought up to date every frame, for telling scenes apart
+    /// (single-screen mode raises the bottom screen in battles and menus).
     pub overlays: Option<Arc<LoadedOverlays>>,
 }
 
-/// The ARM9 overlays in RAM, sorted by number, as of the last frame.
+/// The ARM9 overlays in RAM, sorted by number, and whether the field menu
+/// (the X menu) is open, as of the last frame.
 #[derive(Default)]
-pub struct LoadedOverlays(std::sync::Mutex<Vec<u16>>);
+pub struct LoadedOverlays {
+    ids: std::sync::Mutex<Vec<u16>>,
+    field_menu: AtomicBool,
+}
 
 impl LoadedOverlays {
     pub fn get(&self) -> Vec<u16> {
-        self.0.lock().map(|ids| ids.clone()).unwrap_or_default()
+        self.ids.lock().map(|ids| ids.clone()).unwrap_or_default()
     }
 
     fn set(&self, ids: &[u16]) {
-        if let Ok(mut current) = self.0.lock() {
+        if let Ok(mut current) = self.ids.lock() {
             current.clear();
             current.extend_from_slice(ids);
         }
+    }
+
+    /// Whether the field menu, or a screen opened from it, is up.
+    pub fn field_menu(&self) -> bool {
+        self.field_menu.load(Ordering::Relaxed)
     }
 }
 
@@ -250,8 +260,14 @@ pub struct Machine {
     loaded: Vec<u16>,
     /// Words that tell each overlay is in RAM (`overlay_signatures`).
     signatures: Vec<(u16, Vec<(u32, u32)>)>,
+    /// Where the game keeps the state of its field menu, when its code was
+    /// recognised.
+    field_menu: Option<FieldMenu>,
+    /// Whether the field menu was open at the last frame.
+    field_menu_open: bool,
     /// GEN5_OVERLAY_LOG=path: each frame the overlays in RAM change, the
-    /// frame number and the overlays loaded and unloaded.
+    /// frame number and the overlays loaded and unloaded, and each frame
+    /// the field menu opens or closes.
     overlay_log: Option<fs::File>,
     _library: Library,
 }
@@ -1266,10 +1282,25 @@ impl Machine {
     }
 
     /// Bring `Options::overlays` and GEN5_OVERLAY_LOG up to date with the
-    /// overlays in RAM.
+    /// overlays in RAM and the field menu.
     fn track_overlays(&mut self) {
         if self.options.overlays.is_none() && self.overlay_log.is_none() {
             return;
+        }
+        let field_menu_open = self.field_menu.is_some_and(|menu| {
+            self.loaded.contains(&field_menu::OVERLAY) && menu.is_open(&self.memory.main)
+        });
+        if field_menu_open != self.field_menu_open {
+            self.field_menu_open = field_menu_open;
+            if let Some(log) = &mut self.overlay_log {
+                let state = if field_menu_open { "opens" } else { "closes" };
+                let _ = writeln!(log, "{}: field menu {state}", self.presented);
+            }
+            if let Some(overlays) = &self.options.overlays {
+                overlays
+                    .field_menu
+                    .store(field_menu_open, Ordering::Relaxed);
+            }
         }
         if self.signatures.is_empty() {
             self.signatures = overlay_signatures(&self.overlays);
@@ -2129,7 +2160,14 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
             ModuleId::Overlay(id) => Some((id, (module.base, module.bytes.clone()))),
             _ => None,
         })
-        .collect();
+        .collect::<HashMap<u16, (u32, Vec<u8>)>>();
+    let field_menu = FieldMenu::find(
+        &arm9,
+        manifest.arm9.binary.load_address,
+        overlays
+            .get(&field_menu::OVERLAY)
+            .map(|(base, code)| (*base, code.as_slice())),
+    );
 
     let cpu = Box::into_raw(Box::new(Cpu {
         r: [0; 16],
@@ -2194,6 +2232,8 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
             .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok()),
         loaded: Vec::new(),
         signatures: Vec::new(),
+        field_menu,
+        field_menu_open: false,
         overlay_log: std::env::var_os("GEN5_OVERLAY_LOG")
             .and_then(|path| fs::File::create(path).ok()),
         _library: library,

@@ -155,14 +155,11 @@ struct App {
     auto_scale: bool,
     /// The bottom screen raised over the top one, in single-screen mode.
     panel: Panel,
-    /// The overlays in RAM, which tell scenes apart.
+    /// The overlays in RAM and whether the X menu is open, which tell
+    /// scenes apart.
     overlays: Arc<LoadedOverlays>,
     /// Raises and lowers the bottom screen as scenes change.
     scene: SceneWatch,
-    /// Whether the X menu is open, as far as the keys tell (`x_menu_after`).
-    x_menu: bool,
-    /// The DS buttons held, keyboard and controllers together.
-    buttons: u32,
     /// The stylus the right stick moves on the raised bottom screen.
     pad_cursor: PadCursor,
     /// Alt held, for Alt+Enter.
@@ -361,7 +358,9 @@ const MENU_OVERLAYS: &[u16] = &[140, 142, 165, 207, 316];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scene {
     /// Walking around, or talking, on the overworld. The X menu opens over
-    /// it without overlays of its own.
+    /// it without overlays of its own, and so do some screens opened from
+    /// it (the Pokédex, the options, the save prompt), so whether it is
+    /// open is read from the game's events instead (`nds::field_menu`).
     Field,
     Battle,
     Menu,
@@ -383,25 +382,12 @@ fn scene(overlays: &[u16]) -> Scene {
 }
 
 /// Whether the bottom screen should be up in `scene`: in battles and menus,
-/// and on the field while the X menu is open.
+/// and on the field while the X menu, or a screen opened from it, is up.
 fn scene_wants_panel(scene: Scene, x_menu: bool) -> Option<bool> {
     match scene {
         Scene::Battle | Scene::Menu => Some(true),
         Scene::Field => Some(x_menu),
         Scene::Unknown => None,
-    }
-}
-
-/// Whether the X menu is open after the DS buttons in `pressed` were just
-/// pressed in `scene`. The overlays cannot tell, so this follows the keys:
-/// on the field X opens the menu and closes it, and B closes it. Menus
-/// opened from it come back to it, and a battle closes it.
-fn x_menu_after(open: bool, scene: Scene, pressed: u32) -> bool {
-    match scene {
-        Scene::Field if pressed & input::X != 0 => !open,
-        Scene::Field if pressed & input::B != 0 => false,
-        Scene::Battle => false,
-        _ => open,
     }
 }
 
@@ -591,8 +577,6 @@ impl App {
             panel: Panel::new(Instant::now()),
             overlays,
             scene: SceneWatch::new(Instant::now()),
-            x_menu: false,
-            buttons: 0,
             pad_cursor: PadCursor::new(Instant::now()),
             alt: false,
             widescreen,
@@ -799,7 +783,6 @@ impl App {
         self.input.set_modal(true);
         self.pressed = 0;
         self.pad_pressed = 0;
-        self.buttons = 0;
         self.blocked_pad = u32::MAX;
         self.pen_down = false;
         self.pad_cursor.touching = false;
@@ -817,7 +800,6 @@ impl App {
                 self.menu.open = false;
                 self.pressed = 0;
                 self.pad_pressed = 0;
-                self.buttons = 0;
                 self.blocked_pad = u32::MAX;
                 self.pen_down = false;
                 self.input.set_modal(false);
@@ -938,18 +920,12 @@ impl App {
         }
     }
 
-    fn update_buttons(&mut self) {
+    fn update_buttons(&self) {
         if self.menu.open {
             self.input.set_buttons(0);
             return;
         }
-        let buttons = self.pressed | self.pad_pressed;
-        let pressed = buttons & !self.buttons;
-        self.buttons = buttons;
-        if pressed != 0 && self.layout == Layout::Single {
-            self.x_menu = x_menu_after(self.x_menu, scene(&self.overlays.get()), pressed);
-        }
-        self.input.set_buttons(buttons);
+        self.input.set_buttons(self.pressed | self.pad_pressed);
     }
 
     fn poll_gamepads(&mut self, event_loop: &ActiveEventLoop) {
@@ -1081,15 +1057,12 @@ impl App {
         let now = Instant::now();
         let touchable = self.panel.touchable();
         let scene = scene(&self.overlays.get());
-        if scene == Scene::Battle {
-            self.x_menu = false;
-        }
         if self.layout == Layout::Single
             && self.settings.smart_bottom
             && !self.menu.open
             && let Some(up) = self
                 .scene
-                .update(now, scene_wants_panel(scene, self.x_menu))
+                .update(now, scene_wants_panel(scene, self.overlays.field_menu()))
             && up != self.panel.up
         {
             self.panel.toggle(now);
@@ -2714,20 +2687,45 @@ mod tests {
     }
 
     #[test]
-    fn keys_tell_when_the_x_menu_is_open() {
-        // X on the field opens it; menus from it come back to it.
-        let open = x_menu_after(false, Scene::Field, input::X);
-        assert!(open);
-        assert!(x_menu_after(open, Scene::Field, input::A | input::DOWN));
-        assert!(x_menu_after(open, Scene::Menu, input::B));
-        // B or X closes it; B alone on the field (running) keeps it shut.
-        assert!(!x_menu_after(open, Scene::Field, input::B));
-        assert!(!x_menu_after(open, Scene::Field, input::X));
-        assert!(!x_menu_after(false, Scene::Field, input::B));
-        // Keys elsewhere do not open it, and a battle closes it.
-        assert!(!x_menu_after(false, Scene::Menu, input::X));
-        assert!(!x_menu_after(false, Scene::Unknown, input::X));
-        assert!(!x_menu_after(true, Scene::Battle, input::A));
+    fn the_x_menu_holds_the_bottom_screen_up_until_it_closes() {
+        // The overlays and the game's field menu, step by step, as White 2
+        // showed them touring the X menu in the Pokémon Center and saving.
+        let field = [12, 27, 33, 35, 36, 65, 74, 80];
+        let pokedex = [12, 27, 33, 35, 36, 65, 74, 80, 301, 302];
+        let trainer_card = [12, 27, 33, 35, 65, 74, 80, 186];
+        let options = [12, 27, 33, 35, 36, 65, 74, 80, 139, 140];
+        let save = [12, 27, 33, 35, 36, 65, 74, 87];
+        let steps: [(&[u16], bool, Option<bool>); 12] = [
+            (&field, false, Some(false)),
+            // X opens the menu, which has no overlays of its own.
+            (&field, true, Some(true)),
+            // B in the Pokédex, the trainer card or the options goes back
+            // to the menu, which stays open.
+            (&pokedex, true, None),
+            (&field, true, None),
+            (&trainer_card, true, None),
+            (&field, true, None),
+            (&options, true, None),
+            (&field, true, None),
+            // Saving closes the menu by itself.
+            (&save, true, None),
+            (&field, false, Some(false)),
+            // B in the menu closes it too.
+            (&save, true, Some(true)),
+            (&field, false, Some(false)),
+        ];
+        let start = Instant::now();
+        let mut watch = SceneWatch::new(start);
+        for (step, &(overlays, menu, expected)) in steps.iter().enumerate() {
+            let wanted = scene_wants_panel(scene(overlays), menu);
+            let t = start + SCENE_SETTLE * 4 * step as u32;
+            assert_eq!(watch.update(t, wanted), None, "step {step}");
+            assert_eq!(
+                watch.update(t + SCENE_SETTLE * 2, wanted),
+                expected,
+                "step {step}"
+            );
+        }
     }
 
     #[test]

@@ -237,13 +237,19 @@ menus played on it and drops back on the overworld. The runtime tells
 scenes apart by the ARM9 overlays in RAM (see `scene_wants_panel` in
 `src/runtime/screen.rs`); a scene has to hold for 100 ms first, so map
 transitions pass unnoticed, and scenes it cannot tell (the title screen,
-the opening) leave the bottom screen where it is. L2 or Space still moves
-it at any time; the next scene change takes over again. On a controller,
-the right stick moves a stylus over the raised bottom screen, shown as a
-ring, and pressing the stick in touches with it (the ring fills); it hides
-three seconds after it last moved. `GEN5_OVERLAY_LOG=path` writes, for `run`
-or `boot`, each frame at which the overlays in RAM change, with those
-loaded and unloaded, for finding the overlays of new scenes.
+the opening) leave the bottom screen where it is. The X menu loads no
+overlays of its own, so the runtime reads the game's field events instead
+(`src/nds/field_menu.rs`): the bottom screen stays up while the menu or any
+screen opened from it (the Pokédex, the trainer card, the save prompt, ...)
+is up, and drops once the menu closes, whether by B, by X or by itself
+after saving. L2 or Space still moves it at any time; the next scene change
+takes over again. On a controller, the right stick moves a stylus over the
+raised bottom screen, shown as a ring, and pressing the stick in touches
+with it (the ring fills); it hides three seconds after it last moved.
+`GEN5_OVERLAY_LOG=path` writes, for `run` or `boot`, each frame at which the
+overlays in RAM change, with those loaded and unloaded, and each frame at
+which the field menu opens or closes, for finding the overlays of new
+scenes.
 
 F11 or Alt+Enter switches
 between full screen and a window, in any layout. `--single-screen` and

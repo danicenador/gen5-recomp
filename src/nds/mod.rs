@@ -4,6 +4,7 @@
 //! - `card`: the game card's ROM read commands.
 //! - `cpu`: CPU state shared with generated code, banked registers, PSRs.
 //! - `firmware`: the console's firmware flash (user and Wi-Fi settings).
+//! - `field_menu`: whether the game's field menu (the X menu) is open.
 //! - `memory`: the ARM9 address space as page tables over host buffers.
 //! - `vram`: the VRAM banks and their VRAMCNT mapping.
 //! - `io`: I/O registers (display timing, interrupts, DMA, math, IPC).
@@ -19,6 +20,7 @@
 pub mod backup;
 pub mod card;
 pub mod cpu;
+mod field_menu;
 pub mod firmware;
 pub mod gpu2d;
 pub mod gpu3d;
