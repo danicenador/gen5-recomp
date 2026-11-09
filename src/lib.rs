@@ -3,6 +3,7 @@
 //! A ROM explorer/importer, a static recompiler for the ARM9 code, and the
 //! Nintendo DS runtime the recompiled code runs on.
 
+pub mod debug;
 pub mod formats;
 pub mod importer;
 pub mod nds;

@@ -36,13 +36,18 @@ pub const RESULT_FAILURE: u32 = 1;
 pub struct Backup {
     pub data: Vec<u8>,
     path: PathBuf,
+    pub history: Option<crate::debug::History>,
 }
 
 impl Backup {
     /// Open the save file, or start with erased memory if there is none.
     pub fn open(path: PathBuf) -> Self {
         let data = fs::read(&path).unwrap_or_default();
-        Self { data, path }
+        Self {
+            data,
+            path,
+            history: None,
+        }
     }
 
     /// Size the memory to what the game's chip spec declares.

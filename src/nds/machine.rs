@@ -482,6 +482,11 @@ impl Machine {
             return;
         }
         self.presented = self.io.frame;
+        if let Some(history) = &mut self.backup.history
+            && let Err(error) = history.capture(self.presented, &self.backup.data, &self.firmware.data)
+        {
+            self.stop(&format!("debug save history: {error}"));
+        }
         // The ARM7 counts vertical blanks for OS_GetVBlankCount.
         let count = self.read32(VBLANK_COUNT);
         self.write32(VBLANK_COUNT, count.wrapping_add(1));
@@ -1108,8 +1113,13 @@ impl Machine {
             length,
             result,
         });
-        if changed && let Err(error) = self.backup.flush() {
-            self.stop(&error);
+        if changed && result == backup::RESULT_SUCCESS {
+            if let Err(error) = self.backup.flush() {
+                self.stop(&error);
+            }
+            if let Some(history) = &mut self.backup.history {
+                history.changed(self.io.frame);
+            }
         }
         result
     }
@@ -2032,6 +2042,14 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
             state_root.display()
         )
     })?;
+    let mut backup = Backup::open(state_root.join("save.bin"));
+    if let Some(root) = std::env::var_os("GEN5_DEBUG_HISTORY") {
+        backup.history = Some(crate::debug::History::open(root.into(), &backup.data)?);
+    }
+    let firmware = Firmware::open(state_root.join("firmware.bin"));
+    if backup.history.is_some() {
+        firmware.flush()?;
+    }
     let card = Card::open(rom)?;
     let code_dir = cache_root.join("code");
     let manifest_text = fs::read_to_string(code_dir.join("code.json"))
@@ -2132,8 +2150,8 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
             .as_ref()
             .map(|speed| Pace::new(speed.clone(), options.real_time)),
         key_repeat: KeyRepeat::find(&arm9, manifest.arm9.binary.load_address),
-        backup: Backup::open(state_root.join("save.bin")),
-        firmware: Firmware::open(state_root.join("firmware.bin")),
+        backup,
+        firmware,
         arm7_sync_output: 7,
         arm7_init_phase: 0,
         options,

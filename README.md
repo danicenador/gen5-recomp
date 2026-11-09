@@ -250,6 +250,15 @@ For isolated playthroughs, set `GEN5_STATE_DIR` to a separate directory; both
 code and assets stay in the original cache. `GEN5_BOOT_SECONDS` changes the
 headless watchdog (default 20 seconds; 0 disables it).
 
+For debug playthroughs with automatic save history, use `debug run <cache> <rom>`
+(or `debug boot <cache> <rom> [frames [png-directory]]`). Each launch creates an
+isolated working save under `debug/runs/`, ignored by Git. Add
+`--checkpoint=debug/checkpoints/<game>/<scenario>` to start from a copy of a named
+checkpoint. `checkpoint <source> <destination> "description" "reproduction steps"`
+promotes a selected snapshot for committing. See
+[debug/checkpoints/README.md](debug/checkpoints/README.md) for the workflow and
+the limits of automatic snapshot detection.
+
 From PowerShell, `./scripts/white2/replay.ps1` replays the fresh-game Juniper
 baseline to frame 2300. Each invocation creates a separate state directory,
 screenshots and report under `.gen5-cache/checkpoints/`. Reaching the requested

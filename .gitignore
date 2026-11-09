@@ -1,3 +1,4 @@
 /target
 /.gen5-cache
 /roms/*.nds
+/debug/runs/

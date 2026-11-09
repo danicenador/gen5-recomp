@@ -21,6 +21,10 @@ fn main() {
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("debug") => gen5::debug::launch(&args[1..]),
+        Some("checkpoint") if args.len() == 5 => {
+            gen5::debug::promote(Path::new(&args[1]), Path::new(&args[2]), &args[3], &args[4])
+        }
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
         Some("code-info") if args.len() == 2 => code_info(Path::new(&args[1])),
         Some("analyze") if args.len() == 2 => analyze(Path::new(&args[1])),
@@ -836,6 +840,8 @@ fn print_usage() {
          gen5 run <import-cache-directory> <rom.nds> [scale] [--fps=ds|display|uncapped|N] [--split-screens | --single-screen] [--widescreen]\n\
          gen5 disasm <import-cache-directory> <main|autoloadN|ovN> <address>\n\
          gen5 import <rom.nds> [cache-directory]\n\
+         gen5 debug run|boot <import-cache-directory> <rom.nds> [--checkpoint=<directory>] [normal arguments]\n\
+         gen5 checkpoint <snapshot-directory> <destination-directory> \"description\" \"reproduction steps\"\n\
          gen5 help"
     );
 }
