@@ -718,6 +718,23 @@ impl Machine {
         if address & !3 == card::ROMCTRL && size == 4 && value & card::ROMCTRL_BUSY != 0 {
             self.start_card_transfer(value);
         }
+        if (address..address + size).contains(&card::AUXSPIDATA) {
+            self.backup_spi_transfer();
+        }
+    }
+
+    /// A byte written to AUXSPIDATA goes out on the card's SPI bus at once,
+    /// and the byte read back replaces it.
+    fn backup_spi_transfer(&mut self) {
+        let control = self.io.get16(card::AUXSPICNT);
+        let spi = card::AUXSPICNT_ENABLE | card::AUXSPICNT_SPI;
+        if control & spi != spi {
+            return;
+        }
+        let value = self.io.get8(card::AUXSPIDATA);
+        let hold = control & card::AUXSPICNT_HOLD != 0;
+        let reply = self.card.spi.transfer(value, hold);
+        self.io.set16(card::AUXSPIDATA, u16::from(reply));
     }
 
     /// VRAMCNT changed: remap the banks (0x04000247 is WRAMCNT, not a bank).

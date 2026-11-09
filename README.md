@@ -454,7 +454,13 @@ The `nds` module provides:
   ROM file, including card-triggered DMA and the transfer-complete
   interrupt. Like a retail card, addresses wrap at the chip size from the
   header and reads below 0x8000 return data from 0x8000; Black 2 and
-  White 2's anti-piracy code checks both.
+  White 2's anti-piracy code checks both. Bytes written to AUXSPIDATA in
+  SPI mode go to the card's backup bus: on cards whose game code starts
+  with `I` an infrared chip sits in front of the flash and answers its ID
+  command (0x08) with 0xAA. Black 2 and White 2 ask for it before a battle
+  awards experience, so without it no Pokémon gains EXP. The flash itself
+  is not on this bus here (saves go through the ARM7 stand-in) and reads
+  0xFF.
 - `cpu`: banked registers, CPSR and SPSR, and exception entry and return.
 - `machine`: boot as the firmware leaves memory, CP15, BIOS calls (waits,
   division, copies, CRC, LZ77 and RLE), and interrupt delivery through the
