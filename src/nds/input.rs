@@ -3,7 +3,7 @@
 //! KEYINPUT; X and Y come from the ARM7 through shared RAM, and touch
 //! samples are left there when the ARM7 answers a sampling request.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub const A: u32 = 1 << 0;
 pub const B: u32 = 1 << 1;
@@ -22,6 +22,10 @@ const TOUCHING: u32 = 1 << 16;
 
 #[derive(Default)]
 pub struct Input {
+    modal: AtomicBool,
+    frame: AtomicU64,
+    options_until: AtomicU64,
+    gpu_requested: AtomicBool,
     /// Pressed buttons, using the constants above.
     buttons: AtomicU32,
     /// Bottom-screen pixel: x in bits 0-7, y in bits 8-15, bit 16 set while
@@ -30,12 +34,45 @@ pub struct Input {
 }
 
 impl Input {
+    pub fn set_gpu_requested(&self, requested: bool) {
+        self.gpu_requested.store(requested, Ordering::Relaxed);
+    }
+    pub fn gpu_requested(&self) -> bool {
+        self.gpu_requested.load(Ordering::Relaxed)
+    }
+    pub fn set_modal(&self, modal: bool) {
+        self.set_buttons(0);
+        self.set_touch(None);
+        self.modal.store(modal, Ordering::Release);
+    }
+    /// Wait only at a guest frame boundary, keeping the host UI responsive.
+    pub fn wait_for_ui(&self) -> bool {
+        let waited = self.modal.load(Ordering::Acquire);
+        while self.modal.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        waited
+    }
+    pub fn set_frame(&self, frame: u64) {
+        self.frame.store(frame, Ordering::Relaxed);
+    }
+    pub fn mark_native_options(&self, frame: u64) {
+        self.options_until.store(frame + 2, Ordering::Relaxed);
+    }
+    pub fn native_options(&self) -> bool {
+        let until = self.options_until.load(Ordering::Relaxed);
+        until != 0 && self.frame.load(Ordering::Relaxed) <= until
+    }
     pub fn set_buttons(&self, pressed: u32) {
         self.buttons.store(pressed, Ordering::Relaxed);
     }
 
     pub fn buttons(&self) -> u32 {
-        self.buttons.load(Ordering::Relaxed)
+        if self.modal.load(Ordering::Acquire) {
+            0
+        } else {
+            self.buttons.load(Ordering::Relaxed)
+        }
     }
 
     pub fn set_touch(&self, point: Option<(u8, u8)>) {
@@ -44,6 +81,9 @@ impl Input {
     }
 
     fn touch(&self) -> Option<(u32, u32)> {
+        if self.modal.load(Ordering::Acquire) {
+            return None;
+        }
         let value = self.touch.load(Ordering::Relaxed);
         (value & TOUCHING != 0).then_some((value & 0xFF, (value >> 8) & 0xFF))
     }
@@ -83,6 +123,38 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modal_menu_releases_input_and_pauses_until_closed() {
+        let input = std::sync::Arc::new(Input::default());
+        input.set_buttons(A | DOWN);
+        input.set_touch(Some((20, 30)));
+        input.set_modal(true);
+        assert_eq!(input.keyinput(), 0x3ff);
+        assert_eq!(input.touch_sample(), 0);
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker_input = input.clone();
+        let worker = std::thread::spawn(move || {
+            send.send(worker_input.wait_for_ui()).unwrap();
+        });
+        assert!(
+            recv.recv_timeout(std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        input.set_modal(false);
+        assert!(
+            recv.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        );
+        worker.join().unwrap();
+        assert_eq!(input.buttons(), 0);
+        assert_eq!(input.touch_sample(), 0);
+        input.set_frame(10);
+        input.mark_native_options(10);
+        assert!(input.native_options());
+        input.set_frame(13);
+        assert!(!input.native_options());
+    }
 
     #[test]
     fn registers_are_active_low() {

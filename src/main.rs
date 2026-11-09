@@ -227,9 +227,7 @@ fn run() -> Result<(), String> {
                                 .map_err(|_| "invalid GEN5_SPEED".to_owned())
                         })
                         .transpose()?
-                        .map(|factor| {
-                            std::sync::Arc::new(gen5::nds::speed::Speed::fixed(factor))
-                        }),
+                        .map(|factor| std::sync::Arc::new(gen5::nds::speed::Speed::fixed(factor))),
                     real_time: false,
                     overlays: None,
                 },
@@ -237,10 +235,21 @@ fn run() -> Result<(), String> {
         }
         Some("run") if (3..=8).contains(&args.len()) => {
             use gen5::runtime::screen::Layout;
-            let mut scale = None;
+            use gen5::runtime::settings::Settings;
+            let settings_path = Settings::path(Path::new(&args[1]));
+            let mut settings = Settings::load(&settings_path)?;
+            let mut scale = settings.scale;
+            let mut explicit_scale = false;
             let mut fps = None;
-            let mut layout = Layout::Stacked;
-            let mut widescreen = widescreen_from_env();
+            let mut layout = settings.layout;
+            let mut chosen_layout = None;
+            let mut widescreen = settings.widescreen;
+            if std::env::var_os("GEN5_WIDESCREEN").is_some() {
+                widescreen = widescreen_from_env();
+            }
+            if std::env::var_os("GEN5_SCALE").is_some() {
+                scale = Some(scale_from_env()?);
+            }
             for value in &args[3..] {
                 let chosen = match value.as_str() {
                     "--split-screens" => Some(Layout::Split),
@@ -248,17 +257,23 @@ fn run() -> Result<(), String> {
                     _ => None,
                 };
                 if let Some(chosen) = chosen {
-                    if layout != Layout::Stacked && layout != chosen {
+                    if chosen_layout.is_some_and(|layout| layout != chosen) {
                         return Err(
                             "--split-screens and --single-screen cannot be combined".to_owned()
                         );
                     }
                     layout = chosen;
+                    chosen_layout = Some(chosen);
+                    if layout == Layout::Single {
+                        settings.fullscreen = true;
+                        widescreen = true;
+                    }
                 } else if value == "--widescreen" {
                     widescreen = true;
                 } else if let Some(mode) = value.strip_prefix("--fps=") {
                     fps = Some(gen5::runtime::pacing::Fps::parse(mode)?);
                 } else {
+                    explicit_scale = true;
                     scale = Some(
                         value
                             .trim_start_matches("--scale=")
@@ -267,28 +282,29 @@ fn run() -> Result<(), String> {
                     );
                 }
             }
-            // Single-screen mode picks a resolution for the monitor unless
-            // told one.
-            let scale = match scale {
-                Some(scale) => Some(scale),
-                None if layout == Layout::Single && std::env::var_os("GEN5_SCALE").is_none() => {
-                    None
-                }
-                None => Some(scale_from_env()?),
-            };
+            if chosen_layout == Some(Layout::Single)
+                && !explicit_scale
+                && std::env::var_os("GEN5_SCALE").is_none()
+            {
+                scale = None;
+            }
+            settings.scale = scale;
+            settings.layout = layout;
+            settings.widescreen = widescreen;
             let fps = match fps {
-                Some(fps) => fps,
-                None => fps_from_env()?,
+                Some(fps) => {
+                    settings.interpolate = fps.interpolates();
+                    fps
+                }
+                None if std::env::var_os("GEN5_FPS").is_some() => {
+                    let fps = fps_from_env()?;
+                    settings.interpolate = fps.interpolates();
+                    fps
+                }
+                None if settings.interpolate => gen5::runtime::pacing::Fps::Display,
+                None => gen5::runtime::pacing::Fps::Ds,
             };
-            gen5::runtime::play_recompiled(
-                Path::new(&args[1]),
-                Path::new(&args[2]),
-                scale,
-                fps,
-                layout,
-                // Single-screen mode is built around a 16:9 top screen.
-                widescreen || layout == Layout::Single,
-            )
+            gen5::runtime::play_recompiled(Path::new(&args[1]), Path::new(&args[2]), fps, settings)
         }
         Some("disasm") if args.len() == 4 => {
             let module = args[2].parse::<ModuleId>()?;

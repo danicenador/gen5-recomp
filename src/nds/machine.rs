@@ -343,6 +343,16 @@ pub(super) unsafe fn get<'a>(cpu: *mut Cpu) -> &'a mut Machine {
 }
 
 impl Machine {
+    /// The hook observes the original Options state without changing guest registers or memory.
+    pub(super) fn observe_options(&mut self) {
+        let state = self.cpu().r[1];
+        if (0x0200_0000..0x0240_0000).contains(&state)
+            && self.read32(state) == 0
+            && let Some(input) = &self.options.input
+        {
+            input.mark_native_options(self.io.frame);
+        }
+    }
     /// The current display frame.
     pub(super) fn frame(&self) -> u64 {
         self.io.frame
@@ -482,8 +492,18 @@ impl Machine {
             return;
         }
         self.presented = self.io.frame;
+        if let Some(input) = &self.options.input {
+            input.set_frame(self.presented);
+            if input.wait_for_ui() {
+                if let Some(pace) = &mut self.pace {
+                    pace.reset();
+                }
+                self.timing.last = None;
+            }
+        }
         if let Some(history) = &mut self.backup.history
-            && let Err(error) = history.capture(self.presented, &self.backup.data, &self.firmware.data)
+            && let Err(error) =
+                history.capture(self.presented, &self.backup.data, &self.firmware.data)
         {
             self.stop(&format!("debug save history: {error}"));
         }
@@ -599,6 +619,11 @@ impl Machine {
         let scaled = self.options.scale.load(Ordering::Relaxed) > 1
             || self.force_gpu
             || self.options.gpu
+            || self
+                .options
+                .input
+                .as_ref()
+                .is_some_and(|input| input.gpu_requested())
             || self.io.geometry.wide;
         let frame =
             (render && self.options.on_frame.is_some() || self.profile.is_some()).then(|| {
@@ -2234,7 +2259,9 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         table.len()
     );
     if machine.options.speed.is_some() && !machine.key_repeat.is_found() {
-        eprintln!("fast-forward: this game's key repeat was not recognised, so menus will repeat keys faster too");
+        eprintln!(
+            "fast-forward: this game's key repeat was not recognised, so menus will repeat keys faster too"
+        );
     }
     // The machine is reached through `cpu.runtime` from here on.
     let machine = Box::leak(machine);

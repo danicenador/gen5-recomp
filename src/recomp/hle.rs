@@ -19,6 +19,8 @@ pub enum Hle {
     /// an interrupt made a higher-priority thread ready. r12 holds the
     /// thread info block; the IRQ stack holds the handler's saved `lr`.
     IrqThreadSwitch = 3,
+    /// Observe the original Options input loop; its original body still runs.
+    OptionsInput = 4,
 }
 
 /// (word, mask) pairs: masked bits must match; the rest are literal-pool
@@ -80,10 +82,104 @@ pub fn detect_inline(module: &Module, address: u32, thumb: bool) -> Option<Hle> 
     (!thumb && matches(module, address, IRQ_THREAD_SWITCH)).then_some(Hle::IrqThreadSwitch)
 }
 
+/// English BW2 ConfigPanelSeq_Input, identified by module, size, offset and instructions.
+/// Addresses differ between Black 2 and White 2; these instructions do not.
+/// Symbol reference: fuddlesworth/pokebw2, src/ov140/config_panel.c.
+pub fn observes_options(module: &Module, address: u32, thumb: bool) -> bool {
+    use super::program::ModuleId;
+    const PREFIX: &[u8] = &[
+        0xf0, 0xb5, 0x97, 0xb0, 0x96, 0x26, 0x14, 0x1c, 0xb6, 0x00, 0x07, 0x1c, 0xa0, 0x59, 0x0d,
+        0x1c,
+    ];
+    thumb
+        && module.id == ModuleId::Overlay(140)
+        && module.bytes.len() == 8992
+        && address == module.base + 0x1c48
+        && module.bytes.get(0x1c48..0x1c58) == Some(PREFIX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::recomp::program::ModuleId;
+
+    #[test]
+    fn options_observer_rejects_other_overlays_and_changed_instructions() {
+        let mut module = Module {
+            id: ModuleId::Overlay(140),
+            base: 0x0219cec0,
+            bytes: vec![0; 8992],
+            bss_size: 0,
+            sinit: None,
+        };
+        module.bytes[0x1c48..0x1c58].copy_from_slice(&[
+            0xf0, 0xb5, 0x97, 0xb0, 0x96, 0x26, 0x14, 0x1c, 0xb6, 0, 7, 0x1c, 0xa0, 0x59, 0x0d,
+            0x1c,
+        ]);
+        let address = module.base + 0x1c48;
+        assert!(observes_options(&module, address, true));
+        assert!(!observes_options(&module, address, false));
+        assert!(!observes_options(&module, address + 2, true));
+        module.id = ModuleId::Overlay(141);
+        assert!(!observes_options(&module, address, true));
+        module.id = ModuleId::Overlay(140);
+        module.bytes[0x1c48] ^= 1;
+        assert!(!observes_options(&module, address, true));
+    }
+
+    #[test]
+    #[ignore = "requires locally supplied English Black 2 and White 2 ROMs"]
+    fn native_observer_matches_local_roms_and_preserves_original_code() {
+        use crate::formats::nds::{Cpu, NdsRom};
+        use crate::recomp::{
+            analysis::{Analysis, FunctionKey, analyze_function},
+            codegen,
+            program::Program,
+        };
+        use std::collections::{BTreeMap, HashSet};
+        for name in [
+            "Pokemon White Version 2.nds",
+            "Pokemon Black Version 2 .nds",
+        ] {
+            let mut rom = NdsRom::open(&std::path::Path::new("roms").join(name)).unwrap();
+            let entry = rom
+                .overlay_table(Cpu::Arm9)
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.id == 140)
+                .unwrap();
+            let bytes = rom.overlay_image(&entry).unwrap();
+            let module = Module {
+                id: ModuleId::Overlay(140),
+                base: entry.ram_address,
+                bytes,
+                bss_size: 0,
+                sinit: None,
+            };
+            let address = module.base + 0x1c48;
+            assert!(observes_options(&module, address, true), "{name}");
+            let mut program = Program {
+                entry: address,
+                modules: vec![module],
+            };
+            let key = FunctionKey {
+                module: ModuleId::Overlay(140),
+                address,
+            };
+            let function = analyze_function(&program, key, true, &HashSet::new());
+            let analysis = Analysis {
+                functions: BTreeMap::from([(key, function)]),
+                ..Analysis::default()
+            };
+            let hooked =
+                codegen::emit_function(&analysis, &program.modules[0], &analysis.functions[&key]);
+            assert_eq!(hooked.matches("rt_hle(cpu, 4);").count(), 1);
+            program.modules[0].bytes[0x1c48] ^= 1;
+            let original =
+                codegen::emit_function(&analysis, &program.modules[0], &analysis.functions[&key]);
+            assert_eq!(hooked.replace("    /* Observe Options input without replacing the game menu. */\n    rt_hle(cpu, 4);\n",""),original);
+        }
+    }
 
     #[test]
     fn detects_context_routines_by_pattern() {

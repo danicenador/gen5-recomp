@@ -157,6 +157,47 @@ turns fast-forward on and off, like Tab, and in single-screen mode the left
 trigger raises and lowers the bottom screen, like Space, and the right
 stick moves a stylus on it that pressing the stick touches with.
 
+### PC settings menu
+
+Press **F1** or click the controller's **left stick** to open PC Settings
+at any time. The game pauses while the menu is open. Use the D-pad or arrow
+keys to select a row, left/right to change it, A (keyboard X or Enter) to
+confirm, and B (keyboard Z or Escape) to go back. Mouse clicks work too;
+the mouse wheel scrolls the mappings. Menu navigation keeps these defaults
+even after gameplay controls are remapped, and F1 remains a recovery shortcut.
+
+On the supported English Black 2 / White 2 builds, the original **Options**
+screen also has a **Y: PC Settings** button beside its existing bottom-screen
+buttons. Tap it or press the DS Y button (keyboard A by default) to open the
+same submenu. Closing it returns to the original Options screen, preserving
+any edits to the game's own options. This entry observes the game's actual
+Options input routine rather than guessing from X presses. Other builds keep
+the F1 / left-stick entry point when their Options routine does not match.
+
+After updating an existing import, run `codegen <cache>` and `build <cache>`
+once to include the Options observer in the game library. No ROM patch or
+save conversion is needed. The observer's identification was checked against
+the local English Black 2 and White 2 ROMs; function names were cross-referenced
+with [pokebw2's Options source](https://github.com/fuddlesworth/pokebw2/blob/main/src/ov140/config_panel.c).
+
+The submenu controls render resolution (Auto or 1x-8x), 4:3 / 16:9, single /
+stacked / separate-window layouts, fullscreen, Manual / Smart bottom-screen
+behavior, fast-forward and its 2x-8x speed, 3D interpolation, stylus sensitivity,
+stick dead zone, and keyboard/controller mappings. Manual mode leaves the
+bottom screen under the player's control; Smart mode follows scene changes
+and still allows manual toggles. Layout changes take effect without restarting
+the game. Controller binding names are physical positions: East is the right
+face button, South the bottom one, North the top one, and West the left one.
+
+To remap, select an action and press the new key or controller button. A button
+assigned elsewhere moves to the new action. Escape cancels capture; Delete
+clears the selected binding. Restore Defaults asks for a second confirmation.
+Changes, including the existing display/speed shortcuts, are saved in
+`<cache>/pc-settings.json`, separately from `save.bin` and `firmware.bin`.
+`GEN5_SETTINGS_FILE=path` selects an isolated preferences file for testing.
+Explicit launch flags and environment settings override saved preferences at
+launch. A settings-file error is reported instead of silently overwriting it.
+
 Add `--split-screens` to `run` to put the top and bottom DS screens in
 separate, independently resizable windows. Keyboard controls work in either
 window; the mouse acts as the stylus only in the bottom-screen window.

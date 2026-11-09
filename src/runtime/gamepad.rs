@@ -8,21 +8,46 @@
 //! screen the right stick moves a stylus that pressing the stick touches
 //! with.
 
+use super::settings::{ACTION_COUNT, Bindings, FAST_FORWARD, FULLSCREEN, MENU, PANEL, TOUCH};
 use crate::nds::input;
 use gilrs::{Axis, Button, Gilrs};
 
 /// How far the stick must lean to press a direction.
+#[cfg(test)]
 const STICK_THRESHOLD: f32 = 0.5;
+const ALL_BUTTONS: [Button; 19] = [
+    Button::South,
+    Button::East,
+    Button::North,
+    Button::West,
+    Button::C,
+    Button::Z,
+    Button::LeftTrigger,
+    Button::LeftTrigger2,
+    Button::RightTrigger,
+    Button::RightTrigger2,
+    Button::Select,
+    Button::Start,
+    Button::Mode,
+    Button::LeftThumb,
+    Button::RightThumb,
+    Button::DPadUp,
+    Button::DPadDown,
+    Button::DPadLeft,
+    Button::DPadRight,
+];
 
 pub struct Gamepads {
     gilrs: Gilrs,
     fast_forward_held: bool,
     panel_held: bool,
+    actions_held: u32,
 }
 
 /// What the controllers are doing right now.
 #[derive(Default, Clone, Copy, PartialEq, Debug)]
 pub struct State {
+    pub held_actions: u32,
     /// DS buttons held, using the `input` constants.
     pub buttons: u32,
     /// The fast-forward button was pressed since the last poll.
@@ -34,6 +59,10 @@ pub struct State {
     pub right_stick: (f32, f32),
     /// The right stick is pressed in: the stylus touches.
     pub touch: bool,
+    pub toggle_menu: bool,
+    pub toggle_fullscreen: bool,
+    pub capture: Option<Button>,
+    pub menu_buttons: u32,
 }
 
 const BUTTONS: [(Button, u32); 12] = [
@@ -64,6 +93,7 @@ impl Gamepads {
                     gilrs,
                     fast_forward_held: false,
                     panel_held: false,
+                    actions_held: 0,
                 })
             }
             Err(error) => {
@@ -73,7 +103,8 @@ impl Gamepads {
         }
     }
 
-    pub fn poll(&mut self) -> State {
+    pub fn poll(&mut self, bindings: &Bindings, dead_zone: f32) -> State {
+        let mut capture = None;
         while let Some(event) = self.gilrs.next_event() {
             match event.event {
                 gilrs::EventType::Connected => tracing::info!(
@@ -81,6 +112,9 @@ impl Gamepads {
                     self.gilrs.gamepad(event.id).name()
                 ),
                 gilrs::EventType::Disconnected => tracing::info!("controller disconnected"),
+                gilrs::EventType::ButtonPressed(button, _) if ALL_BUTTONS.contains(&button) => {
+                    capture = Some(button)
+                }
                 _ => {}
             }
         }
@@ -89,16 +123,33 @@ impl Gamepads {
         let mut panel = false;
         let mut right_stick = (0.0f32, 0.0f32);
         let mut touch = false;
+        let mut actions = 0u32;
+        let mut menu_buttons = 0;
         for (_, gamepad) in self.gilrs.gamepads() {
-            for (button, bit) in BUTTONS {
-                if gamepad.is_pressed(button) {
-                    buttons |= bit;
+            for button in ALL_BUTTONS {
+                if !gamepad.is_pressed(button) {
+                    continue;
+                }
+                let name = format!("{button:?}");
+                for (action, bound) in bindings.controller.iter().enumerate().take(ACTION_COUNT) {
+                    if *bound == name {
+                        actions |= 1 << action;
+                    }
                 }
             }
-            buttons |= stick(gamepad.value(Axis::LeftStickX), gamepad.value(Axis::LeftStickY));
-            fast_forward |= gamepad.is_pressed(Button::RightTrigger2);
-            panel |= gamepad.is_pressed(Button::LeftTrigger2);
-            touch |= gamepad.is_pressed(Button::RightThumb);
+            let directions = stick_with_threshold(
+                gamepad.value(Axis::LeftStickX),
+                gamepad.value(Axis::LeftStickY),
+                dead_zone,
+            );
+            buttons |= directions;
+            menu_buttons |= directions;
+            // Menu navigation always has a recovery path, independent of gameplay bindings.
+            for (button, bit) in BUTTONS {
+                if gamepad.is_pressed(button) {
+                    menu_buttons |= bit;
+                }
+            }
             // The controller leaning furthest steers.
             let (x, y) = (
                 gamepad.value(Axis::RightStickX),
@@ -108,33 +159,49 @@ impl Gamepads {
                 right_stick = (x, y);
             }
         }
+        buttons |= actions & 0xFFF;
+        fast_forward |= actions & (1 << FAST_FORWARD) != 0;
+        panel |= actions & (1 << PANEL) != 0;
+        touch |= actions & (1 << TOUCH) != 0;
+        let newly_pressed = actions & !self.actions_held;
+        self.actions_held = actions;
         let toggle_fast_forward = fast_forward && !self.fast_forward_held;
         self.fast_forward_held = fast_forward;
         let toggle_panel = panel && !self.panel_held;
         self.panel_held = panel;
         State {
+            held_actions: actions,
             buttons,
             toggle_fast_forward,
             toggle_panel,
             right_stick,
             touch,
+            toggle_menu: newly_pressed & (1 << MENU) != 0,
+            toggle_fullscreen: newly_pressed & (1 << FULLSCREEN) != 0,
+            capture,
+            menu_buttons,
         }
     }
 }
 
 /// D-pad bits for a stick position (y up is positive).
+#[cfg(test)]
 fn stick(x: f32, y: f32) -> u32 {
+    stick_with_threshold(x, y, STICK_THRESHOLD)
+}
+
+fn stick_with_threshold(x: f32, y: f32, threshold: f32) -> u32 {
     let mut buttons = 0;
-    if x <= -STICK_THRESHOLD {
+    if x <= -threshold {
         buttons |= input::LEFT;
     }
-    if x >= STICK_THRESHOLD {
+    if x >= threshold {
         buttons |= input::RIGHT;
     }
-    if y >= STICK_THRESHOLD {
+    if y >= threshold {
         buttons |= input::UP;
     }
-    if y <= -STICK_THRESHOLD {
+    if y <= -threshold {
         buttons |= input::DOWN;
     }
     buttons

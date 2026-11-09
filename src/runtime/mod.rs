@@ -3,6 +3,8 @@ pub mod gamepad;
 pub mod pacing;
 pub mod scaled;
 pub mod screen;
+pub mod settings;
+mod settings_menu;
 
 use crate::Result;
 use std::path::{Path, PathBuf};
@@ -10,29 +12,23 @@ use std::sync::Arc;
 
 /// Play the recompiled game in a window: the game runs on its own threads,
 /// paced to the DS frame rate (or a multiple of it while fast-forwarding,
-/// Tab), and the window shows its frames, drawn at `scale` times the DS
-/// resolution (keys 1-8 change it). The window draws as often as `fps`
-/// says, interpolating 3D between game frames. `layout` stacks the DS
-/// screens in one window, puts each in its own, or shows the top one with
-/// the bottom one raised over it on demand. `widescreen` draws the top
-/// screen 16:9 (H turns it off and on). With no `scale`, single-screen mode
-/// picks one for the monitor.
+/// Tab), and the window draws as often as `fps` says. PC preferences
+/// choose resolution, screen layout, widescreen, interpolation and controls;
+/// the in-game PC Settings menu and shortcuts edit the same values.
 pub fn play_recompiled(
     cache_root: &Path,
     rom: &Path,
-    scale: Option<u32>,
     fps: pacing::Fps,
-    layout: screen::Layout,
-    widescreen: bool,
+    mut settings: settings::Settings,
 ) -> Result<()> {
     use crate::nds::{input::Input, machine, speed::Speed};
-    let auto_scale = scale.is_none();
     let scale = Arc::new(std::sync::atomic::AtomicU32::new(
-        scale.unwrap_or(1).clamp(1, screen::MAX_SCALE),
+        settings.scale.unwrap_or(1).clamp(1, screen::MAX_SCALE),
     ));
-    let widescreen = Arc::new(std::sync::atomic::AtomicBool::new(widescreen));
+    let widescreen = Arc::new(std::sync::atomic::AtomicBool::new(settings.widescreen));
     let screens = Arc::new(screen::Screens::default());
     let input = Arc::new(Input::default());
+    input.set_gpu_requested(settings.interpolate);
     // GEN5_SPEED=N starts fast-forwarding at N times the game speed.
     let speed = Arc::new(match std::env::var("GEN5_SPEED") {
         Ok(value) => Speed::fixed(
@@ -40,8 +36,18 @@ pub fn play_recompiled(
                 .parse()
                 .map_err(|_| format!("invalid GEN5_SPEED: {value}"))?,
         ),
-        Err(_) => Speed::default(),
+        Err(_) => {
+            let speed = Speed::default();
+            speed.set_factor(settings.speed);
+            if settings.fast_forward {
+                speed.toggle();
+            }
+            speed
+        }
     });
+    settings.fast_forward = speed.is_fast();
+    settings.speed = speed.factor();
+    let settings_path = settings::Settings::path(cache_root);
     let overlays = Arc::new(machine::LoadedOverlays::default());
     let audio = Arc::new(crate::nds::sound::AudioQueue::default());
     // Kept alive for as long as the window is open.
@@ -79,10 +85,10 @@ pub fn play_recompiled(
         scale,
         fps,
         speed,
-        layout,
-        auto_scale,
         widescreen,
         overlays,
+        settings,
+        settings_path,
     )?;
     // The game threads never return; closing the window ends the program.
     std::process::exit(0);

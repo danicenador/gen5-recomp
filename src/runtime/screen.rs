@@ -10,6 +10,8 @@
 
 use super::gamepad::Gamepads;
 use super::pacing::{self, Fps, FrameTime, Pick};
+use super::settings::{self, Settings};
+use super::settings_menu::{self, Effect, Menu, Page};
 use crate::Result;
 use crate::nds::gpu2d::{Frame, HEIGHT, WIDTH};
 use crate::nds::gpu3d::{DisplayList, Matched};
@@ -17,6 +19,7 @@ use crate::nds::input::{self, Input};
 use crate::nds::machine::LoadedOverlays;
 use crate::nds::speed::Speed;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -109,51 +112,25 @@ pub fn run(
     scale: Arc<AtomicU32>,
     fps: Fps,
     speed: Arc<Speed>,
-    layout: Layout,
-    auto_scale: bool,
     widescreen: Arc<AtomicBool>,
     overlays: Arc<LoadedOverlays>,
+    settings: Settings,
+    settings_path: PathBuf,
 ) -> Result<()> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("could not create event loop: {error}"))?;
-    let mut app = App {
-        title: title.to_owned(),
+    let mut app = App::new(
+        title,
         screens,
         input,
         scale,
-        speed,
-        windows: Vec::new(),
-        layout,
-        auto_scale,
-        panel: Panel::new(Instant::now()),
-        overlays,
-        scene: SceneWatch::new(Instant::now()),
-        x_menu: false,
-        buttons: 0,
-        pad_cursor: PadCursor::new(Instant::now()),
-        alt: false,
-        widescreen,
-        redraw_pending: false,
-        gpu: None,
-        pressed: 0,
-        gamepads: Gamepads::new(),
-        pad_pressed: 0,
-        cursor: None,
-        pen_down: false,
-        shown: u64::MAX,
-        error: None,
         fps,
-        interpolate: fps.interpolates(),
-        history: VecDeque::new(),
-        drawn: None,
-        next_present: Instant::now(),
-        rate: Rate {
-            since: Instant::now(),
-            presents: 0,
-            matched: Matched::default(),
-            shown: String::new(),
-        },
-    };
+        speed,
+        widescreen,
+        overlays,
+        settings,
+        settings_path,
+    );
     event_loop
         .run_app(&mut app)
         .map_err(|error| format!("window event loop failed: {error}"))?;
@@ -161,6 +138,13 @@ pub fn run(
 }
 
 struct App {
+    settings: Settings,
+    settings_path: PathBuf,
+    menu: Menu,
+    menu_pad: u32,
+    /// Inputs used by the UI stay released in the game until physically released.
+    blocked_keyboard: Vec<KeyCode>,
+    blocked_pad: u32,
     title: String,
     screens: Arc<Screens>,
     input: Arc<Input>,
@@ -209,26 +193,8 @@ struct App {
     rate: Rate,
 }
 
-fn button(key: KeyCode) -> Option<u32> {
-    Some(match key {
-        KeyCode::KeyX => input::A,
-        KeyCode::KeyZ => input::B,
-        KeyCode::KeyS => input::X,
-        KeyCode::KeyA => input::Y,
-        KeyCode::KeyQ => input::L,
-        KeyCode::KeyW => input::R,
-        KeyCode::Enter => input::START,
-        KeyCode::ShiftRight | KeyCode::Backspace => input::SELECT,
-        KeyCode::ArrowUp => input::UP,
-        KeyCode::ArrowDown => input::DOWN,
-        KeyCode::ArrowLeft => input::LEFT,
-        KeyCode::ArrowRight => input::RIGHT,
-        _ => return None,
-    })
-}
-
 /// How the DS screens are shown.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Layout {
     /// One window, the top screen over the bottom one.
     Stacked,
@@ -389,7 +355,7 @@ const BATTLE_OVERLAYS: &[u16] = &[167, 168, 169, 170];
 /// (165), a Pokémon's summary (207, over the party) and the starter choice
 /// (316). The naming keyboard's 280 is left out: it stays in RAM through the
 /// whole opening, whose speeches are on the top screen.
-const MENU_OVERLAYS: &[u16] = &[142, 165, 207, 316];
+const MENU_OVERLAYS: &[u16] = &[140, 142, 165, 207, 316];
 
 /// What the game is doing, going by the overlays in RAM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -491,6 +457,7 @@ const CURSOR_LINGER: Duration = Duration::from_secs(3);
 /// touches with when pressed in.
 #[derive(Clone, Copy, Debug)]
 struct PadCursor {
+    sensitivity: f32,
     /// Where it points, in DS pixels.
     x: f32,
     y: f32,
@@ -504,6 +471,7 @@ struct PadCursor {
 impl PadCursor {
     fn new(now: Instant) -> Self {
         Self {
+            sensitivity: 1.0,
             x: WIDTH as f32 / 2.0,
             y: HEIGHT as f32 / 2.0,
             touching: false,
@@ -530,6 +498,7 @@ impl PadCursor {
         if lean > CURSOR_DEAD_ZONE {
             // Gentle near the middle for aiming, fast at the edge.
             let speed = CURSOR_SPEED
+                * self.sensitivity
                 * ((lean - CURSOR_DEAD_ZONE) / (1.0 - CURSOR_DEAD_ZONE))
                     .min(1.0)
                     .powi(2);
@@ -597,6 +566,346 @@ fn extra_columns(widescreen: bool) -> usize {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        title: &str,
+        screens: Arc<Screens>,
+        input: Arc<Input>,
+        scale: Arc<AtomicU32>,
+        fps: Fps,
+        speed: Arc<Speed>,
+        widescreen: Arc<AtomicBool>,
+        overlays: Arc<LoadedOverlays>,
+        settings: Settings,
+        settings_path: PathBuf,
+    ) -> Self {
+        Self {
+            title: title.to_owned(),
+            screens,
+            input,
+            scale,
+            speed,
+            windows: Vec::new(),
+            layout: settings.layout,
+            auto_scale: settings.scale.is_none(),
+            panel: Panel::new(Instant::now()),
+            overlays,
+            scene: SceneWatch::new(Instant::now()),
+            x_menu: false,
+            buttons: 0,
+            pad_cursor: PadCursor::new(Instant::now()),
+            alt: false,
+            widescreen,
+            redraw_pending: false,
+            gpu: None,
+            pressed: 0,
+            gamepads: Gamepads::new(),
+            pad_pressed: 0,
+            cursor: None,
+            pen_down: false,
+            shown: u64::MAX,
+            error: None,
+            fps,
+            interpolate: settings.interpolate && fps.interpolates(),
+            settings,
+            settings_path,
+            menu: Menu::default(),
+            menu_pad: 0,
+            blocked_keyboard: Vec::new(),
+            blocked_pad: 0,
+            history: VecDeque::new(),
+            drawn: None,
+            next_present: Instant::now(),
+            rate: Rate {
+                since: Instant::now(),
+                presents: 0,
+                matched: Matched::default(),
+                shown: String::new(),
+            },
+        }
+    }
+
+    fn keyboard_event(&mut self, event_loop: &ActiveEventLoop, index: usize, event: &KeyEvent) {
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        let down = event.state == ElementState::Pressed;
+        if !down {
+            self.blocked_keyboard.retain(|key| *key != code);
+        }
+        if self.menu.open {
+            if down && !self.blocked_keyboard.contains(&code) {
+                self.blocked_keyboard.push(code);
+            }
+            if !down {
+                return;
+            }
+            if event.repeat
+                && matches!(
+                    code,
+                    KeyCode::Escape | KeyCode::F1 | KeyCode::Enter | KeyCode::KeyX | KeyCode::KeyZ
+                )
+            {
+                return;
+            }
+            let effect = if code == KeyCode::Escape || code == KeyCode::F1 {
+                self.menu.back()
+            } else if self.menu.capture.is_some() {
+                if (self.menu.page == Page::Keyboard || code == KeyCode::Delete) && !event.repeat {
+                    self.menu.bind(
+                        if code == KeyCode::Delete {
+                            String::new()
+                        } else {
+                            format!("{code:?}")
+                        },
+                        &mut self.settings,
+                    )
+                } else {
+                    Effect::None
+                }
+            } else {
+                let pressed = match code {
+                    KeyCode::ArrowUp => input::UP,
+                    KeyCode::ArrowDown => input::DOWN,
+                    KeyCode::ArrowLeft => input::LEFT,
+                    KeyCode::ArrowRight => input::RIGHT,
+                    KeyCode::Enter | KeyCode::KeyX => input::A,
+                    KeyCode::KeyZ => input::B,
+                    _ => 0,
+                };
+                self.menu.buttons(pressed, &mut self.settings)
+            };
+            self.menu_effect(effect, event_loop);
+            return;
+        }
+        if down && self.blocked_keyboard.contains(&code) {
+            return;
+        }
+        if code == KeyCode::F1 {
+            if down && !event.repeat {
+                self.blocked_keyboard.push(code);
+                self.show_settings();
+            }
+            return;
+        }
+        if code == KeyCode::Escape {
+            if down && !event.repeat && self.confirm_quit(index) {
+                event_loop.exit();
+            }
+            return;
+        }
+        if code == KeyCode::Enter && self.alt {
+            if down && !event.repeat {
+                self.toggle_fullscreen(index);
+                self.save_settings();
+            }
+            return;
+        }
+        if code == KeyCode::Backspace
+            && self.settings.bindings.keyboard[2] == "ShiftRight"
+            && self
+                .settings
+                .bindings
+                .keyboard_action("Backspace")
+                .is_none()
+        {
+            if down {
+                self.pressed |= input::SELECT;
+            } else {
+                self.pressed &= !input::SELECT;
+            }
+            self.update_buttons();
+            return;
+        }
+        if let Some(action) = self.settings.bindings.keyboard_action(&format!("{code:?}")) {
+            if action < 12 {
+                let bit = 1 << action;
+                if down && bit == input::Y && self.input.native_options() {
+                    self.blocked_keyboard.push(code);
+                    self.show_settings();
+                    return;
+                }
+                if down {
+                    self.pressed |= bit;
+                } else {
+                    self.pressed &= !bit;
+                }
+                self.update_buttons();
+            } else if down && !event.repeat {
+                match action {
+                    settings::FAST_FORWARD => {
+                        self.speed.toggle();
+                        self.settings.fast_forward = self.speed.is_fast();
+                        self.save_settings();
+                        self.update_title();
+                    }
+                    settings::PANEL => self.toggle_panel(),
+                    settings::MENU => {
+                        self.blocked_keyboard.push(code);
+                        self.show_settings();
+                    }
+                    settings::FULLSCREEN => {
+                        self.toggle_fullscreen(index);
+                        self.save_settings();
+                    }
+                    _ => {}
+                }
+            }
+            if action == settings::TOUCH {
+                self.pen_down = down;
+                self.update_touch();
+            }
+            return;
+        }
+        if !down || event.repeat {
+            return;
+        }
+        if let Some(scale) = scale_key(code) {
+            self.settings.scale = Some(scale);
+            self.auto_scale = false;
+            self.scale.store(scale, Ordering::Relaxed);
+        } else if code == KeyCode::KeyH {
+            self.toggle_widescreen();
+            self.settings.widescreen = self.widescreen.load(Ordering::Relaxed);
+        } else if code == KeyCode::KeyF && self.fps.interpolates() {
+            self.interpolate = !self.interpolate;
+            self.settings.interpolate = self.interpolate;
+        } else if self.speed_key(event) {
+            self.settings.speed = self.speed.factor();
+            self.settings.fast_forward = self.speed.is_fast();
+        } else {
+            return;
+        }
+        self.update_title();
+        self.save_settings();
+    }
+
+    fn save_settings(&mut self) {
+        match self.settings.save(&self.settings_path) {
+            Ok(()) => {
+                if self.menu.status.is_empty() {
+                    self.menu.status = "Settings saved".into();
+                }
+            }
+            Err(error) => {
+                tracing::warn!("{error}");
+                self.menu.status = "Save failed - check settings file permissions".into();
+            }
+        }
+    }
+
+    fn show_settings(&mut self) {
+        self.menu.show();
+        self.input.set_modal(true);
+        self.pressed = 0;
+        self.pad_pressed = 0;
+        self.buttons = 0;
+        self.blocked_pad = u32::MAX;
+        self.pen_down = false;
+        self.pad_cursor.touching = false;
+        self.request_redraw();
+    }
+
+    fn menu_effect(&mut self, effect: Effect, event_loop: &ActiveEventLoop) {
+        match effect {
+            Effect::Changed => {
+                self.menu.status.clear();
+                self.apply_settings(event_loop);
+                self.save_settings();
+            }
+            Effect::Close => {
+                self.menu.open = false;
+                self.pressed = 0;
+                self.pad_pressed = 0;
+                self.buttons = 0;
+                self.blocked_pad = u32::MAX;
+                self.pen_down = false;
+                self.input.set_modal(false);
+            }
+            Effect::None => {}
+        }
+        self.request_redraw();
+    }
+
+    fn apply_settings(&mut self, event_loop: &ActiveEventLoop) {
+        if self.layout != self.settings.layout
+            && let Err(error) = self.change_layout(event_loop, self.settings.layout)
+        {
+            self.settings.layout = self.layout;
+            self.menu.status = format!("Layout change failed: {error}");
+            tracing::warn!("{}", self.menu.status);
+        }
+        self.auto_scale = self.settings.scale.is_none();
+        let automatic = self
+            .windows
+            .first()
+            .and_then(|window| window.current_monitor())
+            .map_or(1, |monitor| monitor.size().height.div_ceil(HEIGHT as u32));
+        self.scale.store(
+            self.settings.scale.unwrap_or(automatic).clamp(1, MAX_SCALE),
+            Ordering::Relaxed,
+        );
+        if self.widescreen.load(Ordering::Relaxed) != self.settings.widescreen {
+            self.toggle_widescreen();
+        }
+        self.speed.set_factor(self.settings.speed);
+        if self.speed.is_fast() != self.settings.fast_forward {
+            self.speed.toggle();
+        }
+        if self.settings.interpolate && self.fps == Fps::Ds {
+            self.fps = Fps::Display;
+        }
+        self.interpolate = self.settings.interpolate;
+        self.input.set_gpu_requested(self.interpolate);
+        for window in &self.windows {
+            window.set_fullscreen(
+                self.settings
+                    .fullscreen
+                    .then_some(winit::window::Fullscreen::Borderless(None)),
+            );
+        }
+        self.drawn = None;
+        self.update_title();
+    }
+
+    /// Build replacement outputs before dropping the current windows.
+    fn change_layout(&mut self, event_loop: &ActiveEventLoop, layout: Layout) -> Result<()> {
+        let views: &[View] = match layout {
+            Layout::Single => &[View::Single],
+            Layout::Stacked => &[View::Stacked],
+            Layout::Split => &[View::Top, View::Bottom],
+        };
+        let mut windows = Vec::new();
+        let extra = extra_columns(self.settings.widescreen);
+        for view in views {
+            let attributes = Window::default_attributes()
+                .with_visible(!cfg!(test))
+                .with_title(&self.title)
+                .with_inner_size(winit::dpi::LogicalSize::new(
+                    (view.width(extra) * 2) as f64,
+                    (view.height() * 2) as f64,
+                ))
+                .with_fullscreen(
+                    self.settings
+                        .fullscreen
+                        .then_some(winit::window::Fullscreen::Borderless(None)),
+                );
+            windows.push(Arc::new(
+                event_loop
+                    .create_window(attributes)
+                    .map_err(|error| error.to_string())?,
+            ));
+        }
+        let gpu = pollster::block_on(Gpu::new(&windows, views, self.fps))?;
+        self.gpu = Some(gpu);
+        self.windows = windows;
+        self.layout = layout;
+        self.scene = SceneWatch::new(Instant::now());
+        self.shown = u64::MAX;
+        self.drawn = None;
+        self.update_touch();
+        Ok(())
+    }
     fn view(&self, index: usize) -> View {
         match self.layout {
             Layout::Stacked => View::Stacked,
@@ -618,17 +927,22 @@ impl App {
 
     /// F11 or Alt+Enter: switch window `index` between full screen and a
     /// window.
-    fn toggle_fullscreen(&self, index: usize) {
+    fn toggle_fullscreen(&mut self, index: usize) {
         if let Some(window) = self.windows.get(index) {
             let fullscreen = window
                 .fullscreen()
                 .is_none()
                 .then_some(winit::window::Fullscreen::Borderless(None));
+            self.settings.fullscreen = fullscreen.is_some();
             window.set_fullscreen(fullscreen);
         }
     }
 
     fn update_buttons(&mut self) {
+        if self.menu.open {
+            self.input.set_buttons(0);
+            return;
+        }
         let buttons = self.pressed | self.pad_pressed;
         let pressed = buttons & !self.buttons;
         self.buttons = buttons;
@@ -638,25 +952,54 @@ impl App {
         self.input.set_buttons(buttons);
     }
 
-    fn poll_gamepads(&mut self) {
+    fn poll_gamepads(&mut self, event_loop: &ActiveEventLoop) {
         let Some(gamepads) = &mut self.gamepads else {
             return;
         };
-        let state = gamepads.poll();
-        if state.toggle_fast_forward {
+        let state = gamepads.poll(&self.settings.bindings, self.settings.stick_dead_zone);
+        let pressed = state.menu_buttons & !self.menu_pad;
+        self.menu_pad = state.menu_buttons;
+        self.blocked_pad &= state.buttons | state.held_actions;
+        if self.menu.open {
+            if self.menu.capture.is_some() && self.menu.page == Page::Controller {
+                if let Some(button) = state.capture {
+                    let effect = self.menu.bind(format!("{button:?}"), &mut self.settings);
+                    self.menu_effect(effect, event_loop);
+                }
+            } else if self.menu.capture.is_none() {
+                let effect = self.menu.buttons(pressed, &mut self.settings);
+                self.menu_effect(effect, event_loop);
+            }
+            return;
+        }
+        if state.toggle_menu && self.blocked_pad & (1 << settings::MENU) == 0
+            || (self.input.native_options()
+                && state.buttons & !self.pad_pressed & !self.blocked_pad & input::Y != 0)
+        {
+            self.show_settings();
+            return;
+        }
+        if state.toggle_fullscreen && self.blocked_pad & (1 << settings::FULLSCREEN) == 0 {
+            self.toggle_fullscreen(0);
+            self.save_settings();
+        }
+        if state.toggle_fast_forward && self.blocked_pad & (1 << settings::FAST_FORWARD) == 0 {
             self.speed.toggle();
+            self.settings.fast_forward = self.speed.is_fast();
+            self.save_settings();
             self.update_title();
         }
-        if state.toggle_panel {
+        if state.toggle_panel && self.blocked_pad & (1 << settings::PANEL) == 0 {
             self.toggle_panel();
         }
         if self.layout == Layout::Single {
+            self.pad_cursor.sensitivity = self.settings.stylus_sensitivity;
             let touching = self.pad_cursor.touching;
             let point = self.pad_cursor.point();
             self.pad_cursor.update(
                 Instant::now(),
                 state.right_stick,
-                state.touch,
+                state.touch && self.blocked_pad & (1 << settings::TOUCH) == 0,
                 self.panel.touchable(),
             );
             if self.pad_cursor.touching != touching
@@ -665,8 +1008,8 @@ impl App {
                 self.update_touch();
             }
         }
-        if state.buttons != self.pad_pressed {
-            self.pad_pressed = state.buttons;
+        if state.buttons & !self.blocked_pad != self.pad_pressed {
+            self.pad_pressed = state.buttons & !self.blocked_pad;
             self.update_buttons();
         }
     }
@@ -688,6 +1031,10 @@ impl App {
     }
 
     fn update_touch(&self) {
+        if self.menu.open {
+            self.input.set_touch(None);
+            return;
+        }
         // Where the screens are is decided by the frame shown.
         let extra = self.gpu.as_ref().map_or(0, |gpu| gpu.extra);
         let point = self.cursor.filter(|_| self.pen_down).and_then(|cursor| {
@@ -738,12 +1085,17 @@ impl App {
             self.x_menu = false;
         }
         if self.layout == Layout::Single
+            && self.settings.smart_bottom
+            && !self.menu.open
             && let Some(up) = self
                 .scene
                 .update(now, scene_wants_panel(scene, self.x_menu))
             && up != self.panel.up
         {
             self.panel.toggle(now);
+        }
+        if !self.settings.smart_bottom {
+            self.scene = SceneWatch::new(now);
         }
         self.panel.advance(now);
         if self.panel.touchable() != touchable {
@@ -790,7 +1142,14 @@ impl App {
             }
             self.history.drain(..pick.keep_from);
         }
+        let menu_vertices = if self.menu.open {
+            self.menu.paint(&self.settings)
+        } else {
+            Vec::new()
+        };
+        gpu.native_options = self.input.native_options();
         for (index, window) in self.windows.iter().enumerate() {
+            gpu.menu_vertices = menu_vertices.clone();
             gpu.draw(index, window.inner_size())?;
         }
         self.rate.presents += 1;
@@ -855,8 +1214,8 @@ impl App {
         }
     }
 
-    /// Tab turns fast-forward on and off; + and - change its speed (and
-    /// turn it on, so the change can be seen). + and - are matched by what
+    /// Plus and minus change fast-forward speed and turn it on.
+    /// They are matched by what
     /// the key types, so they work on any keyboard layout (and = counts as
     /// +, being + unshifted on US keyboards), as do the numpad keys.
     fn speed_key(&self, event: &KeyEvent) -> bool {
@@ -869,10 +1228,7 @@ impl App {
             PhysicalKey::Unidentified(_) => None,
         };
         let factor = self.speed.factor();
-        let new_factor = if code == Some(KeyCode::Tab) {
-            self.speed.toggle();
-            return true;
-        } else if code == Some(KeyCode::NumpadAdd) || typed == "+" || typed == "=" {
+        let new_factor = if code == Some(KeyCode::NumpadAdd) || typed == "+" || typed == "=" {
             factor + 1
         } else if code == Some(KeyCode::NumpadSubtract) || typed == "-" {
             factor.saturating_sub(1)
@@ -909,8 +1265,7 @@ impl ApplicationHandler for App {
         }
         // Single-screen mode draws at least as many lines as the monitor
         // has (6x for 1080 lines), then shrinks to fit.
-        if self.layout == Layout::Single
-            && self.auto_scale
+        if self.auto_scale
             && let Some(monitor) = event_loop.primary_monitor()
         {
             let scale = monitor.size().height.div_ceil(HEIGHT as u32);
@@ -925,6 +1280,7 @@ impl ApplicationHandler for App {
             let height = view.height() as u32;
             let width = view.width(extra) as u32;
             let mut attributes = Window::default_attributes()
+                .with_visible(!cfg!(test))
                 .with_title(self.output_title(index))
                 .with_inner_size(winit::dpi::LogicalSize::new(
                     f64::from(width * 2),
@@ -940,7 +1296,7 @@ impl ApplicationHandler for App {
                 }
                 attributes = attributes.with_inner_size(size);
             }
-            if view == View::Single {
+            if self.settings.fullscreen {
                 attributes =
                     attributes.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
             }
@@ -962,7 +1318,6 @@ impl ApplicationHandler for App {
             Err(error) => {
                 self.error = Some(error);
                 event_loop.exit();
-                return;
             }
         }
     }
@@ -975,81 +1330,68 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    if code == KeyCode::Escape {
-                        if event.state == ElementState::Pressed
-                            && !event.repeat
-                            && self.confirm_quit(index)
-                        {
-                            event_loop.exit();
-                        }
-                        return;
-                    }
-                    if code == KeyCode::KeyF
-                        && event.state == ElementState::Pressed
-                        && !event.repeat
-                        && self.fps.interpolates()
-                    {
-                        self.interpolate = !self.interpolate;
-                        return;
-                    }
-                    if code == KeyCode::KeyH {
-                        if event.state == ElementState::Pressed && !event.repeat {
-                            self.toggle_widescreen();
-                        }
-                        return;
-                    }
-                    if code == KeyCode::F11 || (code == KeyCode::Enter && self.alt) {
-                        if event.state == ElementState::Pressed && !event.repeat {
-                            self.toggle_fullscreen(index);
-                        }
-                        return;
-                    }
-                    if code == KeyCode::Space && self.layout == Layout::Single {
-                        if event.state == ElementState::Pressed && !event.repeat {
-                            self.toggle_panel();
-                        }
-                        return;
-                    }
-                    if let Some(scale) = scale_key(code)
-                        && event.state == ElementState::Pressed
-                    {
-                        self.scale.store(scale, Ordering::Relaxed);
-                        self.update_title();
-                        return;
-                    }
-                    if event.state == ElementState::Pressed
-                        && !event.repeat
-                        && self.speed_key(&event)
-                    {
-                        self.update_title();
-                        return;
-                    }
-                    if let Some(bit) = button(code) {
-                        match event.state {
-                            ElementState::Pressed => self.pressed |= bit,
-                            ElementState::Released => self.pressed &= !bit,
-                        }
-                        self.update_buttons();
-                    }
-                }
+                self.keyboard_event(event_loop, index, &event);
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.alt = modifiers.state().alt_key();
             }
-            WindowEvent::CursorMoved { position, .. } if touch_window => {
+            WindowEvent::CursorMoved { position, .. } if touch_window || self.menu.open => {
                 self.cursor = Some(position);
                 self.update_touch();
             }
-            WindowEvent::CursorLeft { .. } if touch_window => {
+            WindowEvent::CursorLeft { .. } if touch_window || self.menu.open => {
                 self.cursor = None;
                 self.update_touch();
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.menu.open => {
+                let y = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
+                    winit::event::MouseScrollDelta::PixelDelta(point) => point.y,
+                };
+                if y != 0. {
+                    self.menu.buttons(
+                        if y > 0. { input::UP } else { input::DOWN },
+                        &mut self.settings,
+                    );
+                    self.request_redraw();
+                }
             }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
-            } if touch_window => {
+            } if touch_window || self.menu.open => {
+                if state == ElementState::Pressed
+                    && let Some(cursor) = self.cursor
+                {
+                    let size = self.windows[index].inner_size();
+                    if self.menu.open {
+                        if let Some((x, y)) =
+                            settings_menu::point((size.width, size.height), (cursor.x, cursor.y))
+                        {
+                            let effect = self.menu.click(x, y, &mut self.settings);
+                            self.menu_effect(effect, event_loop);
+                        }
+                        return;
+                    }
+                    if self.input.native_options() {
+                        let extra = self.gpu.as_ref().map_or(0, |gpu| gpu.extra);
+                        let point = match self.view(index) {
+                            View::Single if self.panel.touchable() => {
+                                panel_touch(size, cursor, extra)
+                            }
+                            View::Single => None,
+                            view => view.touch(size, cursor, extra),
+                        };
+                        if point.is_some_and(|(x, y)| x < 112 && y >= 168) {
+                            self.show_settings();
+                            return;
+                        }
+                    }
+                }
+                if self.menu.open {
+                    return;
+                }
                 self.pen_down = state == ElementState::Pressed;
                 self.update_touch();
             }
@@ -1083,7 +1425,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.poll_gamepads();
+        self.poll_gamepads(event_loop);
         if self.windows.is_empty() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_TIME / 2));
             return;
@@ -1144,6 +1486,9 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
 ";
 
 struct Gpu {
+    menu_renderer: settings_menu::Renderer,
+    menu_vertices: Vec<settings_menu::Vertex>,
+    native_options: bool,
     targets: Vec<SurfaceTarget>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1786,6 +2131,9 @@ impl Gpu {
         });
         Ok(Self {
             targets,
+            menu_renderer: settings_menu::Renderer::new(&device, config.format),
+            menu_vertices: Vec::new(),
+            native_options: false,
             device,
             queue,
             texture,
@@ -1885,6 +2233,32 @@ impl Gpu {
         }
     }
 
+    fn bottom_viewport(
+        &self,
+        index: usize,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let view = self.targets[index].view;
+        if view == View::Top {
+            return None;
+        }
+        if view == View::Single {
+            if self.panel < 0.999 {
+                return None;
+            }
+            let [x, y, w, h] = panel_rect(size.width, size.height, self.extra, self.panel);
+            return Some((x, y, w, h));
+        }
+        let (x, y, scale) = placement(size.width, size.height, view, self.extra);
+        let x = x + (view.width(self.extra) as f32 - WIDTH as f32) * scale / 2.;
+        let y = y + if view == View::Stacked {
+            HEIGHT as f32 * scale
+        } else {
+            0.
+        };
+        Some((x, y, WIDTH as f32 * scale, HEIGHT as f32 * scale))
+    }
+
     fn draw(&mut self, index: usize, size: winit::dpi::PhysicalSize<u32>) -> Result<()> {
         if size.width == 0 || size.height == 0 {
             return Ok(());
@@ -1919,6 +2293,24 @@ impl Gpu {
                 label: Some("DS screens frame"),
             });
         self.encode(index, &view, size, &mut encoder);
+        if self.menu_vertices.is_empty()
+            && self.native_options
+            && let Some(rect) = self.bottom_viewport(index, size)
+        {
+            let mut paint = settings_menu::Paint(Vec::new());
+            paint.rect(0., 336., 224., 48., [0.12, 0.17, 0.23, 1.]);
+            paint.rect(2., 338., 220., 44., [0.23, 0.46, 0.65, 1.]);
+            paint.text_scaled(8., 352., "Y: PC SETTINGS", [1., 1., 1., 1.], 2.);
+            self.menu_renderer
+                .encode_at(&self.device, &mut encoder, &view, rect, &paint.0);
+        }
+        self.menu_renderer.encode(
+            &self.device,
+            &mut encoder,
+            &view,
+            (size.width, size.height),
+            &self.menu_vertices,
+        );
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
         Ok(())
@@ -2070,6 +2462,78 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires a Windows desktop and graphics adapter"]
+    fn pc_settings_switch_layouts_and_return_without_game_input() {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        struct Smoke;
+        impl ApplicationHandler for Smoke {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                let path = PathBuf::from("target/pc-settings-window-smoke.json");
+                let input = Arc::new(Input::default());
+                let screens = Arc::new(Screens::default());
+                screens.publish(1, &Frame::blank(), Instant::now());
+                let mut app = App::new(
+                    "PC settings smoke",
+                    screens,
+                    input.clone(),
+                    Arc::new(AtomicU32::new(1)),
+                    Fps::Ds,
+                    Arc::new(Speed::default()),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(LoadedOverlays::default()),
+                    Settings::default(),
+                    path.clone(),
+                );
+                app.resumed(event_loop);
+                assert!(app.error.is_none(), "{:?}", app.error);
+                input.set_buttons(input::A);
+                input.set_touch(Some((20, 30)));
+                app.show_settings();
+                assert_eq!(input.buttons(), 0);
+                assert_eq!(input.touch_sample(), 0);
+                for layout in [Layout::Single, Layout::Split, Layout::Stacked] {
+                    app.settings.layout = layout;
+                    app.menu_effect(Effect::Changed, event_loop);
+                    assert_eq!(app.layout, layout);
+                    assert_eq!(
+                        app.windows.len(),
+                        if layout == Layout::Split { 2 } else { 1 }
+                    );
+                    assert!(app.menu.open);
+                    assert_eq!(input.buttons(), 0);
+                    app.redraw().unwrap();
+                    let gpu = app.gpu.as_ref().unwrap();
+                    assert_eq!(gpu.targets[0].view, app.view(0));
+                    assert!(!gpu.menu_vertices.is_empty());
+                }
+                app.settings.scale = Some(3);
+                app.settings.widescreen = true;
+                app.settings.smart_bottom = false;
+                app.settings.fast_forward = true;
+                app.settings.speed = 5;
+                app.settings.interpolate = true;
+                app.menu_effect(Effect::Changed, event_loop);
+                assert_eq!(app.scale.load(Ordering::Relaxed), 3);
+                assert!(app.widescreen.load(Ordering::Relaxed));
+                assert_eq!(app.speed.current(), 5);
+                assert!(input.gpu_requested());
+                assert_eq!(app.fps, Fps::Display);
+                app.menu_effect(Effect::Close, event_loop);
+                assert!(!app.menu.open);
+                assert_eq!(input.buttons(), 0);
+                assert_eq!(input.touch_sample(), 0);
+                assert_eq!(Settings::load(&path).unwrap(), app.settings);
+                std::fs::remove_file(path).unwrap();
+                event_loop.exit();
+            }
+            fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+        }
+        let event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
+        event_loop.run_app(&mut Smoke).unwrap();
+    }
 
     #[test]
     fn screens_fit_with_square_pixels() {

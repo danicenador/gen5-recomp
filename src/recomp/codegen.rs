@@ -132,6 +132,9 @@ pub fn emit_function(analysis: &Analysis, module: &Module, function: &Function) 
     let instructions: Vec<&Instruction> = function.instructions.values().collect();
     let mut labels: BTreeSet<u32> = BTreeSet::new();
     let mut body = String::new();
+    if super::hle::observes_options(module, function.address, function.thumb) {
+        body.push_str("    /* Observe Options input without replacing the game menu. */\n    rt_hle(cpu, 4);\n");
+    }
     let context = Context {
         analysis,
         module,
@@ -196,13 +199,11 @@ pub fn emit_function(analysis: &Analysis, module: &Module, function: &Function) 
     );
     let checked_return = format!("RT_RETURN(0x{:08X}u);", function.address);
     // Code inside its caller's frame (a shared epilogue) moves sp itself.
-    let epilogue =
-        super::analysis::inside_caller_frame(module, function.address, function.thumb);
+    let epilogue = super::analysis::inside_caller_frame(module, function.address, function.thumb);
     let mut previous = "";
     for line in body.lines() {
-        let unchecked = epilogue
-            || previous.contains("rt_hle(")
-            || previous.contains("rt_exception_return(");
+        let unchecked =
+            epilogue || previous.contains("rt_hle(") || previous.contains("rt_exception_return(");
         previous = line;
         let line = if unchecked {
             line.to_owned()

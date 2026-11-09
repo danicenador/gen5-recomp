@@ -74,6 +74,7 @@ pub(super) extern "C" fn host_hle(cpu: *mut Cpu, id: u32) {
         id if id == Hle::SaveContext as u32 => save_context(cpu),
         id if id == Hle::LoadContext as u32 => load_context(cpu),
         id if id == Hle::IrqThreadSwitch as u32 => irq_thread_switch(cpu),
+        id if id == Hle::OptionsInput as u32 => unsafe { machine::get(cpu) }.observe_options(),
         _ => unsafe { machine::get(cpu) }.stop(&format!("unknown HLE routine {id}")),
     }
 }
