@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "before first combat",
+  "reproduction": ".",
+  "source": "debug/runs/1794256290099245700-8328/history/frame-0000084621",
+  "frame": 84621,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
