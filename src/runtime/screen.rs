@@ -318,7 +318,8 @@ impl Panel {
 
     /// Move it on to `now`.
     fn advance(&mut self, now: Instant) {
-        let step = now.saturating_duration_since(self.at).as_secs_f32() / self.duration.as_secs_f32();
+        let step =
+            now.saturating_duration_since(self.at).as_secs_f32() / self.duration.as_secs_f32();
         self.at = now;
         self.travel = if self.up {
             (self.travel + step).min(1.0)
@@ -1162,6 +1163,9 @@ impl App {
         };
         gpu.native_options = self.input.native_options();
         for (index, window) in self.windows.iter().enumerate() {
+            if window.is_minimized() == Some(true) {
+                continue;
+            }
             gpu.menu_vertices = menu_vertices.clone();
             gpu.draw(index, window.inner_size())?;
         }
@@ -1342,7 +1346,16 @@ impl ApplicationHandler for App {
         let touch_window = self.view(index) != View::Top;
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                // Windows replays held keys when focus returns. In particular,
+                // a synthetic Alt+Enter or menu key must not toggle the UI.
+                if is_synthetic && event.state == ElementState::Pressed {
+                    return;
+                }
                 self.keyboard_event(event_loop, index, &event);
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -1411,6 +1424,7 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => {
                 self.alt = false;
                 self.pressed = 0;
+                self.blocked_keyboard.clear();
                 self.update_buttons();
                 if touch_window {
                     self.pen_down = false;
@@ -1418,8 +1432,30 @@ impl ApplicationHandler for App {
                     self.update_touch();
                 }
             }
-            WindowEvent::Resized(_) if touch_window => {
-                self.update_touch();
+            WindowEvent::Focused(true) | WindowEvent::Occluded(false) => {
+                // A fullscreen swap chain can need rebuilding after Alt+Tab
+                // even when its dimensions did not change.
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.targets[index].occluded = false;
+                    gpu.targets[index].reconfigure = true;
+                }
+                self.drawn = None;
+                self.next_present = Instant::now();
+                self.request_redraw();
+            }
+            WindowEvent::Occluded(true) => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.targets[index].occluded = true;
+                }
+            }
+            WindowEvent::Resized(_) => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.targets[index].reconfigure = true;
+                }
+                if touch_window {
+                    self.update_touch();
+                }
+                self.request_redraw();
             }
             WindowEvent::RedrawRequested => {
                 // Both windows request the same presentation. Draw once so
@@ -1441,6 +1477,18 @@ impl ApplicationHandler for App {
         self.poll_gamepads(event_loop);
         if self.windows.is_empty() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_TIME / 2));
+            return;
+        }
+        if self.windows.iter().enumerate().all(|(index, window)| {
+            window.is_minimized() == Some(true)
+                || self
+                    .gpu
+                    .as_ref()
+                    .is_some_and(|gpu| gpu.targets[index].occluded)
+        }) {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(50),
+            ));
             return;
         }
         match self.fps {
@@ -1543,6 +1591,8 @@ struct SurfaceTarget {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     view: View,
+    occluded: bool,
+    reconfigure: bool,
     /// What part of the screens the window shows (`View::rect`).
     rect: wgpu::Buffer,
     rect_bind_group: wgpu::BindGroup,
@@ -1980,6 +2030,8 @@ impl Gpu {
                 surface,
                 config: target_config,
                 view: views[index],
+                occluded: false,
+                reconfigure: false,
                 rect,
                 rect_bind_group,
                 panel_rect,
@@ -2273,15 +2325,18 @@ impl Gpu {
     }
 
     fn draw(&mut self, index: usize, size: winit::dpi::PhysicalSize<u32>) -> Result<()> {
-        if size.width == 0 || size.height == 0 {
+        if size.width == 0 || size.height == 0 || self.targets[index].occluded {
             return Ok(());
         }
         self.prepare(index, size);
         let target = &mut self.targets[index];
-        if (size.width, size.height) != (target.config.width, target.config.height) {
+        if target.reconfigure
+            || (size.width, size.height) != (target.config.width, target.config.height)
+        {
             target.config.width = size.width;
             target.config.height = size.height;
             target.surface.configure(&self.device, &target.config);
+            target.reconfigure = false;
         }
         let frame = match target.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -2539,6 +2594,32 @@ mod tests {
                 assert_eq!(input.buttons(), 0);
                 assert_eq!(input.touch_sample(), 0);
                 assert_eq!(Settings::load(&path).unwrap(), app.settings);
+                let id = app.windows[0].id();
+                for _ in 0..3 {
+                    app.toggle_fullscreen(0);
+                    assert!(matches!(
+                        app.windows[0].fullscreen(),
+                        Some(winit::window::Fullscreen::Borderless(_))
+                    ));
+                    app.alt = true;
+                    app.pressed = input::A;
+                    app.blocked_keyboard.push(KeyCode::KeyX);
+                    app.window_event(event_loop, id, WindowEvent::Focused(false));
+                    assert!(!app.alt);
+                    assert_eq!(input.buttons(), 0);
+                    assert!(app.blocked_keyboard.is_empty());
+                    app.window_event(event_loop, id, WindowEvent::Occluded(true));
+                    assert!(app.gpu.as_ref().unwrap().targets[0].occluded);
+                    app.redraw().unwrap();
+                    app.window_event(event_loop, id, WindowEvent::Focused(true));
+                    let target = &app.gpu.as_ref().unwrap().targets[0];
+                    assert!(!target.occluded && target.reconfigure);
+                    assert!(app.redraw_pending);
+                    app.redraw().unwrap();
+                    assert!(!app.gpu.as_ref().unwrap().targets[0].reconfigure);
+                    app.toggle_fullscreen(0);
+                    assert!(app.windows[0].fullscreen().is_none());
+                }
                 std::fs::remove_file(path).unwrap();
                 event_loop.exit();
             }

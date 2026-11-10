@@ -262,7 +262,9 @@ and unloaded, and each frame at which the field menu opens or closes, for
 finding the overlays of new scenes.
 
 F11 or Alt+Enter switches
-between full screen and a window, in any layout. `--single-screen` and
+between borderless full screen and a window, in any layout. On returning from
+Alt+Tab the display surface is refreshed, and minimized or occluded windows
+skip presentation until restored. `--single-screen` and
 `--split-screens` cannot be combined.
 
 Add `--widescreen` (or set `GEN5_WIDESCREEN=1`) to draw the top screen at
