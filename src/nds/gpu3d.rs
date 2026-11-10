@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -94,6 +95,8 @@ pub struct Pixel {
 
 #[derive(Clone, Copy, Debug)]
 struct Vertex {
+    /// The submitted model-space coordinates, before camera/animation matrices.
+    model: [i32; 3],
     clip: [f64; 4],
     color: [f64; 3],
     uv: [f64; 2],
@@ -102,6 +105,7 @@ struct Vertex {
 impl Vertex {
     fn lerp(self, other: Self, t: f64) -> Self {
         Self {
+            model: self.model,
             clip: std::array::from_fn(|i| self.clip[i] + (other.clip[i] - self.clip[i]) * t),
             color: std::array::from_fn(|i| self.color[i] + (other.color[i] - self.color[i]) * t),
             uv: std::array::from_fn(|i| self.uv[i] + (other.uv[i] - self.uv[i]) * t),
@@ -130,6 +134,8 @@ struct PolygonId {
     /// POLYGON_ATTR without the alpha, which games fade.
     attr: u32,
     vertices: u8,
+    /// Model-space vertices and texture coordinates, independent of the camera.
+    geometry: u64,
     occurrence: u32,
 }
 
@@ -140,6 +146,9 @@ const ID_ATTR_MASK: u32 = !(31 << 16);
 #[derive(Clone, Default)]
 pub struct DisplayList {
     polygons: Vec<Polygon>,
+    /// Submission counts include culled polygons. If repeated geometry changes
+    /// count, occurrence numbers cannot reliably identify the same object.
+    submitted: HashMap<PolygonId, u32>,
     render_w: bool,
     /// SWAP_BUFFERS bit 0: translucent polygons keep submission order
     /// instead of being sorted by Y.
@@ -170,7 +179,7 @@ impl DisplayList {
         alpha: f64,
     ) -> (Cow<'_, [Polygon]>, Matched) {
         let total = self.polygons.len();
-        let Some(next) = next.filter(|_| alpha > 0.0) else {
+        let Some(next) = next.filter(|next| alpha > 0.0 && self.render_w == next.render_w) else {
             return (Cow::Borrowed(&self.polygons), Matched { matched: 0, total });
         };
         let alpha = alpha.min(1.0);
@@ -185,7 +194,12 @@ impl DisplayList {
             .iter()
             .map(|polygon| {
                 let mut polygon = polygon.clone();
+                let identity = PolygonId {
+                    occurrence: 0,
+                    ..polygon.id
+                };
                 if let Some(after) = later.get(&polygon.id)
+                    && self.submitted.get(&identity) == next.submitted.get(&identity)
                     && pairs_with(&polygon, after)
                 {
                     matched += 1;
@@ -205,10 +219,13 @@ impl DisplayList {
 /// Whether `before` can be drawn part way to `after`: the same shape, in
 /// front of the camera both times, and not too far apart on screen.
 fn pairs_with(before: &Polygon, after: &Polygon) -> bool {
-    if before.vertices.len() != after.vertices.len() {
+    if before.vertices.len() != after.vertices.len() || before.viewport != after.viewport {
         return false;
     }
     before.vertices.iter().zip(&after.vertices).all(|(a, b)| {
+        if a.model != b.model || a.uv != b.uv {
+            return false;
+        }
         let (wa, wb) = (a.clip[3], b.clip[3]);
         if wa <= 0.0 || wb <= 0.0 {
             return false;
@@ -449,6 +466,7 @@ impl Geometry {
             self.swaps += 1;
             self.displayed = Arc::new(DisplayList {
                 polygons: std::mem::take(&mut self.building),
+                submitted: self.occurrences.clone(),
                 render_w: flags & 2 != 0,
                 manual_sort: flags & 1 != 0,
                 swap: self.swaps,
@@ -679,6 +697,7 @@ impl Geometry {
         }
         let clip = transform(self.position, self.clip_matrix());
         self.vertices.push(Vertex {
+            model: std::array::from_fn(|i| (self.position[i] * 4096.0) as i32),
             clip,
             color: self.color,
             uv: self.uv,
@@ -703,11 +722,17 @@ impl Geometry {
         // only polygons that survive culling and clipping are stored: a
         // wide scene submits far more than it keeps.
         self.submitted_polygons += 1;
+        let mut geometry = std::collections::hash_map::DefaultHasher::new();
+        for vertex in &vertices {
+            vertex.model.hash(&mut geometry);
+            vertex.uv.map(f64::to_bits).hash(&mut geometry);
+        }
         let mut id = PolygonId {
             texture: self.texture,
             palette: self.palette,
             attr: self.attr & ID_ATTR_MASK,
             vertices: count as u8,
+            geometry: geometry.finish(),
             occurrence: 0,
         };
         let seen = self.occurrences.entry(id).or_default();
@@ -1932,16 +1957,19 @@ mod tests {
         Arc::make_mut(&mut g.displayed).polygons.push(Polygon {
             vertices: vec![
                 Vertex {
+                    model: [0; 3],
                     clip: [-1.0, -1.0, 0.0, 1.0],
                     uv: [0.0, 0.0],
                     color: [31.0; 3],
                 },
                 Vertex {
+                    model: [0; 3],
                     clip: [2.0, -2.0, 0.0, 2.0],
                     uv: [8.0, 0.0],
                     color: [31.0; 3],
                 },
                 Vertex {
+                    model: [0; 3],
                     clip: [-1.0, 1.0, 0.0, 1.0],
                     uv: [0.0, 0.0],
                     color: [31.0; 3],
@@ -2029,6 +2057,60 @@ mod tests {
         // from 89.6 halfway to 96.
         assert_eq!(edges[0], 64.0);
         assert!((edges[1] - 92.8).abs() < 0.1, "{edges:?}");
+    }
+
+    #[test]
+    fn inserting_a_repeated_object_does_not_morph_its_neighbors() {
+        let shown = list_at(&[0, 819]);
+        let next = list_at(&[-819, 205, 1024]);
+        let half = shown.build(Some(&next), 0.5, false);
+        // The repeated mesh changed count, making occurrence-based pairing
+        // ambiguous. Keep the shown geometry instead of pulling it sideways.
+        assert_eq!(half.matched.matched, 0);
+        assert_eq!(
+            left_edges(&half),
+            left_edges(&shown.build(None, 0.0, false))
+        );
+    }
+
+    #[test]
+    fn different_meshes_with_the_same_material_keep_their_pairs_when_reordered() {
+        let list = |shapes: &[(i32, i16)]| {
+            let mut g = Geometry::default();
+            command(&mut g, 0x10, &[2]);
+            for &(offset, size) in shapes {
+                command(&mut g, 0x15, &[]);
+                command(&mut g, 0x1c, &[offset as u32, 0, 0]);
+                command(&mut g, 0x29, &[(31 << 16) | 0xc0]);
+                command(&mut g, 0x40, &[0]);
+                vertex(&mut g, -size, -size, 0);
+                vertex(&mut g, size, -size, 0);
+                vertex(&mut g, 0, size, 0);
+                command(&mut g, 0x41, &[]);
+            }
+            command(&mut g, 0x50, &[0]);
+            g.vblank();
+            g.displayed
+        };
+        let shown = list(&[(0, 2048), (819, 1024)]);
+        let next = list(&[(1024, 1024), (205, 2048)]);
+        let half = shown.build(Some(&next), 0.5, false);
+        assert_eq!(half.matched.matched, 2);
+        let mut edges = left_edges(&half);
+        edges.sort_by(f32::total_cmp);
+        assert!((edges[0] - 67.2).abs() < 0.1, "{edges:?}");
+        assert!((edges[1] - 124.8).abs() < 0.1, "{edges:?}");
+    }
+
+    #[test]
+    fn changed_texture_coordinates_and_viewports_are_not_interpolated() {
+        let shown = list_at(&[0]);
+        let mut next = list_at(&[205]);
+        Arc::make_mut(&mut next).polygons[0].vertices[0].uv[0] = 8.0;
+        assert_eq!(shown.build(Some(&next), 0.5, false).matched.matched, 0);
+        let mut next = list_at(&[205]);
+        Arc::make_mut(&mut next).polygons[0].viewport = [0, 0, 127, 191];
+        assert_eq!(shown.build(Some(&next), 0.5, false).matched.matched, 0);
     }
 
     #[test]
