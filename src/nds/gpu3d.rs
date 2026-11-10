@@ -1249,7 +1249,7 @@ fn sort_key(polygon: &Polygon) -> (i32, i32) {
         .iter()
         .filter(|v| v.clip[3] > 0.0)
         .map(|v| {
-            let y = 191.0
+            let y = 192.0
                 - ((v.clip[1] / v.clip[3] + 1.0) * height / 2.0 + f64::from(polygon.viewport[1]));
             y.clamp(-1024.0, 1024.0) as i32
         });
@@ -1433,7 +1433,7 @@ impl<'a> Triangle<'a> {
         let screen = vertices.map(|v| {
             [
                 (v.clip[0] / v.clip[3] + 1.0) * f64::from(width) / 2.0 + f64::from(vp[0]),
-                191.0
+                192.0
                     - ((v.clip[1] / v.clip[3] + 1.0) * f64::from(height) / 2.0 + f64::from(vp[1])),
             ]
         });
@@ -2044,6 +2044,33 @@ mod tests {
         io.set16(0x0400_006c, 0x8010); // master brightness black
         let frame = super::super::gpu2d::render(&io, &memory);
         assert_eq!(&frame.top[at..at + 4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn the_viewport_covers_every_row_and_column() {
+        // Clip space from -1 to 1 maps onto rows 0 to 191 and columns 0 to
+        // 255, all of them: the bottom row is not left to the clear color.
+        for (reach, rows, columns) in [(4096, 0..192, 0..256), (2048, 48..144, 64..192)] {
+            let mut g = Geometry::default();
+            command(&mut g, 0x29, &[(31 << 16) | 0xc0]);
+            command(&mut g, 0x40, &[1]);
+            for (x, y) in [
+                (-reach, -reach),
+                (reach, -reach),
+                (reach, reach),
+                (-reach, reach),
+            ] {
+                vertex(&mut g, x, y, 0);
+            }
+            command(&mut g, 0x50, &[0]);
+            g.vblank();
+            let pixels = g.render(&io(), &Vram::new());
+            for (index, pixel) in pixels.iter().enumerate() {
+                let (x, y) = (index % 256, index / 256);
+                let inside = rows.contains(&y) && columns.contains(&x);
+                assert_eq!(pixel.alpha != 0, inside, "pixel {x},{y} of a {reach} quad");
+            }
+        }
     }
 
     #[test]
