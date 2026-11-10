@@ -24,6 +24,12 @@ fn io(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+/// A path as printed and recorded: forward slashes only, since Windows paths
+/// built with `join("debug/runs")` would otherwise mix both separators.
+fn slashed(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 fn read_metadata(path: &Path) -> Result<Metadata> {
     let meta: Metadata =
         serde_json::from_slice(&fs::read(path.join("checkpoint.json")).map_err(io)?).map_err(io)?;
@@ -116,7 +122,7 @@ pub fn launch(args: &[String]) -> Result<()> {
         game_code: String::from_utf8_lossy(&rom.header.game_code).into_owned(),
         description: "Debug session".into(),
         reproduction: String::new(),
-        source: checkpoint.as_ref().map(|p| p.display().to_string()),
+        source: checkpoint.as_deref().map(slashed),
         frame: None,
         status: "working-copy".into(),
     };
@@ -129,7 +135,7 @@ pub fn launch(args: &[String]) -> Result<()> {
         .join("debug/runs")
         .join(format!("{id}-{}", std::process::id()));
     create_session(&state, &meta, checkpoint.as_deref())?;
-    println!("Debug state: {}", state.display());
+    println!("Debug state: {}", slashed(&state));
     let status = Command::new(std::env::current_exe().map_err(io)?)
         .args(forwarded)
         .env("GEN5_STATE_DIR", &state)
@@ -156,7 +162,7 @@ pub fn promote(
     let (save, firmware) = read_state(source)?;
     meta.description = description.into();
     meta.reproduction = reproduction.into();
-    meta.source = Some(source.display().to_string());
+    meta.source = Some(slashed(source));
     meta.status = "manual-checkpoint; verify by loading Continue".into();
     write_checkpoint(destination, &meta, &save, &firmware)
 }
@@ -196,7 +202,7 @@ impl History {
             meta.status = "unverified; 120 frames without flash writes".into();
             let path = self.root.join(format!("frame-{frame:010}"));
             write_checkpoint(&path, &meta, save, firmware)?;
-            eprintln!("Debug save candidate: {}", path.display());
+            eprintln!("Debug save candidate: {}", slashed(&path));
             self.previous = save.to_vec();
         }
         self.last_write = None;
@@ -231,6 +237,16 @@ mod tests {
             frame: None,
             status: "test".into(),
         }
+    }
+
+    #[test]
+    fn printed_paths_use_forward_slashes() {
+        assert_eq!(
+            slashed(Path::new(
+                r"D:\gen5\debug/runs\1-2\history\frame-0000084621"
+            )),
+            "D:\gen5\debug/runs/1-2/history/frame-0000084621"
+        );
     }
 
     #[test]
