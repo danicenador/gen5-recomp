@@ -282,8 +282,10 @@ fn placement(width: u32, height: u32, view: View, extra: usize) -> (f32, f32, f3
     (x, y, scale)
 }
 
-/// How long the bottom screen takes to rise all the way, or to drop.
+/// How long the bottom screen takes to rise, or to drop when moved manually.
 const PANEL_TIME: Duration = Duration::from_millis(180);
+/// Smart mode dismisses the screen three times as fast.
+const SMART_DROP_TIME: Duration = Duration::from_millis(60);
 
 /// The raised bottom screen's height, as a share of the top screen's: 720
 /// lines over a 1080-line top screen.
@@ -296,8 +298,10 @@ struct Panel {
     /// Where it is heading: up or down.
     up: bool,
     /// How far up it is, from 0 (out of sight) to 1 (raised), in time:
-    /// it moves by `PANEL_TIME` per unit.
+    /// it moves by `duration` per unit.
     travel: f32,
+    /// Time for a full traversal in the current direction.
+    duration: Duration,
     /// When `travel` was last brought up to date.
     at: Instant,
 }
@@ -307,13 +311,14 @@ impl Panel {
         Self {
             up: false,
             travel: 0.0,
+            duration: PANEL_TIME,
             at: now,
         }
     }
 
     /// Move it on to `now`.
     fn advance(&mut self, now: Instant) {
-        let step = now.saturating_duration_since(self.at).as_secs_f32() / PANEL_TIME.as_secs_f32();
+        let step = now.saturating_duration_since(self.at).as_secs_f32() / self.duration.as_secs_f32();
         self.at = now;
         self.travel = if self.up {
             (self.travel + step).min(1.0)
@@ -326,6 +331,13 @@ impl Panel {
     fn toggle(&mut self, now: Instant) {
         self.advance(now);
         self.up = !self.up;
+        self.duration = PANEL_TIME;
+    }
+
+    fn follow_scene(&mut self, up: bool, now: Instant) {
+        self.advance(now);
+        self.up = up;
+        self.duration = if up { PANEL_TIME } else { SMART_DROP_TIME };
     }
 
     /// How much of it shows, from 0 to 1. It eases out as it rises and in as
@@ -1089,7 +1101,7 @@ impl App {
             )
             && up != self.panel.up
         {
-            self.panel.toggle(now);
+            self.panel.follow_scene(up, now);
         }
         if !self.settings.smart_bottom {
             self.scene = SceneWatch::new(now);
@@ -2650,6 +2662,37 @@ mod tests {
         // Dropping lets go at once.
         panel.toggle(start + 5 * PANEL_TIME);
         assert!(!panel.touchable());
+    }
+
+    #[test]
+    fn smart_bottom_screen_drops_three_times_faster_and_reverses_smoothly() {
+        let start = Instant::now();
+        let mut panel = Panel::new(start);
+        panel.follow_scene(true, start);
+        panel.advance(start + PANEL_TIME);
+        assert!(panel.touchable());
+
+        let drop = start + PANEL_TIME;
+        panel.follow_scene(false, drop);
+        assert!(!panel.touchable());
+        panel.advance(drop + SMART_DROP_TIME / 2);
+        assert!((panel.travel - 0.5).abs() < 1e-4);
+        let before = panel.raised();
+        panel.toggle(drop + SMART_DROP_TIME / 2);
+        assert_eq!(panel.raised(), before);
+        panel.advance(drop + SMART_DROP_TIME / 2 + PANEL_TIME / 2);
+        assert!(panel.touchable());
+
+        let drop = drop + PANEL_TIME;
+        panel.follow_scene(false, drop);
+        panel.advance(drop + PANEL_TIME / 3);
+        assert_eq!(panel.raised(), 0.0);
+        // Manual dismissal still uses the normal duration.
+        panel.toggle(drop + PANEL_TIME);
+        panel.advance(drop + 2 * PANEL_TIME);
+        panel.toggle(drop + 2 * PANEL_TIME);
+        panel.advance(drop + 2 * PANEL_TIME + SMART_DROP_TIME);
+        assert!(panel.raised() > 0.0);
     }
 
     #[test]
