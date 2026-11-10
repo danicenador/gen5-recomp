@@ -139,7 +139,16 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
         (&top, side, captured.as_deref()),
         (&bottom, Composed::fixed(0), None),
     ] {
+        let cover = (extra > 0)
+            .then(|| widescreen_cover(screen, side))
+            .flatten();
         for (line, row) in screen.chunks(WIDTH).enumerate() {
+            if let Some(cover) = cover {
+                pixels.extend(std::iter::repeat_n(cover.pack(), extra));
+                pixels.extend(row.iter().map(Composed::pack));
+                pixels.extend(std::iter::repeat_n(cover.pack(), extra));
+                continue;
+            }
             if let Some(captured) = captured.filter(|_| extra > 0) {
                 let sides = &captured[line * 2 * WIDE_EXTRA..][..2 * WIDE_EXTRA];
                 pixels.extend(sides[..WIDE_EXTRA].iter().map(Composed::pack));
@@ -194,6 +203,29 @@ fn side_of(side: Composed, mirrored: Composed, outer: Composed) -> Composed {
     } else {
         side
     }
+}
+
+/// A uniform foreground covering the entire screen is a screen effect (the
+/// season banner's black sheet, for example). Carry its color/blend into the
+/// margins without reflecting any lettering. Requiring the whole perimeter
+/// excludes dialogue boxes, HUDs and partial overlays.
+fn widescreen_cover(screen: &[Composed], side: Composed) -> Option<Composed> {
+    if !matches!(side.with, With::First { .. }) || screen.len() != WIDTH * HEIGHT {
+        return None;
+    }
+    let cover = screen[0];
+    if matches!(cover.with, With::First { .. }) {
+        return None;
+    }
+    let same =
+        |pixel: &Composed| pixel.with == cover.with && pixel.coefficients == cover.coefficients;
+    let horizontal = screen[..WIDTH]
+        .iter()
+        .chain(&screen[(HEIGHT - 1) * WIDTH..]);
+    let vertical = screen
+        .chunks_exact(WIDTH)
+        .flat_map(|row| [&row[0], &row[WIDTH - 1]]);
+    horizontal.chain(vertical).all(same).then_some(cover)
 }
 
 pub fn render(io: &Io, memory: &Memory) -> Frame {
@@ -404,17 +436,24 @@ fn capture_sides(io: &Io, memory: &Memory, three_d_only: bool, height: usize) ->
     let blank = vec![Pixel::default(); WIDTH * HEIGHT];
     let engine = Engine::new(io, memory, false, &blank);
     let side = engine.side(dispcnt);
-    let mut row = [Composed::default(); WIDTH];
     let captured = engine.capture_sides(dispcnt, &memory.vram);
-    for y in 0..height {
-        engine.compose_line(dispcnt, y, &mut row);
+    let mut screen = vec![Composed::default(); WIDTH * HEIGHT];
+    screen
+        .par_chunks_mut(WIDTH)
+        .enumerate()
+        .for_each(|(y, row)| {
+            engine.compose_line(dispcnt, y, row);
+        });
+    let cover = widescreen_cover(&screen, side);
+    for (y, row) in screen.chunks_exact(WIDTH).take(height).enumerate() {
         for x in (0..WIDE_EXTRA).chain(WIDE_EXTRA + WIDTH..columns) {
             let column = if x < WIDE_EXTRA { x } else { x - WIDTH };
-            let composed = match &captured {
-                Some(pixels) => pixels[y * 2 * WIDE_EXTRA + column],
+            let composed = match (cover, &captured) {
+                (Some(cover), _) => cover,
+                (_, Some(pixels)) => pixels[y * 2 * WIDE_EXTRA + column],
                 // Mirrored, as `render_scaled` shows them.
-                None if x < WIDE_EXTRA => side_of(side, row[WIDE_EXTRA - 1 - x], row[0]),
-                None => side_of(
+                (_, None) if x < WIDE_EXTRA => side_of(side, row[WIDE_EXTRA - 1 - x], row[0]),
+                (_, None) => side_of(
                     side,
                     row[WIDTH - 1 - (x - WIDE_EXTRA - WIDTH)],
                     row[WIDTH - 1],
@@ -1624,6 +1663,72 @@ mod tests {
             side_of(Composed::fixed(0), gradient, gradient),
             Composed::fixed(0)
         );
+    }
+
+    #[test]
+    fn full_screen_fades_cover_the_margins_without_copying_their_lettering() {
+        let mut io = Io::new();
+        let mut memory = Memory::new();
+        io.geometry.wide = true;
+        io.set16(POWCNT1, 0x800a);
+        io.set32(0x0400_0000, 0x10308); // BG0 3D below text BG1
+        io.set16(0x0400_0008, 1);
+        io.set16(0x0400_000a, 1 << 8);
+        memory.vram.control[0] = 0x81;
+        memory.vram.update();
+        memory.vram.banks[32..64].fill(0x11); // opaque black tile
+        memory.vram.banks[64..96].fill(0x22); // white lettering
+        memory.palette[4..6].copy_from_slice(&0x7fffu16.to_le_bytes());
+        for tile in memory.vram.banks[0x800..0x1000].chunks_exact_mut(2) {
+            tile.copy_from_slice(&1u16.to_le_bytes());
+        }
+        memory.vram.banks[0x800 + (10 * 32 + 15) * 2] = 2;
+        let columns = WIDTH + 2 * WIDE_EXTRA;
+        for blend in [0, 0x0142] {
+            io.set16(0x0400_0050, blend);
+            io.set16(0x0400_0052, 0x0808);
+            let frame = render_scaled(&io, &memory);
+            let expected = if blend == 0 {
+                Composed {
+                    coefficients: Coefficients {
+                        eva: 8,
+                        evb: 8,
+                        evy: 0,
+                    },
+                    ..Composed::fixed(0)
+                }
+            } else {
+                Composed {
+                    without: 0,
+                    with: With::Second { first: 0 },
+                    coefficients: Coefficients {
+                        eva: 8,
+                        evb: 8,
+                        evy: 0,
+                    },
+                }
+            };
+            for y in 0..HEIGHT {
+                for x in (0..WIDE_EXTRA).chain(WIDE_EXTRA + WIDTH..columns) {
+                    assert_eq!(frame.pixels[y * columns + x], expected.pack(), "{x},{y}");
+                }
+            }
+            // Lettering remains only in the center.
+            assert_ne!(
+                frame.pixels[80 * columns + WIDE_EXTRA + 120],
+                expected.pack()
+            );
+            assert!(
+                capture_sides(&io, &memory, false, HEIGHT)
+                    .iter()
+                    .all(|&p| p == 0x8000)
+            );
+        }
+        // A dialogue box covering only the bottom of the screen is UI, so
+        // its background and glyphs must not extend into the margins.
+        memory.vram.banks[0x800..0x800 + 19 * 32 * 2].fill(0);
+        let frame = render_scaled(&io, &memory);
+        assert_eq!((frame.pixels[180 * columns][0] >> 16) & 3, 1);
     }
 
     #[test]

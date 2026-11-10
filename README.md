@@ -279,8 +279,10 @@ screen shows the 3D layer, with the same blending and master brightness, or
 black when it shows no 3D (menus and other 2D screens). Under the 3D layer
 the sides mirror what is under it at that end of each line, so a background
 behind the 3D, such as the gradient behind Professor Juniper, carries on
-instead of the backdrop color; so does a 2D layer blended over the 3D, such
-as the season's name fading out over the field when a game is continued.
+instead of the backdrop color. Foreground text and dialogue boxes stay in
+the original 256 columns, including translucent ones. A uniform overlay
+covering the entire screen, such as the season banner's black background
+and its fade, extends into both margins while its lettering stays centered.
 Where opaque 2D is in front of the 3D there, the last column carries on, and
 where it is in front at the end of the line as well, the backdrop is used.
 The bottom screen stays 4:3 and is centered under the top one. Display
