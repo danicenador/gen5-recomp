@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Floccesy Ranch",
+  "reproduction": "after rival battle",
+  "source": "debug/runs/1794337971703561500-17888/history/frame-0000055847",
+  "frame": 55847,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
