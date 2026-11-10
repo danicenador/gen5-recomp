@@ -96,7 +96,8 @@ Options:
                     between game frames), uncapped, or a number.
   --split-screens   Top and bottom screens in two windows.
   --single-screen   One full-screen 16:9 screen; the bottom screen slides
-                    up on L2 or Space, and by itself in battles and menus.
+                    up on L2 or Space, and by itself in menus and for
+                    battle commands.
   --widescreen      Draw the top screen at 16:9 (also GEN5_WIDESCREEN=1).
 
 Settings changed while playing are kept in <cache>/pc-settings.json and

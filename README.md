@@ -236,26 +236,30 @@ mouse is the stylus on it once it has fully risen. Without a resolution
 multiple, single-screen mode draws at least as many lines as the monitor
 has (6x at 1080 lines) and shrinks to fit.
 
-The bottom screen also follows the scene by itself: it rises in battles and
-menus played on it and drops back on the overworld. The runtime tells scenes
-apart by the ARM9 overlays in RAM (see `scene_wants_panel` in
+The bottom screen also follows the scene by itself: it rises in menus played
+on it and in battles while they wait for a command, and drops back on the
+overworld and while a battle plays out. The runtime tells scenes apart by
+the ARM9 overlays in RAM (see `scene_wants_panel` in
 `src/runtime/screen.rs`); a scene has to hold for 100 ms first, so map
 transitions pass unnoticed, and scenes it cannot tell (the title screen)
-leave the bottom screen where it is. In the opening it rises for the naming
-keyboard, which the game shows with the screens swapped (engine A on the
-bottom), and drops for Professor Juniper's speeches. The X menu loads no
-overlays of its own, so the runtime reads the game's field events instead
-(`src/nds/field_menu.rs`): the bottom screen stays up while the menu or any
-screen opened from it (the Pokédex, the trainer card, the save prompt, ...)
-is up, and drops once the menu closes, whether by B, by X or by itself after
-saving. L2 or Space still moves it at any time; the next scene change takes
-over again. On a controller, the right stick moves a stylus over the raised
-bottom screen, shown as a ring, and pressing the stick in touches with it
-(the ring fills); it hides three seconds after it last moved.
-`GEN5_OVERLAY_LOG=path` writes, for `run` or `boot`, each frame at which the
-overlays in RAM change, with those loaded and unloaded, and each frame at
-which the field menu opens or closes, for finding the overlays of new
-scenes.
+leave the bottom screen where it is. A battle's bottom screen shows a Poké
+Ball on BG3 while the battle plays out and the command buttons (FIGHT, BAG,
+RUN, POKéMON, then the moves) on BG0 and BG1 while it waits, so the bottom
+screen rises with the buttons and drops once a command is chosen. In the
+opening it rises for the naming keyboard, which the game shows with the
+screens swapped (engine A on the bottom), and drops for Professor Juniper's
+speeches. The X menu loads no overlays of its own, so the runtime reads the
+game's field events instead (`src/nds/field_menu.rs`): the bottom screen
+stays up while the menu or any screen opened from it (the Pokédex, the
+trainer card, the save prompt, ...) is up, and drops once the menu closes,
+whether by B, by X or by itself after saving. L2 or Space still moves it at
+any time; the next scene change takes over again. On a controller, the right
+stick moves a stylus over the raised bottom screen, shown as a ring, and
+pressing the stick in touches with it (the ring fills); it hides three
+seconds after it last moved. `GEN5_OVERLAY_LOG=path` writes, for `run` or
+`boot`, each frame at which the overlays in RAM change, with those loaded
+and unloaded, and each frame at which the field menu opens or closes, for
+finding the overlays of new scenes.
 
 F11 or Alt+Enter switches
 between full screen and a window, in any layout. `--single-screen` and

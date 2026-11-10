@@ -368,6 +368,9 @@ enum Scene {
     /// it (the Pokédex, the options, the save prompt), so whether it is
     /// open is read from the game's events instead (`nds::field_menu`).
     Field,
+    /// A battle. The bottom screen shows a Poké Ball while the battle plays
+    /// out and the command buttons (FIGHT, BAG, RUN, POKéMON, then the
+    /// moves) while it waits for the player's choice.
     Battle,
     Menu,
     /// The opening, with the naming keyboard on the bottom screen when the
@@ -392,12 +395,15 @@ fn scene(overlays: &[u16]) -> Scene {
     }
 }
 
-/// Whether the bottom screen should be up in `scene`: in battles and menus,
-/// on the field while the X menu, or a screen opened from it, is up, and in
-/// the opening while the naming keyboard is.
+/// Whether the bottom screen should be up in `scene`: in menus; in battles
+/// while they wait for a command, which the bottom screen shows on BG0 and
+/// BG1 (the Poké Ball it shows meanwhile is on BG3); on the field while the
+/// X menu, or a screen opened from it, is up; and in the opening while the
+/// naming keyboard is.
 fn scene_wants_panel(scene: Scene, x_menu: bool, bottom: BottomScreen) -> Option<bool> {
     match scene {
-        Scene::Battle | Scene::Menu => Some(true),
+        Scene::Menu => Some(true),
+        Scene::Battle => Some(!bottom.shows_bg(3) && (bottom.shows_bg(0) || bottom.shows_bg(1))),
         Scene::Field => Some(x_menu),
         Scene::Opening => Some(bottom.engine_a),
         Scene::Unknown => None,
@@ -2704,9 +2710,25 @@ mod tests {
         let shown = BottomScreen::default();
         assert_eq!(scene_wants_panel(Scene::Field, false, shown), Some(false));
         assert_eq!(scene_wants_panel(Scene::Field, true, shown), Some(true));
-        assert_eq!(scene_wants_panel(Scene::Battle, false, shown), Some(true));
         assert_eq!(scene_wants_panel(Scene::Menu, false, shown), Some(true));
         assert_eq!(scene_wants_panel(Scene::Unknown, true, shown), None);
+    }
+
+    #[test]
+    fn battles_raise_the_bottom_screen_for_commands_only() {
+        // White 2's engine B DISPCNT through the first battle: 0x1C13 while
+        // it plays out, 0x1D13 for the frames the command buttons fade in,
+        // 0x1713 while they wait for a choice.
+        let layers = |dispcnt: u32| BottomScreen {
+            engine_a: false,
+            layers: (dispcnt >> 8) as u8 & 0x1F,
+        };
+        let battle = |dispcnt| scene_wants_panel(Scene::Battle, false, layers(dispcnt));
+        assert_eq!(battle(0x1C13), Some(false));
+        assert_eq!(battle(0x1D13), Some(false));
+        assert_eq!(battle(0x1713), Some(true));
+        // As it starts, before the Poké Ball shows, no backgrounds are on.
+        assert_eq!(battle(0x0013), Some(false));
     }
 
     #[test]
