@@ -1116,7 +1116,11 @@ impl App {
             self.history.drain(..pick.keep_from);
         }
         let menu_vertices = if self.menu.open {
-            self.menu.paint(&self.settings)
+            self.menu.paint(
+                &self.settings,
+                self.scale.load(Ordering::Relaxed),
+                self.widescreen.load(Ordering::Relaxed),
+            )
         } else {
             Vec::new()
         };

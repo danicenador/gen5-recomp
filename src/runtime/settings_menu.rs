@@ -180,7 +180,9 @@ impl Menu {
         self.selected.saturating_sub(13)
     }
 
-    fn row(&self, index: usize, s: &Settings) -> (String, String) {
+    /// `scale` is the multiple frames are drawn at now, which Auto resolves
+    /// for the monitor, and `wide` whether the top screen is 16:9.
+    fn row(&self, index: usize, s: &Settings, scale: u32, wide: bool) -> (String, String) {
         if self.page != Page::Main {
             let bindings = if self.page == Page::Keyboard {
                 &s.bindings.keyboard
@@ -201,10 +203,7 @@ impl Menu {
         }
         let on = |b| if b { "On".into() } else { "Off".into() };
         match index {
-            0 => (
-                "Render resolution".into(),
-                s.scale.map_or("Auto".into(), |n| format!("{n}x")),
-            ),
+            0 => ("Render resolution".into(), resolution(s.scale, scale, wide)),
             1 => (
                 "Aspect ratio".into(),
                 if s.widescreen { "16:9" } else { "4:3" }.into(),
@@ -249,7 +248,9 @@ impl Menu {
         }
     }
 
-    pub fn paint(&self, s: &Settings) -> Vec<Vertex> {
+    /// `scale` and `wide` are the resolution multiple and aspect ratio the
+    /// game is drawn with now (see `row`).
+    pub fn paint(&self, s: &Settings, scale: u32, wide: bool) -> Vec<Vertex> {
         let mut paint = Paint(Vec::new());
         paint.rect(0., 0., WIDTH, HEIGHT, [0.02, 0.04, 0.08, 0.75]);
         paint.rect(24., 18., 464., 350., [0.20, 0.25, 0.31, 1.]);
@@ -278,7 +279,7 @@ impl Menu {
             } else {
                 [0.10, 0.15, 0.20, 1.]
             };
-            let (label, value) = self.row(index, s);
+            let (label, value) = self.row(index, s, scale, wide);
             paint.text(44., y + 5., &label, color);
             paint.text(284., y + 5., &value, color);
         }
@@ -299,6 +300,17 @@ impl Menu {
         }
         paint.0
     }
+}
+
+/// The render resolution row: the chosen multiple (or Auto and the multiple
+/// it picked) and the size of the top screen drawn at it, 256 or 342 columns
+/// wide (16:9) and 192 lines per multiple.
+fn resolution(chosen: Option<u32>, scale: u32, wide: bool) -> String {
+    use crate::nds::gpu2d::{HEIGHT, WIDE_EXTRA, WIDTH};
+    let width = (WIDTH + if wide { 2 * WIDE_EXTRA } else { 0 }) as u32 * scale;
+    let height = HEIGHT as u32 * scale;
+    let auto = if chosen.is_none() { "Auto: " } else { "" };
+    format!("{auto}{scale}x ({width} x {height})")
 }
 
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -572,7 +584,7 @@ mod tests {
                 &mut encoder,
                 &view,
                 (1024, 768),
-                &menu.paint(&Settings::default()),
+                &menu.paint(&Settings::default(), 1, false),
             );
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -634,6 +646,13 @@ mod tests {
         assert!(s.bindings.controller[2].is_empty());
         assert_eq!(m.back(), Effect::None);
         assert_eq!(m.back(), Effect::Close);
+    }
+    #[test]
+    fn render_resolution_shows_the_top_screen_size_it_draws() {
+        assert_eq!(resolution(Some(4), 4, false), "4x (1024 x 768)");
+        assert_eq!(resolution(Some(1), 1, true), "1x (342 x 192)");
+        assert_eq!(resolution(None, 6, true), "Auto: 6x (2052 x 1152)");
+        assert_eq!(resolution(None, 6, false), "Auto: 6x (1536 x 1152)");
     }
     #[test]
     fn touch_uses_the_same_letterboxed_canvas_as_rendering() {
