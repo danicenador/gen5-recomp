@@ -977,7 +977,18 @@ impl Geometry {
 
     pub fn render(&self, io: &Io, vram: &Vram) -> Vec<Pixel> {
         let start = std::time::Instant::now();
-        let pixels = self.render_list(io, vram);
+        let pixels = self.render_list(io, vram, false);
+        self.render_nanos
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        pixels
+    }
+
+    /// `render` for widescreen: rows `WIDTH + 2 * WIDE_EXTRA` wide, the
+    /// DS's columns in the middle, for display capture to keep what lies
+    /// beside them.
+    pub fn render_wide(&self, io: &Io, vram: &Vram) -> Vec<Pixel> {
+        let start = std::time::Instant::now();
+        let pixels = self.render_list(io, vram, true);
         self.render_nanos
             .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         pixels
@@ -988,14 +999,15 @@ impl Geometry {
         std::time::Duration::from_nanos(self.render_nanos.swap(0, Ordering::Relaxed))
     }
 
-    fn render_list(&self, io: &Io, vram: &Vram) -> Vec<Pixel> {
+    fn render_list(&self, io: &Io, vram: &Vram, wide: bool) -> Vec<Pixel> {
+        let columns = if wide { WIDTH + 2 * WIDE_EXTRA } else { WIDTH };
         let clear = io.get32(0x0400_0350);
         let mut pixels = vec![
             Pixel {
                 color: clear as u16 & 0x7fff,
                 alpha: ((clear >> 16) & 31) as u8
             };
-            WIDTH * HEIGHT
+            columns * HEIGHT
         ];
         let clear_depth = f64::from(io.get16(0x0400_0354) & 0x7fff) / 32767.0;
         let list = &*self.displayed;
@@ -1005,28 +1017,32 @@ impl Geometry {
             } else {
                 clear_depth
             };
-            WIDTH * HEIGHT
+            columns * HEIGHT
         ];
         // Only a previously drawn translucent polygon suppresses another
         // translucent polygon with the same ID; opaque IDs do not.
-        let mut ids = vec![64; WIDTH * HEIGHT];
+        let mut ids = vec![64; columns * HEIGHT];
         let state = RenderState::read(io, list.render_w);
         // The DS's own view: display capture and native-resolution screens
-        // show exactly the screen's 256 columns.
-        let triangles = triangles(&list.polygons, list.manual_sort, false);
+        // show exactly the screen's 256 columns. A wide render keeps what
+        // widescreen shows beside them too.
+        let mut triangles = triangles(&list.polygons, list.manual_sort, wide);
+        if wide {
+            triangles = triangles.into_iter().map(Triangle::widened).collect();
+        }
         if triangles.is_empty() {
             return pixels;
         }
         // Every pixel only depends on the polygons drawn over it, in order,
         // so bands of rows render in parallel with the same result.
         pixels
-            .par_chunks_mut(BAND_ROWS * WIDTH)
-            .zip(depths.par_chunks_mut(BAND_ROWS * WIDTH))
-            .zip(ids.par_chunks_mut(BAND_ROWS * WIDTH))
+            .par_chunks_mut(BAND_ROWS * columns)
+            .zip(depths.par_chunks_mut(BAND_ROWS * columns))
+            .zip(ids.par_chunks_mut(BAND_ROWS * columns))
             .enumerate()
             .for_each(|(index, ((pixels, depths), ids))| {
                 let top = index * BAND_ROWS;
-                let bottom = top + pixels.len() / WIDTH;
+                let bottom = top + pixels.len() / columns;
                 for triangle in &triangles {
                     let rows = triangle.min_y.max(top)..triangle.max_y.min(bottom);
                     if !rows.is_empty() {
@@ -1412,6 +1428,9 @@ struct Triangle<'a> {
     max_x: usize,
     min_y: usize,
     max_y: usize,
+    /// The width of the rows it is drawn into: `WIDTH`, or the widescreen
+    /// width for `widened` triangles.
+    columns: usize,
 }
 
 const EDGES: [(usize, usize); 3] = [(1, 2), (2, 0), (0, 1)];
@@ -1487,7 +1506,31 @@ impl<'a> Triangle<'a> {
             max_x,
             min_y,
             max_y,
+            columns: WIDTH,
         })
+    }
+
+    /// The triangle drawn into rows `WIDTH + 2 * WIDE_EXTRA` wide, whose
+    /// first column is DS column `-WIDE_EXTRA`.
+    fn widened(mut self) -> Self {
+        let columns = WIDTH + 2 * WIDE_EXTRA;
+        for point in &mut self.screen {
+            point[0] += WIDE_EXTRA as f64;
+        }
+        let low = self
+            .screen
+            .iter()
+            .map(|p| p[0])
+            .fold(f64::INFINITY, f64::min);
+        let high = self
+            .screen
+            .iter()
+            .map(|p| p[0])
+            .fold(f64::NEG_INFINITY, f64::max);
+        self.min_x = low.floor().clamp(0.0, columns as f64) as usize;
+        self.max_x = high.ceil().clamp(0.0, columns as f64) as usize;
+        self.columns = columns;
+        self
     }
 
     /// The columns of row `y` that can be inside the triangle, with a pixel
@@ -1569,7 +1612,7 @@ impl<'a> Triangle<'a> {
                         * 0.5
                         + 0.5
                 };
-                let at = (y - top) * WIDTH + x;
+                let at = (y - top) * self.columns + x;
                 if depth_equal {
                     if (depth - depths[at]).abs() > if w_buffer { 0.125 } else { 0.000125 } {
                         continue;
@@ -2132,6 +2175,33 @@ mod tests {
         vertex(g, 5325, -2048, 0);
         vertex(g, 4813, 2048, 0);
         command(g, 0x41, &[]);
+    }
+
+    #[test]
+    fn a_wide_software_render_draws_beside_the_screen_too() {
+        let mut g = Geometry {
+            wide: true,
+            ..Default::default()
+        };
+        triangle(&mut g, 31, 0, 31, 0);
+        beside_the_screen(&mut g);
+        command(&mut g, 0x50, &[0]);
+        g.vblank();
+        let columns = WIDTH + 2 * WIDE_EXTRA;
+        let narrow = g.render(&io(), &Vram::new());
+        let wide = g.render_wide(&io(), &Vram::new());
+        assert_eq!(wide.len(), columns * HEIGHT);
+        // The DS's columns are the same picture.
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let (a, b) = (wide[y * columns + WIDE_EXTRA + x], narrow[y * WIDTH + x]);
+                assert_eq!((a.color, a.alpha), (b.color, b.alpha), "pixel {x},{y}");
+            }
+        }
+        // The triangle beside the screen, DS columns 262 to 294, shows
+        // only in the wide render.
+        assert_eq!(wide[96 * columns + WIDE_EXTRA + 278].alpha, 31);
+        assert_eq!(wide[96 * columns + WIDE_EXTRA + 300].alpha, 0);
     }
 
     #[test]

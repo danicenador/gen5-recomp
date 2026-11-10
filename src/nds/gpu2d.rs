@@ -8,7 +8,7 @@ use super::gpu3d::Pixel;
 pub use super::gpu3d::WIDE_EXTRA;
 use super::io::Io;
 use super::memory::Memory;
-use super::vram::{Region, Vram};
+use super::vram::{ColorMap, Region, Vram, WideCapture};
 use rayon::prelude::*;
 
 pub const WIDTH: usize = 256;
@@ -77,12 +77,15 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
     let blank = vec![Pixel::default(); WIDTH * HEIGHT];
     let mut three_d = None;
     // Each engine's screen, and what its widescreen columns show.
-    let mut engine = |b: bool, bit: u16| -> (Vec<Composed>, Composed, u16) {
+    let wide = io.geometry.wide;
+    type Screen = (Vec<Composed>, Composed, u16, Option<Vec<Composed>>);
+    let mut engine = |b: bool, bit: u16| -> Screen {
         if power & bit == 0 {
             return (
                 vec![Composed::fixed(0); WIDTH * HEIGHT],
                 Composed::fixed(0),
                 0,
+                None,
             );
         }
         let engine = Engine::new(io, memory, b, &blank);
@@ -94,7 +97,7 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
                 .into_iter()
                 .map(Composed::fixed)
                 .collect();
-            return (colors, Composed::fixed(0), brightness);
+            return (colors, Composed::fixed(0), brightness, None);
         }
         let mut composed = vec![Composed::default(); WIDTH * HEIGHT];
         let scroll = std::sync::atomic::AtomicUsize::new(0);
@@ -115,21 +118,35 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
                 io.geometry.scene(io, &memory.vram),
             ));
         }
-        (composed, engine.side(dispcnt), brightness)
+        // Captured screens shown as bitmaps fill the sides line by line.
+        let captured = wide
+            .then(|| engine.capture_sides(dispcnt, &memory.vram))
+            .flatten();
+        (composed, engine.side(dispcnt), brightness, captured)
     };
-    let (a, a_side, a_bright) = engine(false, 1 << 1);
-    let (b, b_side, b_bright) = engine(true, 1 << 9);
+    let (a, a_side, a_bright, a_captured) = engine(false, 1 << 1);
+    let (b, b_side, b_bright, _) = engine(true, 1 << 9);
     // POWCNT1 bit 15 puts engine A on the top screen.
     let a_on_top = power & 0x8000 != 0;
-    let (top, side, bottom, brightness) = if a_on_top {
-        (a, a_side, b, [a_bright, b_bright])
+    let (top, side, bottom, brightness, captured) = if a_on_top {
+        (a, a_side, b, [a_bright, b_bright], a_captured)
     } else {
-        (b, b_side, a, [b_bright, a_bright])
+        (b, b_side, a, [b_bright, a_bright], None)
     };
     let extra = if io.geometry.wide { WIDE_EXTRA } else { 0 };
     let mut pixels = Vec::with_capacity((WIDTH + 2 * extra) * 2 * HEIGHT);
-    for (screen, side) in [(&top, side), (&bottom, Composed::fixed(0))] {
-        for row in screen.chunks(WIDTH) {
+    for (screen, side, captured) in [
+        (&top, side, captured.as_deref()),
+        (&bottom, Composed::fixed(0), None),
+    ] {
+        for (line, row) in screen.chunks(WIDTH).enumerate() {
+            if let Some(captured) = captured.filter(|_| extra > 0) {
+                let sides = &captured[line * 2 * WIDE_EXTRA..][..2 * WIDE_EXTRA];
+                pixels.extend(sides[..WIDE_EXTRA].iter().map(Composed::pack));
+                pixels.extend(row.iter().map(Composed::pack));
+                pixels.extend(sides[WIDE_EXTRA..].iter().map(Composed::pack));
+                continue;
+            }
             // Each side mirrors the line's end: column -1 - i shows
             // column i, column 256 + i column 255 - i.
             pixels.extend(
@@ -161,17 +178,20 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
 /// layer is on top there, the 2D layers under it are mirrored into the
 /// extra columns, so a background behind the 3D (Juniper's gradient in the
 /// introduction, the rival's backdrop) carries on instead of the backdrop
-/// color. Where 2D is in front of the 3D at the mirrored column (a text box
-/// near the end of the line), the line's last pixel `outer` carries on
-/// instead, if the 3D layer is on top there; failing that, they show
-/// `side`.
+/// color. So is a 2D layer blended over the 3D (the season's name fading
+/// out over the field when a game is continued), which the 3D layer still
+/// shows through. Where opaque 2D is in front of the 3D at the mirrored
+/// column (a text box near the end of the line), the line's last pixel
+/// `outer` carries on instead, if it shows the 3D layer; failing that, they
+/// show `side`.
 fn side_of(side: Composed, mirrored: Composed, outer: Composed) -> Composed {
-    let under_three_d = |pixel: &Composed| matches!(pixel.with, With::First { .. });
-    if !under_three_d(&side) {
+    let shows_three_d =
+        |pixel: &Composed| matches!(pixel.with, With::First { .. } | With::Second { .. });
+    if !matches!(side.with, With::First { .. }) {
         side
-    } else if under_three_d(&mirrored) {
+    } else if shows_three_d(&mirrored) {
         mirrored
-    } else if under_three_d(&outer) {
+    } else if shows_three_d(&outer) {
         outer
     } else {
         side
@@ -329,11 +349,84 @@ pub fn capture_with(io: &mut Io, memory: &mut Memory, cache: &mut FrameCache) {
             });
         }
     }
-    for (i, color) in output.into_iter().enumerate() {
+    let start = bank * 0x20000 + write_offset;
+    memory
+        .vram
+        .wide_captures
+        .retain(|wide| wide.start / 0x20000 != bank);
+    let sides = (io.geometry.wide
+        && mode == 0
+        && width == WIDTH
+        && write_offset + width * height * 2 <= 0x20000)
+        .then(|| capture_sides(io, memory, control & (1 << 24) != 0, height));
+    for (i, color) in output.iter().enumerate() {
         let at = bank * 0x20000 + ((write_offset + i * 2) & 0x1ffff);
         memory.vram.banks[at..at + 2].copy_from_slice(&color.to_le_bytes());
     }
+    if let Some(sides) = sides {
+        memory.vram.wide_captures.push(WideCapture {
+            start,
+            written: output,
+            sides,
+            extra: WIDE_EXTRA,
+        });
+    }
     io.set32(CAPTURE, control & !0x8000_0000);
+}
+
+/// What widescreen showed beside the screen as display capture source A
+/// saw it: the 3D layer alone (`three_d_only`) or engine A's picture, per
+/// line `WIDE_EXTRA` pixels left of the screen and then right of it, with
+/// bit 15 set where opaque.
+fn capture_sides(io: &Io, memory: &Memory, three_d_only: bool, height: usize) -> Vec<u16> {
+    let columns = WIDTH + 2 * WIDE_EXTRA;
+    let dispcnt = io.get32(0x0400_0000);
+    let shows_three_d = three_d_only || io.get16(POWCNT1) & (1 << 3) != 0;
+    let wide = if shows_three_d {
+        io.geometry.render_wide(io, &memory.vram)
+    } else {
+        vec![Pixel::default(); columns * HEIGHT]
+    };
+    let at = |y: usize, x: usize| wide[y * columns + x];
+    let mut sides = Vec::with_capacity(height * 2 * WIDE_EXTRA);
+    if three_d_only {
+        for y in 0..height {
+            for x in (0..WIDE_EXTRA).chain(WIDE_EXTRA + WIDTH..columns) {
+                let pixel = at(y, x);
+                sides.push(pixel.color | if pixel.alpha != 0 { 0x8000 } else { 0 });
+            }
+        }
+        return sides;
+    }
+    if dispcnt & 0x80 != 0 {
+        return vec![0xFFFF; height * 2 * WIDE_EXTRA];
+    }
+    // Engine A's picture: its sides as the screen showed them, with the
+    // wide 3D layer.
+    let blank = vec![Pixel::default(); WIDTH * HEIGHT];
+    let engine = Engine::new(io, memory, false, &blank);
+    let side = engine.side(dispcnt);
+    let mut row = [Composed::default(); WIDTH];
+    let captured = engine.capture_sides(dispcnt, &memory.vram);
+    for y in 0..height {
+        engine.compose_line(dispcnt, y, &mut row);
+        for x in (0..WIDE_EXTRA).chain(WIDE_EXTRA + WIDTH..columns) {
+            let column = if x < WIDE_EXTRA { x } else { x - WIDTH };
+            let composed = match &captured {
+                Some(pixels) => pixels[y * 2 * WIDE_EXTRA + column],
+                // Mirrored, as `render_scaled` shows them.
+                None if x < WIDE_EXTRA => side_of(side, row[WIDE_EXTRA - 1 - x], row[0]),
+                None => side_of(
+                    side,
+                    row[WIDTH - 1 - (x - WIDE_EXTRA - WIDTH)],
+                    row[WIDTH - 1],
+                ),
+            };
+            let pixel = at(y, x);
+            sides.push(composed.resolve((pixel.alpha != 0).then_some(pixel)) | 0x8000);
+        }
+    }
+    sides
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -523,6 +616,27 @@ impl BlendState {
                 3 => map_channels(first.color, |c| c - c * evy / 16),
                 _ => first.color,
             }
+        }
+    }
+
+    /// A pixel from the top three of its layers (the 3D layer marked by
+    /// `Layer::three_d`), with `backdrop` under them.
+    fn compose(&self, stack: &[Option<Layer>; 3], backdrop: Layer) -> Composed {
+        let mut flat = stack.iter().flatten().filter(|layer| !layer.three_d);
+        let (first, second) = (flat.next().copied(), flat.next().copied());
+        let without = self.fixed(first, second.unwrap_or(backdrop), backdrop);
+        let position = stack
+            .iter()
+            .position(|layer| layer.is_some_and(|layer| layer.three_d));
+        let with = match position {
+            Some(0) => self.three_d_first(stack[1].unwrap_or(backdrop)),
+            Some(1) => self.three_d_second(stack[0].unwrap()),
+            _ => With::Fixed(without),
+        };
+        Composed {
+            without,
+            with,
+            coefficients: self.coefficients,
         }
     }
 
@@ -832,25 +946,143 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-            let state = effects(mask);
-            let mut flat = stack.iter().flatten().filter(|layer| !layer.three_d);
-            let (first, second) = (flat.next().copied(), flat.next().copied());
-            let without = state.fixed(first, second.unwrap_or(backdrop), backdrop);
-            let position = stack
-                .iter()
-                .position(|layer| layer.is_some_and(|layer| layer.three_d));
-            let with = match position {
-                Some(0) => state.three_d_first(stack[1].unwrap_or(backdrop)),
-                Some(1) => state.three_d_second(stack[0].unwrap()),
-                _ => With::Fixed(without),
-            };
-            *out = Composed {
-                without,
-                with,
-                coefficients,
-            };
+            *out = effects(mask).compose(&stack, backdrop);
         }
         scroll
+    }
+
+    /// Widescreen's extra columns, line by line (`WIDE_EXTRA` left of the
+    /// screen, then right of it), where the screen shows a captured screen
+    /// as a direct-color bitmap background, from a capture made in
+    /// widescreen (`WideCapture`) that is still in VRAM: the bitmap carries
+    /// on into them, through its own affine transform, from VRAM where it
+    /// maps to the 256 captured columns and from the capture's sides beside
+    /// them, under the 3D layer if the screen shows it. Sprites and other
+    /// backgrounds stay in the middle. `None` when no such background shows.
+    fn capture_sides(&self, dispcnt: u32, vram: &Vram) -> Option<Vec<Composed>> {
+        if self.b || vram.wide_captures.is_empty() {
+            return None;
+        }
+        let region = self.region(false);
+        // The captured bitmaps shown: index, control, base, capture.
+        let mut bitmaps = Vec::new();
+        for index in 2..4 {
+            let control = self.reg16(8 + 2 * index as u32);
+            if dispcnt & (0x100 << index) == 0
+                || self.bg_kind(dispcnt, index) != BgKind::Extended
+                || control & 0x84 != 0x84
+                || control >> 14 != 1
+            {
+                continue;
+            }
+            let base = usize::from((control >> 8) & 0x1F) * 0x4000;
+            let Some(start) = vram.offset(region, base) else {
+                continue;
+            };
+            if let Some((capture, changes)) = vram
+                .wide_captures
+                .iter()
+                .filter(|capture| capture.start == start)
+                .find_map(|capture| Some((capture, capture.changes(vram)?)))
+            {
+                bitmaps.push((index, control, base, capture, changes));
+            }
+        }
+        if bitmaps.is_empty() {
+            return None;
+        }
+        let mask = if dispcnt & 0xE000 == 0 {
+            0x3F
+        } else {
+            self.reg16(0x4A) & 0x3F
+        };
+        let three_d = dispcnt & 0x100 != 0 && self.bg_kind(dispcnt, 0) == BgKind::ThreeD;
+        let three_d_priority = (self.reg16(8) & 3) as u8;
+        let alpha = self.reg16(0x52);
+        let state = BlendState {
+            blend: self.reg16(0x50),
+            effects: mask & 0x20 != 0,
+            coefficients: Coefficients {
+                eva: (alpha & 0x1F).min(16) as u8,
+                evb: ((alpha >> 8) & 0x1F).min(16) as u8,
+                evy: (self.reg16(0x54) & 0x1F).min(16) as u8,
+            },
+        };
+        let backdrop = Layer {
+            color: self.palette(0),
+            layer: LAYER_BACKDROP,
+            semi: false,
+            three_d: false,
+        };
+        let sample = |index: usize,
+                      control: u16,
+                      base: usize,
+                      capture: &WideCapture,
+                      changes: ColorMap,
+                      line: usize,
+                      x: i32| {
+            let params = 0x20 + 0x10 * (index as u32 - 2);
+            let pa = i32::from(self.reg16(params) as i16);
+            let pb = i32::from(self.reg16(params + 2) as i16);
+            let pc = i32::from(self.reg16(params + 4) as i16);
+            let pd = i32::from(self.reg16(params + 6) as i16);
+            let reference = |offset: u32| ((self.reg32(params + offset) << 4) as i32) >> 4;
+            let mut px = (reference(8) + pb * line as i32 + pa * x) >> 8;
+            let mut py = (reference(12) + pd * line as i32 + pc * x) >> 8;
+            if control & 0x2000 != 0 {
+                px = px.rem_euclid(256);
+                py = py.rem_euclid(256);
+            }
+            if !(0..256).contains(&py) {
+                return None;
+            }
+            let color = if (0..256).contains(&px) {
+                vram.read16(region, base + (py as usize * 256 + px as usize) * 2)
+            } else if (py as usize) < capture.height() {
+                changes.apply(capture.side(px, py as usize)?)
+            } else {
+                return None;
+            };
+            (color & 0x8000 != 0).then_some(color & 0x7FFF)
+        };
+        let columns = (-(WIDE_EXTRA as i32)..0).chain(WIDTH as i32..(WIDTH + WIDE_EXTRA) as i32);
+        let sides = (0..HEIGHT)
+            .flat_map(|line| columns.clone().map(move |x| (line, x)))
+            .map(|(line, x)| {
+                let mut stack: [Option<Layer>; 3] = [None; 3];
+                let mut push = |layer: Layer| {
+                    if let Some(slot) = stack.iter_mut().find(|slot| slot.is_none()) {
+                        *slot = Some(layer);
+                    }
+                };
+                for priority in 0..4 {
+                    if three_d && three_d_priority == priority && mask & 1 != 0 {
+                        push(Layer {
+                            color: 0,
+                            layer: 0,
+                            semi: false,
+                            three_d: true,
+                        });
+                    }
+                    for &(index, control, base, capture, changes) in &bitmaps {
+                        if (control & 3) as u8 != priority || mask & (1 << index) == 0 {
+                            continue;
+                        }
+                        if let Some(color) = sample(index, control, base, capture, changes, line, x)
+                        {
+                            push(Layer {
+                                color,
+                                layer: index,
+                                semi: false,
+                                three_d: false,
+                            });
+                        }
+                    }
+                }
+                state.compose(&stack, backdrop)
+            })
+            .collect();
+        Some(sides)
     }
 
     /// What widescreen's extra columns show: they are outside every
@@ -1377,10 +1609,70 @@ mod tests {
         let text_box = Composed::fixed(0x7FFF);
         assert_eq!(side_of(side, text_box, gradient), gradient);
         assert_eq!(side_of(side, text_box, text_box), side);
+        // A layer blended over the 3D is mirrored too.
+        let fading = Composed {
+            without: 0,
+            with: With::Second { first: 0 },
+            coefficients: state.coefficients,
+        };
+        assert_eq!(side_of(side, fading, gradient), fading);
         assert_eq!(
             side_of(Composed::fixed(0), gradient, gradient),
             Composed::fixed(0)
         );
+    }
+
+    #[test]
+    fn a_captured_screen_shown_as_a_bitmap_fills_the_sides() {
+        let mut io = Io::new();
+        let mut memory = Memory::new();
+        io.geometry.wide = true;
+        // Bank D as engine A's backgrounds; mode 5 with BG2 a 256x256
+        // direct-color bitmap at 0, untransformed; A on the top screen.
+        memory.vram.control[3] = 0x81;
+        memory.vram.update();
+        io.set16(POWCNT1, 0x8003);
+        io.set32(0x0400_0000, 0x0001_0405);
+        io.set16(0x0400_000C, 0x4084);
+        io.set16(0x0400_0020, 0x100);
+        io.set16(0x0400_0026, 0x100);
+        // Captured red, which the game has since halved in place, with green
+        // beside it.
+        let start = 3 * 0x20000;
+        let fill = |memory: &mut Memory, color: u16| {
+            for at in (start..start + 256 * 192 * 2).step_by(2) {
+                memory.vram.banks[at..at + 2].copy_from_slice(&color.to_le_bytes());
+            }
+        };
+        fill(&mut memory, 0x800F);
+        memory.vram.wide_captures.push(WideCapture {
+            start,
+            written: vec![0x801F; 256 * 192],
+            sides: vec![0x83E0; 192 * 2 * WIDE_EXTRA],
+            extra: WIDE_EXTRA,
+        });
+        let columns = WIDTH + 2 * WIDE_EXTRA;
+        let without = |frame: &ScaledFrame, x: usize, y: usize| {
+            frame.pixels[y * columns + x][0] as u16 & 0x7FFF
+        };
+        let frame = render_scaled(&io, &memory);
+        assert_eq!(without(&frame, 0, 10), 0x03E0);
+        assert_eq!(without(&frame, columns - 1, 100), 0x03E0);
+        assert_eq!(without(&frame, WIDE_EXTRA, 10), 0x000F);
+        // Zoomed in by two around the middle, as through a door, the sides
+        // show the bitmap itself.
+        io.set16(0x0400_0020, 0x80);
+        io.set32(0x0400_0028, 64 << 8);
+        let frame = render_scaled(&io, &memory);
+        assert_eq!(without(&frame, 0, 10), 0x000F);
+        io.set16(0x0400_0020, 0x100);
+        io.set32(0x0400_0028, 0);
+        // Other data in the bank is not the captured screen any more.
+        for at in (start..start + 256 * 96 * 2).step_by(2) {
+            memory.vram.banks[at..at + 2].copy_from_slice(&0x8123_u16.to_le_bytes());
+        }
+        let frame = render_scaled(&io, &memory);
+        assert_eq!(without(&frame, 0, 10), 0);
     }
 
     #[test]

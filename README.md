@@ -277,10 +277,19 @@ screen shows the 3D layer, with the same blending and master brightness, or
 black when it shows no 3D (menus and other 2D screens). Under the 3D layer
 the sides mirror what is under it at that end of each line, so a background
 behind the 3D, such as the gradient behind Professor Juniper, carries on
-instead of the backdrop color; where 2D is in front of the 3D there, the
-last column carries on, and where it is in front at the end of the line as
-well, the backdrop is used. The bottom screen stays 4:3 and is centered
-under the top one. Display capture still sees the DS's 256 columns.
+instead of the backdrop color; so does a 2D layer blended over the 3D, such
+as the season's name fading out over the field when a game is continued.
+Where opaque 2D is in front of the 3D there, the last column carries on, and
+where it is in front at the end of the line as well, the backdrop is used.
+The bottom screen stays 4:3 and is centered under the top one. Display
+capture still writes the DS's 256 columns, but in widescreen it also keeps
+what the screen showed beside them (the 3D layer drawn 342 columns wide in
+software). The game's transitions show a captured screen as a direct-color
+bitmap background (walking through a door, a battle starting, an item
+received), and while such a bitmap is shown and still holds the captured
+pixels, or the same pixels darkened or tinted in place channel by channel,
+it carries on into the sides through its own affine transform: from VRAM
+where it maps to the captured columns, from the kept sides beside them.
 Widescreen uses the GPU renderer at every resolution, and `boot` with
 `GEN5_WIDESCREEN=1` saves widescreen screenshots.
 
