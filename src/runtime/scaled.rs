@@ -23,7 +23,7 @@
 
 use crate::Result;
 use crate::nds::gpu2d::{HEIGHT, ScaledFrame, WIDTH};
-use crate::nds::gpu3d::{Batch, DisplayList, Matched, Scene, SceneVertex};
+use crate::nds::gpu3d::{AlphaTest, Batch, DisplayList, Matched, Scene, SceneVertex};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -92,8 +92,8 @@ pub struct Renderer {
     texture_memory: wgpu::Buffer,
     palette_memory: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
-    /// By (translucent, depth equal, depth write).
-    pipelines: HashMap<(bool, bool, bool), wgpu::RenderPipeline>,
+    /// By (translucent, depth equal, depth write, fragment alpha selection).
+    pipelines: HashMap<(bool, bool, bool, AlphaTest), wgpu::RenderPipeline>,
     vertices: Option<(wgpu::Buffer, u64)>,
     screen_layout: wgpu::BindGroupLayout,
     screen_pipeline: wgpu::RenderPipeline,
@@ -399,14 +399,19 @@ impl Renderer {
     }
 
     fn pipeline(&mut self, batch: &Batch) -> &wgpu::RenderPipeline {
-        let key = (batch.translucent, batch.depth_equal, batch.depth_write);
+        let key = (
+            batch.translucent,
+            batch.depth_equal,
+            batch.depth_write,
+            batch.alpha_test,
+        );
         let (device, layout, shader) = (
             &self.device,
             &self.scene_pipeline_layout,
             &self.scene_shader,
         );
         self.pipelines.entry(key).or_insert_with(|| {
-            let (translucent, depth_equal, depth_write) = key;
+            let (translucent, depth_equal, depth_write, alpha_test) = key;
             const ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
                 0 => Float32x4,
                 1 => Float32x3,
@@ -482,7 +487,10 @@ impl Renderer {
                 fragment: Some(wgpu::FragmentState {
                     module: shader,
                     entry_point: Some("scene_fragment"),
-                    compilation_options: Default::default(),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[("alpha_test", alpha_test as u32 as f64)],
+                        ..Default::default()
+                    },
                     targets: &[
                         Some(wgpu::ColorTargetState {
                             format: COLOR_FORMAT,
@@ -699,7 +707,12 @@ impl Renderer {
                 pass.set_vertex_buffer(0, vertices.slice(..));
                 pass.set_bind_group(0, &self.scene_bind_group, &[]);
                 for batch in &triangles.batches {
-                    let key = (batch.translucent, batch.depth_equal, batch.depth_write);
+                    let key = (
+                        batch.translucent,
+                        batch.depth_equal,
+                        batch.depth_write,
+                        batch.alpha_test,
+                    );
                     pass.set_pipeline(&self.pipelines[&key]);
                     pass.set_stencil_reference(u32::from(batch.id));
                     pass.draw(batch.range.clone(), 0..1);

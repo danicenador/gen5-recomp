@@ -1131,25 +1131,7 @@ impl DisplayList {
         let mut batches: Vec<Batch> = Vec::new();
         for triangle in triangles(&polygons, self.manual_sort, wide) {
             let attr = triangle.polygon.attr;
-            let batch = Batch {
-                range: 0..0,
-                translucent: triangle.translucent,
-                depth_equal: attr & (1 << 14) != 0,
-                depth_write: !triangle.translucent || attr & (1 << 11) != 0,
-                id: if triangle.translucent {
-                    ((attr >> 24) & 63) as u8
-                } else {
-                    64
-                },
-            };
             let start = vertices.len() as u32;
-            match batches.last_mut() {
-                Some(last) if last.same_state(&batch) => {}
-                _ => batches.push(Batch {
-                    range: start..start,
-                    ..batch
-                }),
-            }
             for (i, vertex) in triangle.vertices.iter().enumerate() {
                 let w = vertex.clip[3];
                 vertices.push(SceneVertex {
@@ -1166,7 +1148,37 @@ impl DisplayList {
                     palette: triangle.polygon.palette,
                 });
             }
-            batches.last_mut().unwrap().range.end = vertices.len() as u32;
+            let end = vertices.len() as u32;
+            // Alpha textures are sorted as translucent polygons, but their
+            // opaque texels still write depth and bypass the translucent ID
+            // test. Separate fragment passes keep those per-pixel semantics.
+            let format = (triangle.polygon.texture >> 26) & 7;
+            let split = triangle.translucent && (attr >> 16) & 31 == 31 && matches!(format, 1 | 6);
+            let passes: &[(bool, AlphaTest)] = if split {
+                &[(false, AlphaTest::Opaque), (true, AlphaTest::Translucent)]
+            } else {
+                &[(triangle.translucent, AlphaTest::All)]
+            };
+            for &(translucent, alpha_test) in passes {
+                let batch = Batch {
+                    range: start..end,
+                    translucent,
+                    alpha_test,
+                    depth_equal: attr & (1 << 14) != 0,
+                    depth_write: !translucent || attr & (1 << 11) != 0,
+                    id: if translucent {
+                        ((attr >> 24) & 63) as u8
+                    } else {
+                        64
+                    },
+                };
+                match batches.last_mut() {
+                    Some(last) if last.same_state(&batch) && last.range.end == start => {
+                        last.range.end = end;
+                    }
+                    _ => batches.push(batch),
+                }
+            }
         }
         Triangles {
             vertices,
@@ -1207,12 +1219,21 @@ pub struct SceneVertex {
     pub palette: u32,
 }
 
+/// Which texel alpha values a GPU draw accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AlphaTest {
+    All = 0,
+    Opaque = 1,
+    Translucent = 2,
+}
+
 /// Consecutive triangles drawn with the same blending, depth and stencil
 /// state. `id` is the translucent polygon ID (64 for opaque polygons).
 #[derive(Clone, Debug)]
 pub struct Batch {
     pub range: std::ops::Range<u32>,
     pub translucent: bool,
+    pub alpha_test: AlphaTest,
     pub depth_equal: bool,
     pub depth_write: bool,
     pub id: u8,
@@ -1222,11 +1243,13 @@ impl Batch {
     fn same_state(&self, other: &Self) -> bool {
         (
             self.translucent,
+            self.alpha_test,
             self.depth_equal,
             self.depth_write,
             self.id,
         ) == (
             other.translucent,
+            other.alpha_test,
             other.depth_equal,
             other.depth_write,
             other.id,
@@ -2112,6 +2135,40 @@ mod tests {
                 let (x, y) = (index % 256, index / 256);
                 let inside = rows.contains(&y) && columns.contains(&x);
                 assert_eq!(pixel.alpha != 0, inside, "pixel {x},{y} of a {reach} quad");
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_alpha_texture_pixels_write_depth_and_do_not_share_translucent_ids() {
+        let mut gpu = crate::runtime::scaled::Headless::new().unwrap();
+        for format in [1, 6] {
+            let mut io = io();
+            let mut memory = super::super::memory::Memory::new();
+            memory.vram = texture_vram();
+            // White texels with maximum alpha in both A3I5 and A5I3.
+            memory.vram.banks[..64].fill(if format == 1 { 0xe3 } else { 0xfb });
+            command(&mut io.geometry, 0x2a, &[format << 26]);
+            triangle(&mut io.geometry, 31, 1024, 31, 2);
+            triangle(&mut io.geometry, 31 << 5, 0, 31, 2);
+            triangle(&mut io.geometry, 31 << 10, 2048, 31, 3);
+            command(&mut io.geometry, 0x50, &[0]);
+            io.advance_to_vblank();
+            io.set16(0x0400_0304, 0x800a);
+            io.set32(0x0400_0000, 0x10108);
+            io.set16(0x0400_0060, 9);
+            let software = super::super::gpu2d::render(&io, &memory);
+            let scaled = super::super::gpu2d::render_scaled(&io, &memory);
+            for scale in [1, 2] {
+                let (width, _, pixels) = gpu.render(&scaled, scale).unwrap();
+                let at = ((96 * scale * width + 128 * scale) * 4) as usize;
+                let expected = &software.top[(96 * WIDTH + 128) * 4..][..4];
+                assert_eq!(expected, &[0, 255, 0, 255]);
+                assert_eq!(
+                    &pixels[at..at + 4],
+                    expected,
+                    "format {format}, scale {scale}"
+                );
             }
         }
     }

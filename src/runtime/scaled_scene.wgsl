@@ -181,6 +181,10 @@ struct FragmentOut {
     @builtin(frag_depth) depth: f32,
 };
 
+// Alpha textures contain opaque as well as translucent pixels. The opaque
+// pass writes depth and ID 64; only the translucent pass tests polygon IDs.
+override alpha_test: u32 = 0u;
+
 @fragment
 fn scene_fragment(in: VertexOut) -> FragmentOut {
     let attr = in.polygon.x;
@@ -196,6 +200,9 @@ fn scene_fragment(in: VertexOut) -> FragmentOut {
         alpha = ((tex.alpha + 1u) * (polygon_alpha + 1u) - 1u) / 32u;
     }
     if alpha == 0u || ((control & 4u) != 0u && alpha <= scene.alpha_ref) {
+        discard;
+    }
+    if (alpha_test == 1u && alpha != 31u) || (alpha_test == 2u && alpha == 31u) {
         discard;
     }
     let tc = rgb(tex.color);
