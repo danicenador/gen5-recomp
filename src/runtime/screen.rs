@@ -16,7 +16,7 @@ use crate::Result;
 use crate::nds::gpu2d::{Frame, HEIGHT, WIDTH};
 use crate::nds::gpu3d::{DisplayList, Matched};
 use crate::nds::input::{self, Input};
-use crate::nds::machine::LoadedOverlays;
+use crate::nds::machine::{BottomScreen, LoadedOverlays};
 use crate::nds::speed::Speed;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -354,6 +354,12 @@ const BATTLE_OVERLAYS: &[u16] = &[167, 168, 169, 170];
 /// whole opening, whose speeches are on the top screen.
 const MENU_OVERLAYS: &[u16] = &[140, 142, 165, 207, 316];
 
+/// The naming keyboard's overlay. It stays in RAM through the whole
+/// opening, Professor Juniper's speeches included, so the keyboard itself
+/// is told by the screens: while it is up, the game swaps them, putting
+/// engine A on the bottom screen.
+const NAMING_OVERLAY: u16 = 280;
+
 /// What the game is doing, going by the overlays in RAM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scene {
@@ -364,7 +370,10 @@ enum Scene {
     Field,
     Battle,
     Menu,
-    /// The title screen, the opening, a map transition: no telling.
+    /// The opening, with the naming keyboard on the bottom screen when the
+    /// player names themselves and the rival.
+    Opening,
+    /// The title screen, a map transition: no telling.
     Unknown,
 }
 
@@ -376,17 +385,21 @@ fn scene(overlays: &[u16]) -> Scene {
         Scene::Menu
     } else if overlays.contains(&FIELD_OVERLAY) {
         Scene::Field
+    } else if overlays.contains(&NAMING_OVERLAY) {
+        Scene::Opening
     } else {
         Scene::Unknown
     }
 }
 
 /// Whether the bottom screen should be up in `scene`: in battles and menus,
-/// and on the field while the X menu, or a screen opened from it, is up.
-fn scene_wants_panel(scene: Scene, x_menu: bool) -> Option<bool> {
+/// on the field while the X menu, or a screen opened from it, is up, and in
+/// the opening while the naming keyboard is.
+fn scene_wants_panel(scene: Scene, x_menu: bool, bottom: BottomScreen) -> Option<bool> {
     match scene {
         Scene::Battle | Scene::Menu => Some(true),
         Scene::Field => Some(x_menu),
+        Scene::Opening => Some(bottom.engine_a),
         Scene::Unknown => None,
     }
 }
@@ -1060,9 +1073,14 @@ impl App {
         if self.layout == Layout::Single
             && self.settings.smart_bottom
             && !self.menu.open
-            && let Some(up) = self
-                .scene
-                .update(now, scene_wants_panel(scene, self.overlays.field_menu()))
+            && let Some(up) = self.scene.update(
+                now,
+                scene_wants_panel(
+                    scene,
+                    self.overlays.field_menu(),
+                    self.overlays.bottom_screen(),
+                ),
+            )
             && up != self.panel.up
         {
             self.panel.toggle(now);
@@ -2672,10 +2690,10 @@ mod tests {
         assert_eq!(scene(&bag), Scene::Menu);
         let starter = [12, 27, 33, 35, 66, 74, 80, 112, 279, 281, 316];
         assert_eq!(scene(&starter), Scene::Menu);
-        // A map transition, the opening (with the naming keyboard's 280).
+        // The opening, with the naming keyboard's 280; a map transition.
         assert_eq!(
             scene(&[12, 27, 29, 139, 162, 280, 281, 294, 331]),
-            Scene::Unknown
+            Scene::Opening
         );
         assert_eq!(
             scene(&[12, 27, 33, 35, 66, 74, 80, 112, 279, 281]),
@@ -2683,11 +2701,34 @@ mod tests {
         );
         assert_eq!(scene(&[12, 27, 29, 331]), Scene::Unknown);
 
-        assert_eq!(scene_wants_panel(Scene::Field, false), Some(false));
-        assert_eq!(scene_wants_panel(Scene::Field, true), Some(true));
-        assert_eq!(scene_wants_panel(Scene::Battle, false), Some(true));
-        assert_eq!(scene_wants_panel(Scene::Menu, false), Some(true));
-        assert_eq!(scene_wants_panel(Scene::Unknown, true), None);
+        let shown = BottomScreen::default();
+        assert_eq!(scene_wants_panel(Scene::Field, false, shown), Some(false));
+        assert_eq!(scene_wants_panel(Scene::Field, true, shown), Some(true));
+        assert_eq!(scene_wants_panel(Scene::Battle, false, shown), Some(true));
+        assert_eq!(scene_wants_panel(Scene::Menu, false, shown), Some(true));
+        assert_eq!(scene_wants_panel(Scene::Unknown, true, shown), None);
+    }
+
+    #[test]
+    fn the_opening_raises_the_bottom_screen_for_the_naming_keyboard() {
+        // The game shows the keyboard with the screens swapped (POWCNT1
+        // bit 15 clear), and Juniper's speeches with engine B below.
+        let juniper = BottomScreen {
+            engine_a: false,
+            layers: 0x15,
+        };
+        let keyboard = BottomScreen {
+            engine_a: true,
+            layers: 0x1F,
+        };
+        assert_eq!(
+            scene_wants_panel(Scene::Opening, false, juniper),
+            Some(false)
+        );
+        assert_eq!(
+            scene_wants_panel(Scene::Opening, false, keyboard),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2721,7 +2762,7 @@ mod tests {
         let start = Instant::now();
         let mut watch = SceneWatch::new(start);
         for (step, &(overlays, menu, expected)) in steps.iter().enumerate() {
-            let wanted = scene_wants_panel(scene(overlays), menu);
+            let wanted = scene_wants_panel(scene(overlays), menu, BottomScreen::default());
             let t = start + SCENE_SETTLE * 4 * step as u32;
             assert_eq!(watch.update(t, wanted), None, "step {step}");
             assert_eq!(

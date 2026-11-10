@@ -169,12 +169,52 @@ pub struct Options {
     pub overlays: Option<Arc<LoadedOverlays>>,
 }
 
-/// The ARM9 overlays in RAM, sorted by number, and whether the field menu
-/// (the X menu) is open, as of the last frame.
+/// The ARM9 overlays in RAM, sorted by number, whether the field menu (the
+/// X menu) is open, and what the bottom screen shows, as of the last frame.
 #[derive(Default)]
 pub struct LoadedOverlays {
     ids: std::sync::Mutex<Vec<u16>>,
     field_menu: AtomicBool,
+    /// `BottomScreen::pack`.
+    bottom: AtomicU32,
+}
+
+/// Which engine draws the bottom screen, and the layers it shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BottomScreen {
+    /// POWCNT1 puts engine A (the one with 3D) on the bottom screen, as the
+    /// game does for screens played there: the naming keyboard, the party,
+    /// the bag.
+    pub engine_a: bool,
+    /// DISPCNT bits 8-12 of that engine: BG0-BG3 and sprites.
+    pub layers: u8,
+}
+
+impl BottomScreen {
+    /// BG `n` (0-3) is on.
+    pub fn shows_bg(self, n: u8) -> bool {
+        self.layers & (1 << n) != 0
+    }
+
+    fn read(io: &Io) -> Self {
+        let engine_a = io.get16(0x0400_0304) & 0x8000 == 0;
+        let dispcnt = io.get32(if engine_a { 0x0400_0000 } else { 0x0400_1000 });
+        Self {
+            engine_a,
+            layers: ((dispcnt >> 8) & 0x1F) as u8,
+        }
+    }
+
+    fn pack(self) -> u32 {
+        u32::from(self.engine_a) << 8 | u32::from(self.layers)
+    }
+
+    fn unpack(packed: u32) -> Self {
+        Self {
+            engine_a: packed & 0x100 != 0,
+            layers: packed as u8 & 0x1F,
+        }
+    }
 }
 
 impl LoadedOverlays {
@@ -192,6 +232,10 @@ impl LoadedOverlays {
     /// Whether the field menu, or a screen opened from it, is up.
     pub fn field_menu(&self) -> bool {
         self.field_menu.load(Ordering::Relaxed)
+    }
+
+    pub fn bottom_screen(&self) -> BottomScreen {
+        BottomScreen::unpack(self.bottom.load(Ordering::Relaxed))
     }
 }
 
@@ -1311,6 +1355,10 @@ impl Machine {
     fn track_overlays(&mut self) {
         if self.options.overlays.is_none() && self.overlay_log.is_none() {
             return;
+        }
+        if let Some(overlays) = &self.options.overlays {
+            let bottom = BottomScreen::read(&self.io);
+            overlays.bottom.store(bottom.pack(), Ordering::Relaxed);
         }
         let field_menu_open = self.field_menu.is_some_and(|menu| {
             self.loaded.contains(&field_menu::OVERLAY) && menu.is_open(&self.memory.main)

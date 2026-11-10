@@ -69,7 +69,9 @@ fn resolve(record: vec4<u32>, color: u32, alpha: u32) -> u32 {
     if kind == 2u {
         return mix_colors(other, color, eva, evb);
     }
-    if alpha < 31u && (record.z & 1u) != 0u {
+    // Over a second target 3D pixels blend by their own alpha, never by
+    // EVA/EVB; an opaque one (alpha 31) comes out as it is.
+    if (record.z & 1u) != 0u {
         let a = alpha + 1u;
         var out = 0u;
         for (var shift = 0u; shift < 15u; shift = shift + 5u) {
@@ -78,9 +80,6 @@ fn resolve(record: vec4<u32>, color: u32, alpha: u32) -> u32 {
         return out;
     }
     switch (record.z >> 1u) & 3u {
-        case 1u: {
-            return mix_colors(color, other, eva, evb);
-        }
         case 2u: {
             return brighten(color, evy);
         }

@@ -45,9 +45,10 @@ impl Frame {
 ///
 /// In widescreen (`extra` is `WIDE_EXTRA`) the top screen is `extra`
 /// columns wider on each side. Backgrounds and sprites stay in the middle
-/// 256 columns; the extra ones show the 3D layer over the backdrop, with
-/// the same blending and brightness, where the screen shows 3D, and black
-/// elsewhere. The bottom screen keeps its 256 columns, centered.
+/// 256 columns; where the screen shows 3D, the extra ones show the 3D layer
+/// with the same blending and brightness, over what is under the 3D at the
+/// end of the line (`side_of`), and black elsewhere. The bottom screen
+/// keeps its 256 columns, centered.
 #[derive(Clone)]
 pub struct ScaledFrame {
     /// `(256 + 2 * extra)` x 384 `Composed::pack` pixels, top screen
@@ -128,11 +129,18 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
     let extra = if io.geometry.wide { WIDE_EXTRA } else { 0 };
     let mut pixels = Vec::with_capacity((WIDTH + 2 * extra) * 2 * HEIGHT);
     for (screen, side) in [(&top, side), (&bottom, Composed::fixed(0))] {
-        let side = side.pack();
         for row in screen.chunks(WIDTH) {
-            pixels.extend(std::iter::repeat_n(side, extra));
+            // Each side mirrors the line's end: column -1 - i shows
+            // column i, column 256 + i column 255 - i.
+            pixels.extend(
+                (0..extra)
+                    .rev()
+                    .map(|i| side_of(side, row[i], row[0]).pack()),
+            );
             pixels.extend(row.iter().map(Composed::pack));
-            pixels.extend(std::iter::repeat_n(side, extra));
+            pixels.extend(
+                (0..extra).map(|i| side_of(side, row[WIDTH - 1 - i], row[WIDTH - 1]).pack()),
+            );
         }
     }
     ScaledFrame {
@@ -144,6 +152,29 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
             scroll,
             scene,
         }),
+    }
+}
+
+/// What a column of widescreen's extra columns shows for `mirrored`, the
+/// screen's pixel as far from that end of the line on the other side of
+/// it. Where the screen shows 3D (`side` takes the 3D layer) and the 3D
+/// layer is on top there, the 2D layers under it are mirrored into the
+/// extra columns, so a background behind the 3D (Juniper's gradient in the
+/// introduction, the rival's backdrop) carries on instead of the backdrop
+/// color. Where 2D is in front of the 3D at the mirrored column (a text box
+/// near the end of the line), the line's last pixel `outer` carries on
+/// instead, if the 3D layer is on top there; failing that, they show
+/// `side`.
+fn side_of(side: Composed, mirrored: Composed, outer: Composed) -> Composed {
+    let under_three_d = |pixel: &Composed| matches!(pixel.with, With::First { .. });
+    if !under_three_d(&side) {
+        side
+    } else if under_three_d(&mirrored) {
+        mirrored
+    } else if under_three_d(&outer) {
+        outer
+    } else {
+        side
     }
 }
 
@@ -339,14 +370,15 @@ pub struct Coefficients {
     pub evy: u8,
 }
 
-/// What a special effect does to the 3D layer when it is the top layer.
+/// What a special effect does to the 3D layer when it is the top layer and
+/// does not blend with the layer below by its own alpha. Never EVA/EVB
+/// alpha blending: over a second target the 3D layer always blends by its
+/// own alpha instead. The values are the GPU compositor's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
-    None,
-    /// Alpha blend with the layer below (EVA, EVB).
-    Mix,
-    Brighten,
-    Darken,
+    None = 0,
+    Brighten = 2,
+    Darken = 3,
 }
 
 /// How a pixel combines with the 3D pixel under it, when there is one.
@@ -354,8 +386,9 @@ pub enum Effect {
 pub enum With {
     /// The 3D layer is hidden, or below the top two layers.
     Fixed(u16),
-    /// The 3D layer is on top, over `second`. A translucent 3D pixel blends
-    /// with it by its own alpha when `alpha_blend`; otherwise `effect`.
+    /// The 3D layer is on top, over `second`. A 3D pixel blends with it by
+    /// its own alpha when `alpha_blend` (an opaque one then shows as it
+    /// is); otherwise `effect` applies.
     First {
         second: u16,
         alpha_blend: bool,
@@ -404,7 +437,7 @@ impl Composed {
                 alpha_blend,
                 effect,
             } => {
-                if pixel.alpha < 31 && alpha_blend {
+                if alpha_blend {
                     let a = u32::from(pixel.alpha) + 1;
                     let mut result = 0;
                     for shift in [0, 5, 10] {
@@ -417,7 +450,6 @@ impl Composed {
                 }
                 match effect {
                     Effect::None => pixel.color,
-                    Effect::Mix => mix(pixel.color, second, eva, evb),
                     Effect::Brighten => map_channels(pixel.color, |c| c + (31 - c) * evy / 16),
                     Effect::Darken => map_channels(pixel.color, |c| c - c * evy / 16),
                 }
@@ -494,14 +526,17 @@ impl BlendState {
         }
     }
 
-    /// The 3D layer on top of `second`.
+    /// The 3D layer on top of `second`. Over a second target the hardware
+    /// blends 3D pixels by their own alpha whatever BLDCNT's mode and first
+    /// targets say, so EVA and EVB never apply: Black 2 and White 2's
+    /// introduction sets alpha blending with EVA and EVB at 0 after Juniper
+    /// sends out Minccino, and both still show.
     fn three_d_first(&self, second: Layer) -> With {
         let is_second = self.second_target(second.layer);
         let effect = if !self.effects || !self.first_target(0) {
             Effect::None
         } else {
             match self.mode() {
-                1 if is_second => Effect::Mix,
                 2 => Effect::Brighten,
                 3 => Effect::Darken,
                 _ => Effect::None,
@@ -1260,6 +1295,92 @@ mod tests {
         assert_eq!(&frame.top[8 * 4..8 * 4 + 4], &[0, 0, 0, 0xFF]);
         // Engine B is off on the bottom screen: black.
         assert_eq!(&frame.bottom[..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn three_d_over_a_second_target_blends_by_its_own_alpha() {
+        // BG0 (3D) first target, BG3 second, alpha blending with EVA and
+        // EVB at 0, as in White 2's introduction once Minccino is out.
+        let state = BlendState {
+            blend: 0x0941,
+            effects: true,
+            coefficients: Coefficients::default(),
+        };
+        let bg3 = Layer {
+            color: 0x001F,
+            layer: 3,
+            semi: false,
+            three_d: false,
+        };
+        let composed = Composed {
+            without: bg3.color,
+            with: state.three_d_first(bg3),
+            coefficients: state.coefficients,
+        };
+        let opaque = Pixel {
+            color: 0x7C00,
+            alpha: 31,
+        };
+        assert_eq!(composed.resolve(Some(opaque)), 0x7C00);
+        let half = Pixel {
+            color: 0x7C00,
+            alpha: 15,
+        };
+        assert_eq!(composed.resolve(Some(half)), 0x3C0F);
+        assert_eq!(composed.resolve(None), 0x001F);
+        // Brightness still applies to 3D over a layer that is no second
+        // target.
+        let brighten = BlendState {
+            blend: 0x0081,
+            effects: true,
+            coefficients: Coefficients {
+                evy: 16,
+                ..Default::default()
+            },
+        };
+        let composed = Composed {
+            without: bg3.color,
+            with: brighten.three_d_first(bg3),
+            coefficients: brighten.coefficients,
+        };
+        assert_eq!(composed.resolve(Some(opaque)), 0x7FFF);
+    }
+
+    #[test]
+    fn widescreen_sides_carry_on_what_is_under_the_3d_at_the_edges() {
+        let state = BlendState {
+            blend: 0,
+            effects: true,
+            coefficients: Coefficients::default(),
+        };
+        let layer = |color, layer| Layer {
+            color,
+            layer,
+            semi: false,
+            three_d: false,
+        };
+        let backdrop = layer(0x551D, LAYER_BACKDROP);
+        let side = Composed {
+            without: backdrop.color,
+            with: state.three_d_first(backdrop),
+            coefficients: state.coefficients,
+        };
+        let gradient = Composed {
+            without: 0x6F7B,
+            with: state.three_d_first(layer(0x6F7B, 3)),
+            coefficients: state.coefficients,
+        };
+        assert_eq!(side_of(side, gradient, gradient), gradient);
+        // A text box in front of the 3D at the mirrored column lets the end
+        // of the line carry on; in front of the 3D there too, or on a screen
+        // without 3D, the sides show what they did before.
+        let text_box = Composed::fixed(0x7FFF);
+        assert_eq!(side_of(side, text_box, gradient), gradient);
+        assert_eq!(side_of(side, text_box, text_box), side);
+        assert_eq!(
+            side_of(Composed::fixed(0), gradient, gradient),
+            Composed::fixed(0)
+        );
     }
 
     #[test]

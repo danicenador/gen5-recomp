@@ -237,19 +237,21 @@ multiple, single-screen mode draws at least as many lines as the monitor
 has (6x at 1080 lines) and shrinks to fit.
 
 The bottom screen also follows the scene by itself: it rises in battles and
-menus played on it and drops back on the overworld. The runtime tells
-scenes apart by the ARM9 overlays in RAM (see `scene_wants_panel` in
+menus played on it and drops back on the overworld. The runtime tells scenes
+apart by the ARM9 overlays in RAM (see `scene_wants_panel` in
 `src/runtime/screen.rs`); a scene has to hold for 100 ms first, so map
-transitions pass unnoticed, and scenes it cannot tell (the title screen,
-the opening) leave the bottom screen where it is. The X menu loads no
+transitions pass unnoticed, and scenes it cannot tell (the title screen)
+leave the bottom screen where it is. In the opening it rises for the naming
+keyboard, which the game shows with the screens swapped (engine A on the
+bottom), and drops for Professor Juniper's speeches. The X menu loads no
 overlays of its own, so the runtime reads the game's field events instead
 (`src/nds/field_menu.rs`): the bottom screen stays up while the menu or any
 screen opened from it (the Pokédex, the trainer card, the save prompt, ...)
-is up, and drops once the menu closes, whether by B, by X or by itself
-after saving. L2 or Space still moves it at any time; the next scene change
-takes over again. On a controller, the right stick moves a stylus over the
-raised bottom screen, shown as a ring, and pressing the stick in touches
-with it (the ring fills); it hides three seconds after it last moved.
+is up, and drops once the menu closes, whether by B, by X or by itself after
+saving. L2 or Space still moves it at any time; the next scene change takes
+over again. On a controller, the right stick moves a stylus over the raised
+bottom screen, shown as a ring, and pressing the stick in touches with it
+(the ring fills); it hides three seconds after it last moved.
 `GEN5_OVERLAY_LOG=path` writes, for `run` or `boot`, each frame at which the
 overlays in RAM change, with those loaded and unloaded, and each frame at
 which the field menu opens or closes, for finding the overlays of new
@@ -263,16 +265,20 @@ Add `--widescreen` (or set `GEN5_WIDESCREEN=1`) to draw the top screen at
 16:9, 342x192 per DS-sized screen, and press H to switch between 16:9 and
 4:3 while playing. The 3D camera sees further to the left and right instead
 of the picture being stretched: the left and right clip planes are moved out
-by 43 columns, so polygons and box tests beside the screen are kept and drawn
-there, with polygon RAM of their own so the DS's own view never loses
+by 43 columns, so polygons and box tests beside the screen are kept and
+drawn there, with polygon RAM of their own so the DS's own view never loses
 polygons to them. Viewports narrower than the screen keep their edges.
 Backgrounds and sprites stay in the middle 256 columns; beside them the top
-screen shows the 3D layer over the backdrop, with the same blending and
-master brightness, or black when it shows no 3D (menus and other 2D
-screens). The bottom screen stays 4:3 and is centered under the top one.
-Display capture still sees the DS's 256 columns. Widescreen uses the GPU
-renderer at every resolution, and `boot` with `GEN5_WIDESCREEN=1` saves
-widescreen screenshots.
+screen shows the 3D layer, with the same blending and master brightness, or
+black when it shows no 3D (menus and other 2D screens). Under the 3D layer
+the sides mirror what is under it at that end of each line, so a background
+behind the 3D, such as the gradient behind Professor Juniper, carries on
+instead of the backdrop color; where 2D is in front of the 3D there, the
+last column carries on, and where it is in front at the end of the line as
+well, the backdrop is used. The bottom screen stays 4:3 and is centered
+under the top one. Display capture still sees the DS's 256 columns.
+Widescreen uses the GPU renderer at every resolution, and `boot` with
+`GEN5_WIDESCREEN=1` saves widescreen screenshots.
 
 `run` takes an optional resolution multiple after the ROM, `run <cache>
 <rom> 4` (or `GEN5_SCALE=4`), and keys 1 to 8 change it while playing. At
