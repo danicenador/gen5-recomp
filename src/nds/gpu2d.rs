@@ -178,15 +178,13 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
 /// layer is on top there, the 2D layers under it are mirrored into the
 /// extra columns, so a background behind the 3D (Juniper's gradient in the
 /// introduction, the rival's backdrop) carries on instead of the backdrop
-/// color. So is a 2D layer blended over the 3D (the season's name fading
-/// out over the field when a game is continued), which the 3D layer still
-/// shows through. Where opaque 2D is in front of the 3D at the mirrored
+/// color. Layers in front of 3D stay inside the DS screen, including
+/// translucent dialogue boxes and their text. Where 2D is in front at the mirrored
 /// column (a text box near the end of the line), the line's last pixel
 /// `outer` carries on instead, if it shows the 3D layer; failing that, they
 /// show `side`.
 fn side_of(side: Composed, mirrored: Composed, outer: Composed) -> Composed {
-    let shows_three_d =
-        |pixel: &Composed| matches!(pixel.with, With::First { .. } | With::Second { .. });
+    let shows_three_d = |pixel: &Composed| matches!(pixel.with, With::First { .. });
     if !matches!(side.with, With::First { .. }) {
         side
     } else if shows_three_d(&mirrored) {
@@ -1609,13 +1607,19 @@ mod tests {
         let text_box = Composed::fixed(0x7FFF);
         assert_eq!(side_of(side, text_box, gradient), gradient);
         assert_eq!(side_of(side, text_box, text_box), side);
-        // A layer blended over the 3D is mirrored too.
+        // Translucent dialogue backgrounds and glyphs are foreground UI too.
         let fading = Composed {
             without: 0,
             with: With::Second { first: 0 },
             coefficients: state.coefficients,
         };
-        assert_eq!(side_of(side, fading, gradient), fading);
+        assert_eq!(side_of(side, fading, gradient), gradient);
+        assert_eq!(side_of(side, fading, fading), side);
+        let glyph = Composed {
+            with: With::Second { first: 0x7fff },
+            ..fading
+        };
+        assert_eq!(side_of(side, glyph, fading), side);
         assert_eq!(
             side_of(Composed::fixed(0), gradient, gradient),
             Composed::fixed(0)
