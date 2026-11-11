@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Virbank complex",
+  "reproduction": "Oshawott 1 battle from evolving",
+  "source": "debug/runs/1794431882071079800-5708/history/frame-0000009560",
+  "frame": 9560,
+  "status": "manual-checkpoint; verify by loading Continue"
+}

@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Gym 1 completed",
+  "reproduction": "after challenging gym",
+  "source": "debug/runs/1794430445738680400-9768/history/frame-0000115054",
+  "frame": 115054,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
