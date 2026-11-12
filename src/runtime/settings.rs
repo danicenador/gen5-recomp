@@ -122,6 +122,7 @@ pub struct Settings {
     pub fast_forward: bool,
     pub speed: u32,
     pub interpolate: bool,
+    pub auto_continue: bool,
     pub stick_dead_zone: f32,
     pub stylus_sensitivity: f32,
     pub bindings: Bindings,
@@ -138,6 +139,7 @@ impl Default for Settings {
             fast_forward: false,
             speed: 3,
             interpolate: false,
+            auto_continue: false,
             stick_dead_zone: 0.5,
             stylus_sensitivity: 1.0,
             bindings: Bindings::default(),
@@ -218,6 +220,7 @@ mod tests {
             layout: Layout::Single,
             scale: None,
             smart_bottom: false,
+            auto_continue: true,
             ..Settings::default()
         };
         settings.bindings.bind(true, MENU, "Select".into());
@@ -239,6 +242,7 @@ mod tests {
         assert_eq!(settings.scale, Some(8));
         assert_eq!(settings.speed, 2);
         assert!(settings.smart_bottom);
+        assert!(!settings.auto_continue);
         assert_eq!(settings.bindings.keyboard.len(), ACTION_COUNT);
         settings.bindings.bind(false, PANEL, "KeyX".into());
         assert_eq!(settings.bindings.keyboard_action("KeyX"), Some(PANEL));

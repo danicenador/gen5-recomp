@@ -174,7 +174,9 @@ mod tests {
             let hooked =
                 codegen::emit_function(&analysis, &program.modules[0], &analysis.functions[&key]);
             assert_eq!(hooked.matches("rt_hle(cpu, 4);").count(), 1);
-            program.modules[0].bytes[0x1c48] ^= 1;
+            // Disable the observer without changing instructions: changing
+            // a byte also changes the generated overlay entry guard.
+            program.modules[0].id = ModuleId::Overlay(141);
             let original =
                 codegen::emit_function(&analysis, &program.modules[0], &analysis.functions[&key]);
             assert_eq!(hooked.replace("    /* Observe Options input without replacing the game menu. */\n    rt_hle(cpu, 4);\n",""),original);

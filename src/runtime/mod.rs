@@ -58,6 +58,7 @@ pub fn play_recompiled(
     let on_frame: machine::FrameSink =
         Box::new(move |number, frame, deadline| sink.publish(number, frame, deadline));
     let options = machine::Options {
+        auto_continue: settings.auto_continue,
         max_frames: u64::MAX,
         seconds: 0,
         on_frame: Some(on_frame),

@@ -31,5 +31,6 @@ pub mod machine;
 pub mod memory;
 pub mod sound;
 pub mod speed;
+mod startup;
 mod threads;
 pub mod vram;

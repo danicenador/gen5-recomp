@@ -209,6 +209,8 @@ fn run() -> Result<(), String> {
                 Path::new(&args[1]),
                 Path::new(&args[2]),
                 gen5::nds::machine::Options {
+                    auto_continue: std::env::var("GEN5_AUTO_CONTINUE")
+                        .is_ok_and(|value| value == "1"),
                     max_frames,
                     seconds: std::env::var("GEN5_BOOT_SECONDS")
                         .map(|value| {
@@ -249,6 +251,10 @@ fn run() -> Result<(), String> {
             use gen5::runtime::settings::Settings;
             let settings_path = Settings::path(Path::new(&args[1]));
             let mut settings = Settings::load(&settings_path)?;
+            if std::env::var_os("GEN5_AUTO_CONTINUE").is_some() {
+                settings.auto_continue =
+                    std::env::var("GEN5_AUTO_CONTINUE").is_ok_and(|value| value == "1");
+            }
             let mut scale = settings.scale;
             let mut explicit_scale = false;
             let mut fps = None;
@@ -279,6 +285,8 @@ fn run() -> Result<(), String> {
                         settings.fullscreen = true;
                         widescreen = true;
                     }
+                } else if value == "--continue" {
+                    settings.auto_continue = true;
                 } else if value == "--widescreen" {
                     widescreen = true;
                 } else if let Some(mode) = value.strip_prefix("--fps=") {

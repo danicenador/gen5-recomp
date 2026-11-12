@@ -64,7 +64,7 @@ impl Menu {
 
     pub fn rows(&self) -> usize {
         if self.page == Page::Main {
-            14
+            15
         } else {
             ACTION_COUNT
         }
@@ -134,7 +134,8 @@ impl Menu {
                 self.selected = 0;
                 return Effect::None;
             }
-            12 => {
+            12 => settings.auto_continue = !settings.auto_continue,
+            13 => {
                 if !self.restore_confirm {
                     self.restore_confirm = true;
                     self.status = "Press confirm again to restore defaults".into();
@@ -235,7 +236,8 @@ impl Menu {
             ),
             10 => ("Keyboard mappings".into(), ">".into()),
             11 => ("Controller mappings".into(), ">".into()),
-            12 => (
+            12 => ("Start in saved game".into(), on(s.auto_continue)),
+            13 => (
                 "Restore defaults".into(),
                 if self.restore_confirm {
                     "Confirm?"
@@ -631,7 +633,7 @@ mod tests {
         m.show();
         assert_eq!(m.buttons(input::LEFT, &mut s), Effect::Changed);
         assert_eq!(s.scale, None);
-        m.selected = 12;
+        m.selected = 13;
         m.activate(1, &mut s);
         assert_eq!(s.scale, None);
         m.activate(1, &mut s);

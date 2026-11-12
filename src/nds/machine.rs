@@ -130,6 +130,7 @@ enum Event {
 pub type FrameSink = Box<dyn FnMut(u64, &Frame, Instant) + Send>;
 
 pub struct Options {
+    pub auto_continue: bool,
     /// Stop after this many frames (vertical blanks).
     pub max_frames: u64,
     /// Stop with a report after this much wall-clock time (0: no limit).
@@ -311,6 +312,7 @@ pub struct Machine {
     field_menu: Option<FieldMenu>,
     /// Whether the field menu was open at the last frame.
     field_menu_open: bool,
+    startup: Option<super::startup::Hooks>,
     /// GEN5_OVERLAY_LOG=path: each frame the overlays in RAM change, the
     /// frame number and the overlays loaded and unloaded, and each frame
     /// the field menu opens or closes.
@@ -1723,6 +1725,9 @@ fn call_target(cpu: *mut Cpu, target: u32) {
 /// Call `target` (bit 0 selects Thumb): the recompiled function if one is
 /// loaded there, otherwise the interpreter. `lr` must already be set.
 pub(super) fn call_any(cpu: *mut Cpu, target: u32) {
+    if startup_call(cpu, target) {
+        return;
+    }
     let function = {
         // SAFETY: see `machine`; the borrow ends before generated code runs.
         let machine = unsafe { machine(cpu) };
@@ -1746,6 +1751,54 @@ pub(super) fn call_any(cpu: *mut Cpu, target: u32) {
         Some(function) => unsafe { function(cpu) },
         None => super::interpreter::run(cpu, target),
     }
+}
+
+fn startup_call(cpu: *mut Cpu, target: u32) -> bool {
+    let action = {
+        let machine = unsafe { machine(cpu) };
+        let Some(hooks) = machine.startup else {
+            return false;
+        };
+        let r = unsafe { (*cpu).r };
+        let address = target & !1;
+        if address == hooks.boot && machine.read32(r[1]) == 0 {
+            // The resident boot process idles while the normal start menu
+            // loads and validates the save, without queuing logos/title.
+            machine.write32(r[1], 4);
+            Some((hooks.queue, [162, hooks.menu, 0], true))
+        } else if address == hooks.select {
+            machine.startup = None;
+            let work = r[0];
+            if machine.read32(address) != hooks.select_word
+                || machine.read8(work + 0x170) != 0 // ITEM_CONTINUE
+                || machine.read32(work + 0x19c) != 0
+            // broken save blocks
+            {
+                return false;
+            }
+            machine.write8(work + 0x17a, 0); // selection: Continue
+            machine.write8(work + 0x17b, 0); // cleanup starts at FREE_BEGIN
+            machine.write8(work + 0x17d, 1); // start with wireless C-Gear off
+            Some((hooks.wipe_out, [work, 1, 0], false))
+        } else {
+            None
+        }
+    };
+    let Some((callee, args, boot)) = action else {
+        return false;
+    };
+    let lr = unsafe { (*cpu).r[14] };
+    unsafe {
+        (&mut (*cpu).r)[..3].copy_from_slice(&args);
+    }
+    call_any(cpu, callee | 1);
+    unsafe {
+        (*cpu).r[14] = lr;
+        if boot {
+            (*cpu).r[0] = 0;
+        }
+    }
+    true
 }
 
 /// Deliver pending interrupts as the ARM9 BIOS does: switch to IRQ mode and
@@ -2205,6 +2258,9 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
     let header = fs::read(code_dir.join("header.bin"))
         .map_err(|error| format!("could not read ROM header (re-run `import`): {error}"))?;
     let program = Program::load(&code_dir)?;
+    let startup = (options.auto_continue && backup.data.iter().any(|&byte| byte != 0xff))
+        .then(|| super::startup::Hooks::find(&program))
+        .flatten();
 
     let library_path = cache_root
         .join("recomp")
@@ -2322,6 +2378,7 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         signatures: Vec::new(),
         field_menu,
         field_menu_open: false,
+        startup,
         overlay_log: std::env::var_os("GEN5_OVERLAY_LOG")
             .and_then(|path| fs::File::create(path).ok()),
         _library: library,
