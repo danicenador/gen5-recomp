@@ -186,25 +186,68 @@ impl DisplayList {
             return (Cow::Borrowed(&self.polygons), Matched { matched: 0, total });
         };
         let alpha = alpha.min(1.0);
-        let later: HashMap<PolygonId, &Polygon> = next
-            .polygons
-            .iter()
-            .map(|polygon| (polygon.id, polygon))
-            .collect();
+        let identity = |id: PolygonId| PolygonId {
+            occurrence: 0,
+            ..id
+        };
+        let mut earlier: HashMap<PolygonId, Vec<&Polygon>> = HashMap::new();
+        let mut later: HashMap<PolygonId, Vec<&Polygon>> = HashMap::new();
+        for polygon in &self.polygons {
+            earlier
+                .entry(identity(polygon.id))
+                .or_default()
+                .push(polygon);
+        }
+        for polygon in &next.polygons {
+            later.entry(identity(polygon.id)).or_default().push(polygon);
+        }
+        // Unique meshes provide camera motion. Repeated fence segments,
+        // grass and shore tiles can enter/leave the submitted list or change
+        // order; their occurrence number is not an object identity.
+        let mut motion = [Vec::new(), Vec::new()];
+        for (id, before) in &earlier {
+            if before.len() == 1
+                && let Some(after) = later.get(id).filter(|after| after.len() == 1)
+                && pairs_with(before[0], after[0])
+            {
+                let delta = screen_motion(before[0], after[0]);
+                for axis in 0..2 {
+                    motion[axis].push(delta[axis]);
+                }
+            }
+        }
+        let camera = (!motion[0].is_empty()).then(|| {
+            std::array::from_fn(|axis| {
+                motion[axis].sort_by(f64::total_cmp);
+                motion[axis][motion[axis].len() / 2]
+            })
+        });
         let mut matched = 0;
         let polygons = self
             .polygons
             .iter()
             .map(|polygon| {
                 let mut polygon = polygon.clone();
-                let identity = PolygonId {
-                    occurrence: 0,
-                    ..polygon.id
-                };
-                if let Some(after) = later.get(&polygon.id)
-                    && self.submitted.get(&identity) == next.submitted.get(&identity)
-                    && pairs_with(&polygon, after)
-                {
+                let id = identity(polygon.id);
+                let before = &earlier[&id];
+                let after = later.get(&id).and_then(|candidates| {
+                    if before.len() == 1
+                        && candidates.len() == 1
+                        && self.submitted.get(&id) == Some(&1)
+                        && next.submitted.get(&id) == Some(&1)
+                    {
+                        return pairs_with(&polygon, candidates[0]).then_some(candidates[0]);
+                    }
+                    if camera.is_none() && self.submitted.get(&id) != next.submitted.get(&id) {
+                        return None;
+                    }
+                    let shift = camera.unwrap_or([0.0; 2]);
+                    let tolerance = camera.map(|_| 3.0);
+                    let candidate = nearest_polygon(&polygon, candidates, shift, tolerance)?;
+                    let reverse = nearest_polygon(candidate, before, shift.map(|v| -v), tolerance)?;
+                    (reverse.id == polygon.id).then_some(candidate)
+                });
+                if let Some(after) = after {
                     matched += 1;
                     for (vertex, after) in polygon.vertices.iter_mut().zip(&after.vertices) {
                         let moved = vertex.lerp(*after, alpha);
@@ -217,6 +260,49 @@ impl DisplayList {
             .collect();
         (Cow::Owned(polygons), Matched { matched, total })
     }
+}
+
+fn screen_motion(before: &Polygon, after: &Polygon) -> [f64; 2] {
+    std::array::from_fn(|axis| {
+        before
+            .vertices
+            .iter()
+            .zip(&after.vertices)
+            .map(|(a, b)| {
+                (b.clip[axis] / b.clip[3] - a.clip[axis] / a.clip[3])
+                    * if axis == 0 { 128.0 } else { 96.0 }
+            })
+            .sum::<f64>()
+            / before.vertices.len() as f64
+    })
+}
+
+fn nearest_polygon<'a>(
+    polygon: &Polygon,
+    candidates: &[&'a Polygon],
+    camera: [f64; 2],
+    tolerance: Option<f64>,
+) -> Option<&'a Polygon> {
+    let mut best = None;
+    let mut distance = f64::INFINITY;
+    let mut ambiguous = false;
+    for &candidate in candidates {
+        if !pairs_with(polygon, candidate) {
+            continue;
+        }
+        let delta = screen_motion(polygon, candidate);
+        let score = (delta[0] - camera[0]).powi(2) + (delta[1] - camera[1]).powi(2);
+        if score + 1e-8 < distance {
+            best = Some(candidate);
+            distance = score;
+            ambiguous = false;
+        } else if (score - distance).abs() < 1e-8 {
+            ambiguous = true;
+        }
+    }
+    (!ambiguous && tolerance.is_none_or(|limit| distance <= limit * limit))
+        .then_some(best)
+        .flatten()
 }
 
 /// Whether `before` can be drawn part way to `after`: the same shape, in
@@ -2078,6 +2164,46 @@ mod tests {
             left_edges(&half),
             left_edges(&shown.build(None, 0.0, false))
         );
+    }
+
+    #[test]
+    fn reordered_fence_segments_follow_their_positions_instead_of_submission_order() {
+        let shown = list_at(&[0, 819]);
+        let next = list_at(&[1024, 205]);
+        let half = shown.build(Some(&next), 0.5, false);
+        assert_eq!(half.matched.matched, 2);
+        let mut edges = left_edges(&half);
+        edges.sort_by(f32::total_cmp);
+        assert!((edges[0] - 67.2).abs() < 0.1, "{edges:?}");
+        assert!((edges[1] - 92.8).abs() < 0.1, "{edges:?}");
+    }
+
+    #[test]
+    fn replacing_a_tile_with_the_same_submission_count_does_not_pair_its_neighbor() {
+        let list = |offsets: &[i32], camera: i32| {
+            let mut g = Geometry::default();
+            command(&mut g, 0x10, &[2]);
+            for &offset in offsets {
+                command(&mut g, 0x15, &[]);
+                command(&mut g, 0x1c, &[(offset + camera) as u32, 0, 0]);
+                triangle(&mut g, 31, 0, 31, 0);
+            }
+            command(&mut g, 0x15, &[]);
+            command(&mut g, 0x1c, &[camera as u32, 0, 0]);
+            triangle(&mut g, 31, 0, 31, 1); // unique camera anchor
+            command(&mut g, 0x50, &[0]);
+            g.vblank();
+            g.displayed
+        };
+        let shown = list(&[0, 819], 0);
+        let next = list(&[-819, 819], 205);
+        let half = shown.build(Some(&next), 0.5, false);
+        assert_eq!(half.matched.matched, 2); // anchor and retained tile
+        let mut edges = left_edges(&half);
+        edges.sort_by(f32::total_cmp);
+        assert!((edges[0] - 64.0).abs() < 0.1);
+        assert!((edges[1] - 67.2).abs() < 0.1);
+        assert!((edges[2] - 92.8).abs() < 0.1);
     }
 
     #[test]
