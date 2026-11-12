@@ -40,17 +40,20 @@ struct SceneUniform {
     control: u32,
     alpha_ref: u32,
     w_buffer: u32,
-    extra: u32,
+    span: f32,
     toon: [u32; 32],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ScreenUniform {
-    scale: u32,
+    width: u32,
+    height: u32,
     screen: i32,
     scroll: u32,
     extra: u32,
+    span: f32,
+    padding: [u32; 2],
     brightness: [u32; 4],
 }
 
@@ -73,7 +76,7 @@ struct ShownLayer {
 
 /// Everything sized by the scale and the width.
 struct Targets {
-    scale: u32,
+    size: (u32, u32),
     extra: usize,
     color: wgpu::TextureView,
     alpha: wgpu::TextureView,
@@ -315,15 +318,14 @@ impl Renderer {
         }
     }
 
-    fn targets(&mut self, scale: u32) -> &Targets {
+    fn targets(&mut self, size: (u32, u32)) -> &Targets {
         let extra = self.composed_extra;
         if self
             .targets
             .as_ref()
-            .is_none_or(|targets| (targets.scale, targets.extra) != (scale, extra))
+            .is_none_or(|targets| (targets.size, targets.extra) != (size, extra))
         {
             let device = &self.device;
-            let size = ((WIDTH + 2 * extra) as u32 * scale, HEIGHT as u32 * scale);
             let attachment =
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
             let color = texture(
@@ -385,7 +387,7 @@ impl Renderer {
                 ],
             });
             self.targets = Some(Targets {
-                scale,
+                size,
                 extra,
                 color,
                 alpha,
@@ -519,7 +521,7 @@ impl Renderer {
             control: u32::from(scene.control),
             alpha_ref: u32::from(scene.alpha_ref),
             w_buffer: u32::from(scene.w_buffer),
-            extra: extra as u32,
+            span: (WIDTH + 2 * extra) as f32,
             toon,
         };
         self.queue
@@ -615,13 +617,36 @@ impl Renderer {
         alpha: f64,
     ) -> (&wgpu::Texture, Matched) {
         let scale = scale.max(1);
+        let size = (
+            (WIDTH + 2 * self.shown.extra) as u32 * scale,
+            HEIGHT as u32 * scale,
+        );
+        self.draw_sized(size, next, alpha)
+    }
+
+    /// Draw at an exact pixel size, including fractional DS scale factors.
+    pub fn draw_sized(
+        &mut self,
+        size: (u32, u32),
+        next: Option<&DisplayList>,
+        alpha: f64,
+    ) -> (&wgpu::Texture, Matched) {
+        let size = (size.0.max(1), size.1.max(1));
         let layer = self.shown.layer.as_ref();
         let extra = self.shown.extra;
+        let span = if extra == 0 {
+            WIDTH as f32
+        } else {
+            HEIGHT as f32 * size.0 as f32 / size.1 as f32
+        };
         let uniform = ScreenUniform {
-            scale,
+            width: size.0,
+            height: size.1,
             screen: layer.map_or(-1, |layer| layer.screen as i32),
             scroll: layer.map_or(0, |layer| layer.scroll),
             extra: extra as u32,
+            span,
+            padding: [0; 2],
             brightness: [
                 u32::from(self.shown.brightness[0]),
                 u32::from(self.shown.brightness[1]),
@@ -631,6 +656,8 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.screen_uniform, 0, bytemuck::bytes_of(&uniform));
+        self.queue
+            .write_buffer(&self.scene_uniform, 12, bytemuck::bytes_of(&span));
         let triangles = layer.map(|layer| layer.list.build(next, alpha, extra > 0));
         if let Some(triangles) = &triangles {
             self.upload_vertices(&triangles.vertices);
@@ -638,7 +665,7 @@ impl Renderer {
                 self.pipeline(batch);
             }
         }
-        self.targets(scale);
+        self.targets(size);
         let targets = self.targets.as_ref().unwrap();
         let mut encoder = self
             .device
@@ -765,6 +792,10 @@ impl Headless {
         .map_err(|error| format!("no graphics adapter was found: {error}"))?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gen5 headless screens"),
+            required_limits: wgpu::Limits {
+                max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d,
+                ..Default::default()
+            },
             ..Default::default()
         }))
         .map_err(|error| format!("could not create graphics device: {error}"))?;
@@ -780,17 +811,35 @@ impl Headless {
     /// `384 * scale`, the bottom screen centered in its half.
     pub fn render(&mut self, frame: &ScaledFrame, scale: u32) -> Result<(u32, u32, Vec<u8>)> {
         let output = self.renderer.render(frame, scale);
+        Self::readback(&self.device, &self.queue, output)
+    }
+
+    pub fn render_sized(
+        &mut self,
+        frame: &ScaledFrame,
+        size: (u32, u32),
+    ) -> Result<(u32, u32, Vec<u8>)> {
+        self.renderer.set_frame(frame);
+        let output = self.renderer.draw_sized(size, None, 0.0).0;
+        Self::readback(&self.device, &self.queue, output)
+    }
+
+    fn readback(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        output: &wgpu::Texture,
+    ) -> Result<(u32, u32, Vec<u8>)> {
         let (width, height) = (output.width(), output.height());
         let row = width * 4;
         let padded =
             row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("screenshot readback"),
             size: u64::from(padded * height),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             output.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -803,10 +852,10 @@ impl Headless {
             },
             output.size(),
         );
-        self.queue.submit(std::iter::once(encoder.finish()));
+        queue.submit(std::iter::once(encoder.finish()));
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device
+        device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|error| format!("could not read the screens back: {error}"))?;
         let data = slice

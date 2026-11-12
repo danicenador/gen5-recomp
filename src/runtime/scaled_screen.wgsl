@@ -5,13 +5,16 @@
 
 
 struct Params {
-    scale: u32,
+    width: u32,
+    height: u32,
     // The screen engine A's 3D layer is on (0 top, 1 bottom), or -1.
     screen: i32,
     // Engine A's BG0 horizontal scroll.
     scroll: u32,
     // Widescreen columns on each side (0 without).
     extra: u32,
+    span: f32,
+    padding: vec2<u32>,
     // MASTER_BRIGHT of the top and bottom screens.
     brightness: vec4<u32>,
 };
@@ -94,15 +97,18 @@ fn resolve(record: vec4<u32>, color: u32, alpha: u32) -> u32 {
 
 @fragment
 fn screen_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let scale = params.scale;
     let extra = params.extra;
     let x = u32(position.x);
     let y = u32(position.y);
-    let screen = (y / scale) / 192u;
-    if screen == 1u && (x / scale < extra || x / scale >= extra + 256u) {
+    let screen = min(y / params.height, 1u);
+    let scale = f32(params.width) / params.span;
+    let ds_x = position.x / scale + (f32(256u + 2u * extra) - params.span) * 0.5;
+    let ds_y = f32(y % params.height) * 192.0 / f32(params.height);
+    if screen == 1u && (ds_x < f32(extra) || ds_x >= f32(extra + 256u)) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    let record = textureLoad(composed, vec2<u32>(x / scale, y / scale), 0);
+    let source_x = u32(clamp(floor(ds_x), 0.0, f32(255u + 2u * extra)));
+    let record = textureLoad(composed, vec2<u32>(source_x, u32(ds_y) + screen * 192u), 0);
     var color = record.x & 0x7FFFu;
     if i32(screen) == params.screen {
         // The 3D layer's column, in scaled DS pixels from the screen's
@@ -111,10 +117,9 @@ fn screen_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<
         if scroll >= 256 {
             scroll = scroll - 512;
         }
-        let side = i32(extra * scale);
-        let sx = i32(x) - side + scroll * i32(scale);
-        if sx >= -side && sx < i32(256u * scale) + side {
-            let at = vec2<u32>(u32(sx + side), y - screen * 192u * scale);
+        let sx = i32(floor(position.x + f32(scroll) * scale));
+        if sx >= 0 && sx < i32(params.width) {
+            let at = vec2<u32>(u32(sx), y % params.height);
             let alpha = u32(round(textureLoad(layer_alpha, at, 0).x * 31.0));
             if alpha != 0u {
                 let layer = textureLoad(layer_color, at, 0);

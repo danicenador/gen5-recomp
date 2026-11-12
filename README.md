@@ -165,8 +165,9 @@ cargo run --release -- run ".gen5-cache/pokemon-white-2/95AB5437" "roms/Pokemon 
 cargo run --release -- boot ".gen5-cache/pokemon-white-2/95AB5437" "roms/Pokemon White Version 2.nds" 600 frames
 ```
 
-`run` opens a window with both screens stacked, paced to the DS's 59.83
-frames per second. Keys: arrows for the D-pad, X = A, Z = B, S = X, A = Y,
+On first launch, `run` opens a single full-screen view at the monitor's
+resolution, paced to the DS's 59.83 frames per second. Later launches use
+the saved PC preferences. Keys: arrows for the D-pad, X = A, Z = B, S = X, A = Y,
 Q = L, W = R, Enter = Start, Right Shift or Backspace = Select, and the
 mouse on the lower screen as the stylus. Escape asks whether to quit.
 
@@ -206,7 +207,8 @@ save conversion is needed. The observer's identification was checked against
 the local English Black 2 and White 2 ROMs; function names were cross-referenced
 with [pokebw2's Options source](https://github.com/fuddlesworth/pokebw2/blob/main/src/ov140/config_panel.c).
 
-The submenu controls render resolution (Auto or 1x-8x), 4:3 / 16:9, single /
+The submenu controls resolution (Auto, common pixel sizes and the monitor's
+own size), aspect ratio, single /
 stacked / separate-window layouts, fullscreen, Manual / Smart bottom-screen
 behavior, fast-forward and its 2x-8x speed, 3D interpolation, stylus sensitivity,
 stick dead zone, and keyboard/controller mappings. Manual mode leaves the
@@ -232,19 +234,25 @@ launch. A settings-file error is reported instead of silently overwriting it.
 Add `--split-screens` to `run` to put the top and bottom DS screens in
 separate, independently resizable windows. Keyboard controls work in either
 window; the mouse acts as the stylus only in the bottom-screen window.
-Closing either window quits. Without the flag, both screens remain stacked.
+Closing either window quits. The layout is saved; new preferences use a single screen.
 
 Add `--single-screen` to `run` to play on one screen. The window opens full
-screen, and the 16:9 top screen fills it (as with `--widescreen`; H still
-switches it to 4:3). The bottom screen is hidden until the left trigger (L2)
+screen, and the top screen fits the chosen aspect ratio (H still switches
+it to 4:3). The bottom screen is hidden until the left trigger (L2)
 or Space is pressed: then it slides up from the lower edge in 180 ms, 4:3
 and two thirds as tall as the top screen (720 lines on a 1080-line monitor),
 centered with its lower edge on the screen's, and the top screen blurs
 behind it. Pressing again slides it back down; pressing midway turns it
 around. The game keeps running and taking buttons while it is up, and the
-mouse is the stylus on it once it has fully risen. Without a resolution
-multiple, single-screen mode draws at least as many lines as the monitor
-has (6x at 1080 lines) and shrinks to fit.
+mouse is the stylus on it once it has fully risen.
+
+Auto resolution reads the monitor's exact pixel size. Any size can be selected
+with `--resolution=1920x1080` or `GEN5_RESOLUTION=1417x907`, including in
+headless `boot` screenshots. Rendering uses that pixel size directly instead
+of rounding up to a DS resolution multiple. Fit resolution preserves aspect
+ratios from 4:3 through 16:9 (including 16:10); wider or taller screens show
+black bars. The bottom screen and stylus retain their 4:3 proportions.
+The old 1-8 shortcuts and explicit integer scales remain available.
 
 The bottom screen also follows the scene by itself: it rises in menus played
 on it and in battles while they wait for a command, and drops back on the

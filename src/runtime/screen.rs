@@ -234,8 +234,22 @@ impl View {
     /// The part of the stacked screens shown, in texture coordinates:
     /// x, y, width, height. Frames are `WIDTH + 2 * extra` wide, the bottom
     /// screen in the middle of its half.
+    #[cfg(test)]
     fn rect(self, extra: usize) -> [f32; 4] {
-        let total = (WIDTH + 2 * extra) as f32;
+        self.display_rect(extra as f32)
+    }
+
+    fn display_width(self, extra: f32) -> f32 {
+        WIDTH as f32
+            + if self == Self::Bottom {
+                0.0
+            } else {
+                2.0 * extra
+            }
+    }
+
+    fn display_rect(self, extra: f32) -> [f32; 4] {
+        let total = WIDTH as f32 + 2.0 * extra;
         match self {
             Self::Stacked => [0.0, 0.0, 1.0, 1.0],
             Self::Top | Self::Single => [0.0, 0.0, 1.0, 0.5],
@@ -245,22 +259,28 @@ impl View {
 
     /// The DS touch-screen point under `cursor`. Single-screen windows
     /// touch through the raised bottom screen instead (`Panel`).
+    #[cfg(test)]
     fn touch(
         self,
         size: winit::dpi::PhysicalSize<u32>,
         cursor: PhysicalPosition<f64>,
         extra: usize,
     ) -> Option<(u8, u8)> {
+        self.display_touch(size, cursor, extra as f32)
+    }
+
+    fn display_touch(
+        self,
+        size: winit::dpi::PhysicalSize<u32>,
+        cursor: PhysicalPosition<f64>,
+        extra: f32,
+    ) -> Option<(u8, u8)> {
         if matches!(self, Self::Top | Self::Single) || size.width == 0 || size.height == 0 {
             return None;
         }
-        let (x, y, scale) = placement(size.width, size.height, self, extra);
-        let px = ((cursor.x as f32 - x) / scale).floor()
-            - if self == Self::Stacked {
-                extra as f32
-            } else {
-                0.0
-            };
+        let (x, y, scale) = display_placement(size.width, size.height, self, extra);
+        let px = ((cursor.x as f32 - x) / scale - if self == Self::Stacked { extra } else { 0.0 })
+            .floor();
         let py = ((cursor.y as f32 - y) / scale).floor()
             - if self == Self::Stacked {
                 HEIGHT as f32
@@ -274,8 +294,13 @@ impl View {
 
 /// Where the screens are drawn in a window of this size, with `extra`
 /// widescreen columns on each side of the top screen: x, y, scale.
+#[cfg(test)]
 fn placement(width: u32, height: u32, view: View, extra: usize) -> (f32, f32, f32) {
-    let shown = view.width(extra) as f32;
+    display_placement(width, height, view, extra as f32)
+}
+
+fn display_placement(width: u32, height: u32, view: View, extra: f32) -> (f32, f32, f32) {
+    let shown = view.display_width(extra);
     let scale = (width as f32 / shown).min(height as f32 / view.height() as f32);
     let x = (width as f32 - shown * scale) / 2.0;
     let y = (height as f32 - view.height() as f32 * scale) / 2.0;
@@ -546,9 +571,14 @@ impl PadCursor {
 /// `raised` (0 to 1) of the way up: x, y, width, height. Its lower edge
 /// starts at the top screen's and it rises its own height; whatever lies
 /// below the top screen is not shown.
+#[cfg(test)]
 fn panel_rect(width: u32, height: u32, extra: usize, raised: f32) -> [f32; 4] {
-    let (x, y, scale) = placement(width, height, View::Single, extra);
-    let top_width = View::Single.width(extra) as f32 * scale;
+    display_panel_rect(width, height, extra as f32, raised)
+}
+
+fn display_panel_rect(width: u32, height: u32, extra: f32, raised: f32) -> [f32; 4] {
+    let (x, y, scale) = display_placement(width, height, View::Single, extra);
+    let top_width = View::Single.display_width(extra) * scale;
     let top_height = HEIGHT as f32 * scale;
     let panel_height = (top_height * PANEL_HEIGHT).round();
     let panel_width = (panel_height * WIDTH as f32 / HEIGHT as f32).round();
@@ -561,15 +591,24 @@ fn panel_rect(width: u32, height: u32, extra: usize, raised: f32) -> [f32; 4] {
 }
 
 /// The DS touch-screen point under `cursor` on a raised bottom screen.
+#[cfg(test)]
 fn panel_touch(
     size: winit::dpi::PhysicalSize<u32>,
     cursor: PhysicalPosition<f64>,
     extra: usize,
 ) -> Option<(u8, u8)> {
+    display_panel_touch(size, cursor, extra as f32)
+}
+
+fn display_panel_touch(
+    size: winit::dpi::PhysicalSize<u32>,
+    cursor: PhysicalPosition<f64>,
+    extra: f32,
+) -> Option<(u8, u8)> {
     if size.width == 0 || size.height == 0 {
         return None;
     }
-    let [x, y, width, height] = panel_rect(size.width, size.height, extra, 1.0);
+    let [x, y, width, height] = display_panel_rect(size.width, size.height, extra, 1.0);
     let px = ((cursor.x as f32 - x) / width * WIDTH as f32).floor();
     let py = ((cursor.y as f32 - y) / height * HEIGHT as f32).floor();
     ((0.0..WIDTH as f32).contains(&px) && (0.0..HEIGHT as f32).contains(&py))
@@ -780,6 +819,10 @@ impl App {
         }
         if let Some(scale) = scale_key(code) {
             self.settings.scale = Some(scale);
+            self.settings.resolution = None;
+            if let Some(gpu) = &mut self.gpu {
+                gpu.render_size = None;
+            }
             self.auto_scale = false;
             self.scale.store(scale, Ordering::Relaxed);
         } else if code == KeyCode::KeyH {
@@ -861,6 +904,19 @@ impl App {
             self.settings.scale.unwrap_or(automatic).clamp(1, MAX_SCALE),
             Ordering::Relaxed,
         );
+        if let Some(gpu) = &mut self.gpu {
+            gpu.render_size = self
+                .settings
+                .scale
+                .is_none()
+                .then(|| {
+                    self.settings
+                        .resolution
+                        .or(self.menu.monitor)
+                        .map(|resolution| resolution.content(self.settings.widescreen))
+                })
+                .flatten();
+        }
         if self.widescreen.load(Ordering::Relaxed) != self.settings.widescreen {
             self.toggle_widescreen();
         }
@@ -1046,7 +1102,7 @@ impl App {
             return;
         }
         // Where the screens are is decided by the frame shown.
-        let extra = self.gpu.as_ref().map_or(0, |gpu| gpu.extra);
+        let extra = self.gpu.as_ref().map_or(0.0, Gpu::display_extra);
         let point = self.cursor.filter(|_| self.pen_down).and_then(|cursor| {
             let index = usize::from(self.layout == Layout::Split);
             let size = self.windows.get(index)?.inner_size();
@@ -1054,9 +1110,9 @@ impl App {
                 View::Single => self
                     .panel
                     .touchable()
-                    .then(|| panel_touch(size, cursor, extra))
+                    .then(|| display_panel_touch(size, cursor, extra))
                     .flatten(),
-                view => view.touch(size, cursor, extra),
+                view => view.display_touch(size, cursor, extra),
             }
         });
         // The mouse first, then the stick's stylus.
@@ -1071,6 +1127,19 @@ impl App {
     fn toggle_widescreen(&mut self) {
         let wide = !self.widescreen.load(Ordering::Relaxed);
         self.widescreen.store(wide, Ordering::Relaxed);
+        if let Some(gpu) = &mut self.gpu {
+            gpu.render_size = self
+                .settings
+                .scale
+                .is_none()
+                .then(|| {
+                    self.settings
+                        .resolution
+                        .or(self.menu.monitor)
+                        .map(|resolution| resolution.content(wide))
+                })
+                .flatten();
+        }
         for (index, window) in self.windows.iter().enumerate() {
             if window.is_maximized() || window.fullscreen().is_some() {
                 continue;
@@ -1195,11 +1264,20 @@ impl App {
     }
 
     fn window_title(&self) -> String {
-        let mut title = match self.scale.load(Ordering::Relaxed) {
-            1 => self.title.clone(),
-            scale => format!("{} - {scale}x resolution", self.title),
+        let mut title = match self
+            .settings
+            .scale
+            .is_none()
+            .then(|| self.settings.resolution.or(self.menu.monitor))
+            .flatten()
+        {
+            Some(size) => format!("{} - {} x {}", self.title, size.width, size.height),
+            None => match self.scale.load(Ordering::Relaxed) {
+                1 => self.title.clone(),
+                scale => format!("{} - {scale}x resolution", self.title),
+            },
         };
-        if self.widescreen.load(Ordering::Relaxed) {
+        if self.widescreen.load(Ordering::Relaxed) && self.settings.scale.is_some() {
             title = format!("{title} - 16:9");
         }
         if self.speed.is_fast() {
@@ -1282,6 +1360,13 @@ impl ApplicationHandler for App {
         if !self.windows.is_empty() {
             return;
         }
+        self.menu.monitor = event_loop.primary_monitor().map(|monitor| {
+            let size = monitor.size();
+            settings::Resolution {
+                width: size.width,
+                height: size.height,
+            }
+        });
         // Single-screen mode draws at least as many lines as the monitor
         // has (6x for 1080 lines), then shrinks to fit.
         if self.auto_scale
@@ -1339,6 +1424,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
         }
+        self.apply_settings(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -1403,13 +1489,13 @@ impl ApplicationHandler for App {
                         return;
                     }
                     if self.input.native_options() {
-                        let extra = self.gpu.as_ref().map_or(0, |gpu| gpu.extra);
+                        let extra = self.gpu.as_ref().map_or(0.0, Gpu::display_extra);
                         let point = match self.view(index) {
                             View::Single if self.panel.touchable() => {
-                                panel_touch(size, cursor, extra)
+                                display_panel_touch(size, cursor, extra)
                             }
                             View::Single => None,
-                            view => view.touch(size, cursor, extra),
+                            view => view.display_touch(size, cursor, extra),
                         };
                         if point.is_some_and(|(x, y)| x < 112 && y >= 168) {
                             self.show_settings();
@@ -1549,6 +1635,7 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
 ";
 
 struct Gpu {
+    render_size: Option<(u32, u32)>,
     menu_renderer: settings_menu::Renderer,
     menu_vertices: Vec<settings_menu::Vertex>,
     native_options: bool,
@@ -1985,6 +2072,10 @@ impl Gpu {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gen5 screen"),
+                required_limits: wgpu::Limits {
+                    max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d,
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -2197,6 +2288,7 @@ impl Gpu {
             })
         });
         Ok(Self {
+            render_size: None,
             targets,
             menu_renderer: settings_menu::Renderer::new(&device, config.format),
             menu_vertices: Vec::new(),
@@ -2264,8 +2356,21 @@ impl Gpu {
         let Some(renderer) = self.scaled.as_mut() else {
             return Matched::default();
         };
-        let (output, matched) = renderer.draw(scale, next, alpha);
-        let id = (scale, output.width());
+        let (output, matched) = match self.render_size {
+            Some(size) => {
+                let limit = self.device.limits().max_texture_dimension_2d;
+                let factor = (limit as f64 / size.0 as f64)
+                    .min(limit as f64 / (2 * size.1) as f64)
+                    .min(1.0);
+                let size = (
+                    (size.0 as f64 * factor).round().max(1.0) as u32,
+                    (size.1 as f64 * factor).round().max(1.0) as u32,
+                );
+                renderer.draw_sized(size, next, alpha)
+            }
+            None => renderer.draw(scale, next, alpha),
+        };
+        let id = (output.width(), output.height());
         if self
             .scaled_view
             .as_ref()
@@ -2289,8 +2394,8 @@ impl Gpu {
     fn screens_group(&self, shown: f32) -> &wgpu::BindGroup {
         match &self.scaled_view {
             // Shrinking a large output: average texels rather than skip them.
-            Some(((scale, _), nearest, linear)) if self.showing_scaled => {
-                if (*scale as f32) > shown {
+            Some(((_, height), nearest, linear)) if self.showing_scaled => {
+                if (*height as f32 / (2 * HEIGHT) as f32) > shown {
                     linear
                 } else {
                     nearest
@@ -2298,6 +2403,16 @@ impl Gpu {
             }
             _ => &self.bind_group,
         }
+    }
+
+    fn display_extra(&self) -> f32 {
+        if self.extra == 0 {
+            return 0.0;
+        }
+        self.render_size
+            .map_or(self.extra as f32, |(width, height)| {
+                (HEIGHT as f32 * width as f32 / height as f32 - WIDTH as f32) * 0.5
+            })
     }
 
     fn bottom_viewport(
@@ -2313,11 +2428,12 @@ impl Gpu {
             if self.panel < 0.999 {
                 return None;
             }
-            let [x, y, w, h] = panel_rect(size.width, size.height, self.extra, self.panel);
+            let [x, y, w, h] =
+                display_panel_rect(size.width, size.height, self.display_extra(), self.panel);
             return Some((x, y, w, h));
         }
-        let (x, y, scale) = placement(size.width, size.height, view, self.extra);
-        let x = x + (view.width(self.extra) as f32 - WIDTH as f32) * scale / 2.;
+        let (x, y, scale) = display_placement(size.width, size.height, view, self.display_extra());
+        let x = x + (view.display_width(self.display_extra()) - WIDTH as f32) * scale / 2.;
         let y = y + if view == View::Stacked {
             HEIGHT as f32 * scale
         } else {
@@ -2394,7 +2510,7 @@ impl Gpu {
         self.queue.write_buffer(
             &target.rect,
             0,
-            bytemuck::cast_slice(&view.rect(self.extra)),
+            bytemuck::cast_slice(&view.display_rect(self.display_extra())),
         );
         if view != View::Single {
             return;
@@ -2402,12 +2518,13 @@ impl Gpu {
         self.queue.write_buffer(
             &target.panel_rect,
             0,
-            bytemuck::cast_slice(&View::Bottom.rect(self.extra)),
+            bytemuck::cast_slice(&View::Bottom.display_rect(self.display_extra())),
         );
         if self.panel > 0.0 {
-            let (_, _, scale) = placement(size.width, size.height, view, self.extra);
+            let (_, _, scale) =
+                display_placement(size.width, size.height, view, self.display_extra());
             let wanted = Blur::size_for(
-                view.width(self.extra) as f32 * scale,
+                view.display_width(self.display_extra()) * scale,
                 view.height() as f32 * scale,
             );
             if self.blur.as_ref().is_none_or(|blur| blur.size != wanted) {
@@ -2425,8 +2542,9 @@ impl Gpu {
         encoder: &mut wgpu::CommandEncoder,
     ) {
         let target = &self.targets[index];
-        let (x, y, scale) = placement(size.width, size.height, target.view, self.extra);
-        let width = target.view.width(self.extra) as f32 * scale;
+        let (x, y, scale) =
+            display_placement(size.width, size.height, target.view, self.display_extra());
+        let width = target.view.display_width(self.display_extra()) * scale;
         let height = target.view.height() as f32 * scale;
         let blur = self
             .blur
@@ -2502,7 +2620,7 @@ impl Gpu {
         pass.draw(0..3, 0..1);
         // The bottom screen, cut off at the top screen's lower edge.
         let [panel_x, panel_y, panel_width, panel_height] =
-            panel_rect(size.width, size.height, self.extra, self.panel);
+            display_panel_rect(size.width, size.height, self.display_extra(), self.panel);
         let left = (panel_x.max(0.0) as u32).min(size.width);
         let right = ((panel_x + panel_width).max(0.0) as u32).min(size.width);
         let top = (panel_y.max(0.0) as u32).min(size.height);
@@ -2579,6 +2697,14 @@ mod tests {
                     assert_eq!(gpu.targets[0].view, app.view(0));
                     assert!(!gpu.menu_vertices.is_empty());
                 }
+                app.settings.scale = None;
+                app.settings.resolution = Some(settings::Resolution {
+                    width: 1417,
+                    height: 907,
+                });
+                app.settings.widescreen = true;
+                app.menu_effect(Effect::Changed, event_loop);
+                assert_eq!(app.gpu.as_ref().unwrap().render_size, Some((1417, 907)));
                 app.settings.scale = Some(3);
                 app.settings.widescreen = true;
                 app.settings.smart_bottom = false;
@@ -2596,6 +2722,8 @@ mod tests {
                 assert_eq!(input.buttons(), 0);
                 assert_eq!(input.touch_sample(), 0);
                 assert_eq!(Settings::load(&path).unwrap(), app.settings);
+                app.settings.fullscreen = false;
+                app.apply_settings(event_loop);
                 let id = app.windows[0].id();
                 for _ in 0..3 {
                     app.toggle_fullscreen(0);
@@ -2641,6 +2769,24 @@ mod tests {
         // Widescreen stacks a 342-wide top screen over the bottom one.
         assert_eq!(placement(684, 768, View::Stacked, 43), (0.0, 0.0, 2.0));
         assert_eq!(placement(1000, 384, View::Stacked, 43).0, 329.0);
+    }
+
+    #[test]
+    fn fractional_aspects_keep_stylus_coordinates_and_ultrawide_bars_aligned() {
+        let size = winit::dpi::PhysicalSize::new(1920, 1200);
+        let extra = (192.0 * 1.6 - 256.0) / 2.0;
+        let [x, y, w, h] = display_panel_rect(size.width, size.height, extra, 1.0);
+        assert_eq!(
+            display_panel_touch(
+                size,
+                PhysicalPosition::new((x + w / 2.0) as f64, (y + h / 2.0) as f64),
+                extra
+            ),
+            Some((128, 96))
+        );
+        let extra = (192.0 * (16.0 / 9.0) - 256.0) / 2.0;
+        let (x, y, scale) = display_placement(3440, 1440, View::Single, extra);
+        assert!((x - 440.0).abs() < 0.01 && y == 0.0 && (scale - 7.5).abs() < 0.01);
     }
 
     #[test]

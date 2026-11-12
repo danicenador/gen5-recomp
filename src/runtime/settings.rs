@@ -31,6 +31,67 @@ pub const ACTION_NAMES: [&str; ACTION_COUNT] = [
     "Stylus touch",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolution {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Resolution {
+    pub fn parse(text: &str) -> Result<Self> {
+        let (width, height) = text
+            .split_once(['x', 'X'])
+            .ok_or("resolution must be WIDTHxHEIGHT")?;
+        let resolution = Self {
+            width: width.parse().map_err(|_| "invalid resolution width")?,
+            height: height.parse().map_err(|_| "invalid resolution height")?,
+        };
+        if !(64..=8192).contains(&resolution.width) || !(48..=4320).contains(&resolution.height) {
+            return Err("resolution must be between 64x48 and 8192x4320".into());
+        }
+        Ok(resolution)
+    }
+
+    /// The game fits 4:3 through 16:9 without stretching. Wider or taller
+    /// output modes leave bars outside this content rectangle.
+    pub fn content(self, wide: bool) -> (u32, u32) {
+        let aspect = if wide {
+            (self.width as f64 / self.height as f64).clamp(4.0 / 3.0, 16.0 / 9.0)
+        } else {
+            4.0 / 3.0
+        };
+        let height = (self.height as f64).min(self.width as f64 / aspect);
+        (
+            (height * aspect).round().max(1.0) as u32,
+            height.round().max(1.0) as u32,
+        )
+    }
+
+    pub fn choices(monitor: Option<Self>) -> Vec<Self> {
+        let mut choices = vec![
+            (800, 600),
+            (1024, 768),
+            (1280, 720),
+            (1280, 800),
+            (1366, 768),
+            (1600, 900),
+            (1920, 1080),
+            (1920, 1200),
+            (2560, 1440),
+            (2560, 1600),
+            (3840, 2160),
+        ]
+        .into_iter()
+        .map(|(width, height)| Self { width, height })
+        .collect::<Vec<_>>();
+        if let Some(monitor) = monitor.filter(|monitor| !choices.contains(monitor)) {
+            choices.push(monitor);
+        }
+        choices.sort_by_key(|resolution| (resolution.width, resolution.height));
+        choices
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Bindings {
@@ -113,6 +174,7 @@ impl Bindings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub resolution: Option<Resolution>,
     /// None selects a monitor-appropriate render scale.
     pub scale: Option<u32>,
     pub widescreen: bool,
@@ -131,10 +193,11 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            scale: Some(1),
-            widescreen: false,
-            layout: Layout::Stacked,
-            fullscreen: false,
+            resolution: None,
+            scale: None,
+            widescreen: true,
+            layout: Layout::Single,
+            fullscreen: true,
             smart_bottom: true,
             fast_forward: false,
             speed: 3,
@@ -169,6 +232,10 @@ impl Settings {
     }
 
     fn normalize(&mut self) {
+        if let Some(resolution) = &mut self.resolution {
+            resolution.width = resolution.width.clamp(64, 8192);
+            resolution.height = resolution.height.clamp(48, 4320);
+        }
         self.scale = self
             .scale
             .map(|scale| scale.clamp(1, super::screen::MAX_SCALE));
@@ -247,5 +314,43 @@ mod tests {
         settings.bindings.bind(false, PANEL, "KeyX".into());
         assert_eq!(settings.bindings.keyboard_action("KeyX"), Some(PANEL));
         assert!(settings.bindings.keyboard[0].is_empty());
+    }
+
+    #[test]
+    fn arbitrary_resolutions_keep_aspect_and_bar_ultrawide_monitors() {
+        assert_eq!(
+            Resolution::parse("1920x1080").unwrap().content(true),
+            (1920, 1080)
+        );
+        assert_eq!(
+            Resolution::parse("1920x1200").unwrap().content(true),
+            (1920, 1200)
+        );
+        assert_eq!(
+            Resolution::parse("1417x907").unwrap().content(true),
+            (1417, 907)
+        );
+        assert_eq!(
+            Resolution::parse("3440x1440").unwrap().content(true),
+            (2560, 1440)
+        );
+        assert_eq!(
+            Resolution::parse("1920x1080").unwrap().content(false),
+            (1440, 1080)
+        );
+        assert!(Resolution::parse("0x1080").is_err());
+        assert!(Resolution::parse("1920").is_err());
+        let monitor = Resolution {
+            width: 2256,
+            height: 1504,
+        };
+        assert_eq!(
+            Resolution::choices(Some(monitor))
+                .iter()
+                .filter(|&&item| item == monitor)
+                .count(),
+            1
+        );
+        assert_eq!(Settings::default().layout, Layout::Single);
     }
 }

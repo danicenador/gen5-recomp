@@ -1,6 +1,6 @@
 //! Controller-friendly PC options, painted above the game rather than into DS VRAM.
 use super::screen::Layout;
-use super::settings::{ACTION_COUNT, ACTION_NAMES, Settings};
+use super::settings::{ACTION_COUNT, ACTION_NAMES, Resolution, Settings};
 use crate::nds::input;
 
 pub const WIDTH: f32 = 512.0;
@@ -14,6 +14,7 @@ pub enum Page {
 }
 
 pub struct Menu {
+    pub monitor: Option<Resolution>,
     pub open: bool,
     pub page: Page,
     pub selected: usize,
@@ -25,6 +26,7 @@ pub struct Menu {
 impl Default for Menu {
     fn default() -> Self {
         Self {
+            monitor: None,
             open: false,
             page: Page::Main,
             selected: 0,
@@ -46,6 +48,7 @@ impl Menu {
     pub fn show(&mut self) {
         *self = Self {
             open: true,
+            monitor: self.monitor,
             ..Self::default()
         };
     }
@@ -100,9 +103,18 @@ impl Menu {
         }
         match self.selected {
             0 => {
-                let n = settings.scale.unwrap_or(0) as i32;
-                let n = (n + direction).rem_euclid(9) as u32;
-                settings.scale = (n != 0).then_some(n);
+                let mut choices = vec![None];
+                choices.extend(Resolution::choices(self.monitor).into_iter().map(Some));
+                if !choices.contains(&settings.resolution) {
+                    choices.push(settings.resolution);
+                }
+                let current = choices
+                    .iter()
+                    .position(|choice| *choice == settings.resolution)
+                    .unwrap_or(0);
+                settings.resolution =
+                    choices[(current as i32 + direction).rem_euclid(choices.len() as i32) as usize];
+                settings.scale = None;
             }
             1 => settings.widescreen = !settings.widescreen,
             2 => {
@@ -204,10 +216,32 @@ impl Menu {
         }
         let on = |b| if b { "On".into() } else { "Off".into() };
         match index {
-            0 => ("Render resolution".into(), resolution(s.scale, scale, wide)),
+            0 => (
+                "Resolution".into(),
+                if s.scale.is_none() {
+                    match s.resolution.or(self.monitor) {
+                        Some(size) => format!(
+                            "{}{} x {}",
+                            if s.resolution.is_none() { "Auto: " } else { "" },
+                            size.width,
+                            size.height
+                        ),
+                        None => "Auto (monitor)".into(),
+                    }
+                } else {
+                    resolution(s.scale, scale, wide)
+                },
+            ),
             1 => (
                 "Aspect ratio".into(),
-                if s.widescreen { "16:9" } else { "4:3" }.into(),
+                if s.widescreen && s.scale.is_none() {
+                    "Fit resolution"
+                } else if s.widescreen {
+                    "16:9"
+                } else {
+                    "4:3"
+                }
+                .into(),
             ),
             2 => (
                 "Screen layout".into(),

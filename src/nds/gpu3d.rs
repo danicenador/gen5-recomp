@@ -2467,6 +2467,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fractional_resolutions_render_exact_sizes_without_stretching_geometry() {
+        let Ok(mut gpu) = crate::runtime::scaled::Headless::new() else {
+            return;
+        };
+        let mut io = io();
+        let mut memory = super::super::memory::Memory::new();
+        io.geometry.wide = true;
+        triangle(&mut io.geometry, 31, 0, 31, 0);
+        command(&mut io.geometry, 0x50, &[0]);
+        io.advance_to_vblank();
+        io.set16(0x0400_0304, 0x800a);
+        io.set32(0x0400_0000, 0x10108);
+        memory.palette[0..2].copy_from_slice(&(31u16 << 5).to_le_bytes());
+        let frame = super::super::gpu2d::render_scaled(&io, &memory);
+        for (width, height) in [(1024, 768), (1417, 907), (1920, 1080), (1920, 1200)] {
+            let (w, h, pixels) = gpu.render_sized(&frame, (width, height)).unwrap();
+            assert_eq!((w, h), (width, 2 * height));
+            let mut bounds = [w, h, 0, 0];
+            for (i, pixel) in pixels[..(w * height * 4) as usize]
+                .chunks_exact(4)
+                .enumerate()
+            {
+                if pixel[0] > 200 && pixel[1] < 10 && pixel[2] < 10 {
+                    let (x, y) = (i as u32 % w, i as u32 / w);
+                    bounds = [
+                        bounds[0].min(x),
+                        bounds[1].min(y),
+                        bounds[2].max(x),
+                        bounds[3].max(y),
+                    ];
+                }
+            }
+            let ratio = (bounds[2] - bounds[0] + 1) as f32 / (bounds[3] - bounds[1] + 1) as f32;
+            assert!(
+                (ratio - 4.0 / 3.0).abs() < 0.02,
+                "{width}x{height}: {bounds:?}"
+            );
+        }
+    }
+
     /// A red triangle right of the screen, x 1.05 to 1.3, which only
     /// widescreen's extra columns (up to x 1.336) show: DS columns 262 to
     /// 294, rows 47 to 143.

@@ -167,7 +167,13 @@ fn run() -> Result<(), String> {
             let directory = args.get(4).map(std::path::PathBuf::from);
             // GEN5_SCALE: screenshots at a multiple of the DS resolution,
             // drawn by the GPU renderer.
-            let scale = scale_from_env()?;
+            let resolution = std::env::var("GEN5_RESOLUTION")
+                .ok()
+                .map(|value| gen5::runtime::settings::Resolution::parse(&value))
+                .transpose()?;
+            let scale = resolution.map_or_else(scale_from_env, |resolution| {
+                Ok(resolution.height.div_ceil(192).clamp(1, 8))
+            })?;
             let mut gpu: Option<gen5::runtime::scaled::Headless> = None;
             let on_frame = directory.map(|directory| {
                 Box::new(move |number: u64, frame: &gen5::nds::gpu2d::Frame, _| {
@@ -182,7 +188,14 @@ fn run() -> Result<(), String> {
                                     }
                                 }
                             }
-                            match gpu.as_mut().unwrap().render(scaled, scale) {
+                            let rendered = match resolution {
+                                Some(resolution) => gpu
+                                    .as_mut()
+                                    .unwrap()
+                                    .render_sized(scaled, resolution.content(scaled.extra > 0)),
+                                None => gpu.as_mut().unwrap().render(scaled, scale),
+                            };
+                            match rendered {
                                 Ok(image) => image,
                                 Err(error) => {
                                     eprintln!("{error}");
@@ -225,7 +238,7 @@ fn run() -> Result<(), String> {
                     input: Some(input),
                     audio: queue,
                     scale: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(scale)),
-                    gpu: false,
+                    gpu: resolution.is_some(),
                     // GEN5_WIDESCREEN=1: 16:9 top-screen screenshots.
                     widescreen: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                         widescreen_from_env(),
@@ -246,11 +259,15 @@ fn run() -> Result<(), String> {
                 },
             )
         }
-        Some("run") if (3..=8).contains(&args.len()) => {
+        Some("run") if args.len() >= 3 => {
             use gen5::runtime::screen::Layout;
             use gen5::runtime::settings::Settings;
             let settings_path = Settings::path(Path::new(&args[1]));
             let mut settings = Settings::load(&settings_path)?;
+            if let Ok(value) = std::env::var("GEN5_RESOLUTION") {
+                settings.resolution = Some(gen5::runtime::settings::Resolution::parse(&value)?);
+                settings.scale = None;
+            }
             if std::env::var_os("GEN5_AUTO_CONTINUE").is_some() {
                 settings.auto_continue =
                     std::env::var("GEN5_AUTO_CONTINUE").is_ok_and(|value| value == "1");
@@ -266,6 +283,7 @@ fn run() -> Result<(), String> {
             }
             if std::env::var_os("GEN5_SCALE").is_some() {
                 scale = Some(scale_from_env()?);
+                settings.resolution = None;
             }
             for value in &args[3..] {
                 let chosen = match value.as_str() {
@@ -285,6 +303,10 @@ fn run() -> Result<(), String> {
                         settings.fullscreen = true;
                         widescreen = true;
                     }
+                } else if let Some(value) = value.strip_prefix("--resolution=") {
+                    settings.resolution = Some(gen5::runtime::settings::Resolution::parse(value)?);
+                    scale = None;
+                    explicit_scale = true;
                 } else if value == "--continue" {
                     settings.auto_continue = true;
                 } else if value == "--widescreen" {
@@ -293,6 +315,7 @@ fn run() -> Result<(), String> {
                     fps = Some(gen5::runtime::pacing::Fps::parse(mode)?);
                 } else {
                     explicit_scale = true;
+                    settings.resolution = None;
                     scale = Some(
                         value
                             .trim_start_matches("--scale=")

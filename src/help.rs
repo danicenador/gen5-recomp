@@ -100,6 +100,7 @@ Options:
                     battle commands.
   --widescreen      Draw the top screen at 16:9 (also GEN5_WIDESCREEN=1).
   --continue        Start in the saved game (also GEN5_AUTO_CONTINUE=1).
+  --resolution=WxH  Exact pixel resolution (also GEN5_RESOLUTION=1920x1080).
 
 Settings changed while playing are kept in <cache>/pc-settings.json and
 used at the next launch; the options given here override them.
