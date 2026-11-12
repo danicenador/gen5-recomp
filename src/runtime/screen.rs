@@ -395,10 +395,12 @@ enum Scene {
 
 fn scene(overlays: &[u16]) -> Scene {
     let any = |ids: &[u16]| overlays.iter().any(|id| ids.contains(id));
-    if any(BATTLE_OVERLAYS) {
-        Scene::Battle
-    } else if any(MENU_OVERLAYS) {
+    // Battles keep their overlays loaded while a party/summary menu takes
+    // over, including the move-forgetting screen after a level-up.
+    if any(MENU_OVERLAYS) {
         Scene::Menu
+    } else if any(BATTLE_OVERLAYS) {
+        Scene::Battle
     } else if overlays.contains(&FIELD_OVERLAY) {
         Scene::Field
     } else if overlays.contains(&NAMING_OVERLAY) {
@@ -2853,6 +2855,29 @@ mod tests {
         assert_eq!(battle(0x1713), Some(true));
         // As it starts, before the Poké Ball shows, no backgrounds are on.
         assert_eq!(battle(0x0013), Some(false));
+    }
+
+    #[test]
+    fn battle_submenus_keep_the_bottom_screen_up_until_the_menu_closes() {
+        let background = BottomScreen {
+            engine_a: false,
+            layers: 0x1c,
+        };
+        let mut overlays = BATTLE_OVERLAYS.to_vec();
+        for menu in MENU_OVERLAYS {
+            overlays.push(*menu);
+            assert_eq!(scene(&overlays), Scene::Menu);
+            assert_eq!(
+                scene_wants_panel(scene(&overlays), false, background),
+                Some(true)
+            );
+            overlays.pop();
+        }
+        assert_eq!(scene(&overlays), Scene::Battle);
+        assert_eq!(
+            scene_wants_panel(scene(&overlays), false, background),
+            Some(false)
+        );
     }
 
     #[test]
