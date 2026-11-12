@@ -183,6 +183,7 @@ struct App {
     interpolate: bool,
     /// Frames taken from the game, oldest first, that may still be shown.
     history: VecDeque<Published>,
+    timeline: pacing::Timeline,
     /// What the scaled renderer last drew: frame, next list, alpha, scale.
     drawn: Option<(u64, Option<u64>, u64, u32)>,
     /// With a frame-rate cap, when to present next.
@@ -671,6 +672,7 @@ impl App {
             blocked_keyboard: Vec::new(),
             blocked_pad: 0,
             history: VecDeque::new(),
+            timeline: pacing::Timeline::default(),
             drawn: None,
             next_present: Instant::now(),
             rate: Rate {
@@ -1195,8 +1197,9 @@ impl App {
         if !self.history.is_empty() {
             let pick = if self.interpolate {
                 let times: Vec<FrameTime> = self.history.iter().map(Published::time).collect();
-                pacing::pick(&times, Instant::now())
+                self.timeline.pick(&times, Instant::now())
             } else {
+                self.timeline = pacing::Timeline::default();
                 Pick::newest(self.history.len())
             };
             let shown = &self.history[pick.shown];

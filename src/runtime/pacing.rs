@@ -88,6 +88,69 @@ impl Pick {
 
 /// What to draw at `now` from `frames` (oldest first, not empty).
 pub fn pick(frames: &[FrameTime], now: Instant) -> Pick {
+    pick_at(frames, desired_time(frames, now))
+}
+
+/// A continuous presentation clock. The game's 3D cadence can change between
+/// one, two and more vblanks; changing the delay in one step skips geometry
+/// poses and can briefly show older texture/2D snapshots.
+#[derive(Default)]
+pub struct Timeline {
+    previous: Option<(Instant, Instant)>,
+}
+
+impl Timeline {
+    pub fn pick(&mut self, frames: &[FrameTime], now: Instant) -> Pick {
+        let wanted = desired_time(frames, now);
+        let oldest = frames[0].deadline;
+        let last = frames.len() - 1;
+        let latest = if frames[last].list.is_some() {
+            // Duplicate vblank frames do not provide a future 3D pose.
+            // Hold at the newest list's first frame until its successor
+            // exists, rather than jumping forward when it finally arrives.
+            let mut first = last;
+            while first > 0 && frames[first - 1].list == frames[last].list {
+                first -= 1;
+            }
+            frames[first].deadline
+        } else {
+            frames[last].deadline
+        };
+        let at = match self.previous {
+            Some((previous_now, previous_at))
+                if now.saturating_duration_since(previous_now) <= FRAME_TIME * 6 =>
+            {
+                let elapsed = now.saturating_duration_since(previous_now);
+                let nominal = previous_at + elapsed;
+                let correction = elapsed / 8;
+                if wanted >= nominal {
+                    nominal + wanted.duration_since(nominal).min(correction)
+                } else {
+                    nominal - nominal.duration_since(wanted).min(correction)
+                }
+            }
+            _ => wanted,
+        }
+        .clamp(oldest, latest);
+        self.previous = Some((now, at));
+        let mut pick = pick_at(frames, at);
+        if let Some(list) = frames[pick.shown].list {
+            // Text, sprites and texture memory can still update while a
+            // 3D list is held. Use a recent snapshot of that same list;
+            // only its geometry interpolation clock is held at the pose.
+            let two_d_at = now.checked_sub(FRAME_TIME).unwrap_or(now);
+            let end = pick.next.unwrap_or(frames.len());
+            if let Some(shown) = (pick.shown..end)
+                .rfind(|&i| frames[i].list == Some(list) && frames[i].deadline <= two_d_at)
+            {
+                pick.shown = shown;
+            }
+        }
+        pick
+    }
+}
+
+fn desired_time(frames: &[FrameTime], now: Instant) -> Instant {
     let span_limit = FRAME_TIME * MAX_SPAN;
     // When each list first appeared: the interval between the last two is
     // how far behind the game the window runs.
@@ -103,7 +166,11 @@ pub fn pick(frames: &[FrameTime], now: Instant) -> Pick {
             .clamp(FRAME_TIME, span_limit),
         _ => FRAME_TIME,
     };
-    let at = now.checked_sub(delay).unwrap_or(now);
+    now.checked_sub(delay).unwrap_or(now)
+}
+
+fn pick_at(frames: &[FrameTime], at: Instant) -> Pick {
+    let span_limit = FRAME_TIME * MAX_SPAN;
     let shown = frames
         .iter()
         .rposition(|frame| frame.deadline <= at)
@@ -210,6 +277,87 @@ mod tests {
         frames[1].deadline = start + FRAME_TIME * 10;
         let pick = pick(&frames, start + FRAME_TIME * 6);
         assert_eq!((pick.shown, pick.next), (0, None));
+    }
+
+    #[test]
+    fn cadence_changes_do_not_skip_or_rewind_presented_poses() {
+        let start = Instant::now();
+        let all = timeline(
+            start,
+            &[
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(3),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+            ],
+        );
+        let sample = |frames: &[FrameTime], pick: &Pick| {
+            let mut first = pick.shown;
+            while first > 0 && frames[first - 1].list == frames[pick.shown].list {
+                first -= 1;
+            }
+            frames[first].deadline
+                + pick.next.map_or(Duration::ZERO, |next| {
+                    frames[next]
+                        .deadline
+                        .duration_since(frames[first].deadline)
+                        .mul_f64(pick.alpha)
+                })
+        };
+        let mut clock = Timeline::default();
+        let mut previous = start;
+        let mut old_previous = start;
+        let mut old_jump = Duration::ZERO;
+        for tick in 0..=16 {
+            let now = start + FRAME_TIME * tick / 2;
+            let frames = &all[..(tick as usize / 2 + 1).min(all.len())];
+            let shown = clock.pick(frames, now);
+            let at = sample(frames, &shown);
+            assert!(at >= previous, "pose went backwards at tick {tick}");
+            assert!(
+                at.duration_since(previous) <= FRAME_TIME.mul_f64(0.563),
+                "pose jumped at tick {tick}"
+            );
+            previous = at;
+            let old_at = sample(frames, &pick(frames, now));
+            old_jump = old_jump.max(old_at.saturating_duration_since(old_previous));
+            old_previous = old_at;
+        }
+        assert!(
+            old_jump > FRAME_TIME * 2,
+            "the fixture must reproduce the original cadence jump"
+        );
+    }
+
+    #[test]
+    fn dialogue_snapshots_keep_updating_when_the_3d_pose_is_held() {
+        let start = Instant::now();
+        let frames = timeline(
+            start,
+            &[
+                Some(1),
+                Some(2),
+                Some(2),
+                Some(2),
+                Some(2),
+                Some(2),
+                Some(2),
+            ],
+        );
+        let mut clock = Timeline::default();
+        for frame in 3..frames.len() {
+            let picked = clock.pick(
+                &frames[..=frame],
+                start + FRAME_TIME * frame as u32 + FRAME_TIME / 2,
+            );
+            assert_eq!(picked.shown, frame - 1);
+            assert_eq!((picked.next, picked.alpha), (None, 0.0));
+        }
     }
 
     #[test]
