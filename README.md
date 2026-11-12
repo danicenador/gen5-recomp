@@ -170,6 +170,10 @@ frames per second. Keys: arrows for the D-pad, X = A, Z = B, S = X, A = Y,
 Q = L, W = R, Enter = Start, Right Shift or Backspace = Select, and the
 mouse on the lower screen as the stylus. Escape asks whether to quit.
 
+The DS soft-reset chord, **L + R + Start + Select**, restarts the game.
+The runtime handles the game's reset request after its own shutdown sequence,
+flushes the saved data and firmware, and starts a fresh game process.
+
 Game controllers work too. The face buttons map by position, as on a DS
 (bottom = B, right = A, top = X, left = Y, whatever the controller prints
 on them); the shoulder buttons are L and R, Start and Back/View/Select are

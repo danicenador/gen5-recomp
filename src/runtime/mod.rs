@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod gamepad;
 pub mod pacing;
+pub mod reset;
 pub mod scaled;
 pub mod screen;
 pub mod settings;

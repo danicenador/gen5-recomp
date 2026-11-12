@@ -369,6 +369,7 @@ const RTC_DATE: u32 = 0x027F_FDE8;
 const RTC_TIME: u32 = 0x027F_FDEC;
 /// Card backup requests travel on the FS tag.
 const PXI_TAG_FS: u32 = 11;
+const PXI_TAG_OS: u32 = 12;
 
 /// Shared-RAM words of the ARM9/ARM7 boot handshake.
 const ARM7_BOOT_COUNTER: u32 = 0x027F_FC26;
@@ -917,6 +918,7 @@ impl Machine {
         let tag = word & 0x1F;
         let data = word >> 6;
         match tag {
+            PXI_TAG_OS if crate::runtime::reset::is_reset_command(data) => self.soft_reset(),
             PXI_TAG_PM => {
                 // Power management packets: bit 25 marks the first word
                 // (command in bits 8-14), bit 24 the last. The ARM7 answers
@@ -978,6 +980,18 @@ impl Machine {
             }
             _ => {}
         }
+    }
+
+    fn soft_reset(&mut self) -> ! {
+        if !self.backup.data.is_empty()
+            && let Err(error) = self.backup.flush()
+        {
+            self.stop(&error);
+        }
+        if let Err(error) = self.firmware.flush() {
+            self.stop(&error);
+        }
+        std::process::exit(crate::runtime::reset::RESET_EXIT_CODE);
     }
 
     /// Run a complete firmware flash request against the firmware image.
@@ -1821,6 +1835,7 @@ fn swi(cpu: *mut Cpu, number: u32) {
     machine.record(Event::Swi(number));
     let r = unsafe { (*cpu).r };
     match number {
+        0x00 => machine.soft_reset(),
         // WaitByLoop: the caller is usually waiting on the ARM7.
         0x03 => machine.arm7_tick(),
         0x04 => interrupt_wait(cpu, r[0] != 0, r[1]),

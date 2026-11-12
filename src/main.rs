@@ -26,6 +26,11 @@ fn run() -> Result<(), String> {
         println!("{}", help?);
         return Ok(());
     }
+    if matches!(args.first().map(String::as_str), Some("run" | "boot"))
+        && !gen5::runtime::reset::is_worker()
+    {
+        return gen5::runtime::reset::supervise(&args);
+    }
     match args.first().map(String::as_str) {
         Some("debug") => gen5::debug::launch(&args[1..]),
         Some("checkpoint") if args.len() == 5 => {
