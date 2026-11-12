@@ -222,10 +222,19 @@ pub fn inside_caller_frame(module: &Module, target: u32, thumb: bool) -> bool {
     if !module.contains(target) {
         return false;
     }
-    let mut address = target;
-    for _ in 0..8 {
+    let mut pending = vec![target];
+    let mut visited = HashSet::new();
+    // A shared exit can do substantial cleanup, including calls and
+    // conditional branches, before it releases its caller's stack frame.
+    while let Some(address) = pending.pop() {
+        if visited.len() >= 128 {
+            break;
+        }
+        if !visited.insert(address) {
+            continue;
+        }
         let Some(ins) = decode_at(module, address, thumb) else {
-            return false;
+            continue;
         };
         match ins.op {
             Op::DataProc {
@@ -241,8 +250,8 @@ pub fn inside_caller_frame(module: &Module, target: u32, thumb: bool) -> bool {
                 writeback: true,
                 ..
             } => return true,
-            Op::Multiple { rn: SP, .. } => return false,
-            _ if ins.written_registers() & (1 << SP.0) != 0 => return false,
+            Op::Multiple { rn: SP, .. } => continue,
+            _ if ins.written_registers() & (1 << SP.0) != 0 => continue,
             Op::Memory {
                 rn: SP,
                 offset: Offset::Imm(offset),
@@ -256,10 +265,24 @@ pub fn inside_caller_frame(module: &Module, target: u32, thumb: bool) -> bool {
             } if value >= 0x20 => return true,
             _ => {}
         }
-        if !matches!(flow(&ins, None), Flow::Continue) {
-            return false;
+        match flow(&ins, None) {
+            Flow::Continue | Flow::Call { .. } | Flow::IndirectCall => pending.push(ins.end()),
+            Flow::Jump {
+                target,
+                conditional,
+            } => {
+                if conditional {
+                    pending.push(ins.end());
+                }
+                if module.contains(target) {
+                    pending.push(target);
+                }
+            }
+            Flow::Return { conditional: true } | Flow::IndirectJump { conditional: true } => {
+                pending.push(ins.end());
+            }
+            _ => {}
         }
-        address = ins.end();
     }
     false
 }
@@ -368,9 +391,10 @@ pub fn analyze_function(
 
             let next = ins.end();
             let flow = match flow(&ins, history.last()) {
-                Flow::Call { target, thumb: target_thumb }
-                    if target_thumb == thumb && inside_caller_frame(module, target, thumb) =>
-                {
+                Flow::Call {
+                    target,
+                    thumb: target_thumb,
+                } if target_thumb == thumb && inside_caller_frame(module, target, thumb) => {
                     Flow::Jump {
                         target,
                         conditional: false,
@@ -1169,6 +1193,21 @@ mod tests {
         assert!(function.calls.is_empty());
         assert!(function.instructions.contains_key(&0x0200_000C));
         assert!(!function.instructions.contains_key(&0x0200_0008));
+    }
+
+    #[test]
+    fn shared_cleanup_can_call_helpers_and_branch_before_releasing_the_frame() {
+        // A Thumb long branch to cleanup which calls a normal helper first.
+        let program = program(&[
+            0xb510, 0xb082, 0xf000, 0xf801, 0x4770, 0x1c20, 0xf000, 0xf804, 0x2800, 0xd000, 0x2001,
+            0xb002, 0xbd10, 0x2000, 0x4770,
+        ]);
+        assert!(inside_caller_frame(&program.modules[0], 0x0200_000a, true));
+        assert!(!inside_caller_frame(&program.modules[0], 0x0200_001a, true));
+        let function = analyze_function(&program, key(0x0200_0000), true, &HashSet::new());
+        assert!(!function.instructions.contains_key(&0x0200_0008));
+        assert!(function.instructions.contains_key(&0x0200_0018));
+        assert!(function.calls.iter().all(|call| call.target != 0x0200_000a));
     }
 
     fn arm_program(words: &[u32]) -> Program {

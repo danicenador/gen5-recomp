@@ -195,8 +195,9 @@ any edits to the game's own options. This entry observes the game's actual
 Options input routine rather than guessing from X presses. Other builds keep
 the F1 / left-stick entry point when their Options routine does not match.
 
-After updating an existing import, run `codegen <cache>` and `build <cache>`
-once to include the Options observer in the game library. No ROM patch or
+After updating an existing import, run `analyze <cache>`, `codegen <cache>`
+and `build <cache>` to refresh the function analysis and game library. This
+includes control-flow fixes used during evolution and the Options observer. No ROM patch or
 save conversion is needed. The observer's identification was checked against
 the local English Black 2 and White 2 ROMs; function names were cross-referenced
 with [pokebw2's Options source](https://github.com/fuddlesworth/pokebw2/blob/main/src/ov140/config_panel.c).
