@@ -824,6 +824,19 @@ impl Headless {
         Self::readback(&self.device, &self.queue, output)
     }
 
+    /// Read back the same interpolation used by the window, for regressions.
+    pub fn render_interpolated(
+        &mut self,
+        frame: &ScaledFrame,
+        scale: u32,
+        next: &DisplayList,
+        alpha: f64,
+    ) -> Result<(u32, u32, Vec<u8>)> {
+        self.renderer.set_frame(frame);
+        let output = self.renderer.draw(scale, Some(next), alpha).0;
+        Self::readback(&self.device, &self.queue, output)
+    }
+
     fn readback(
         device: &wgpu::Device,
         queue: &wgpu::Queue,

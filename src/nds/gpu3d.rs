@@ -222,37 +222,89 @@ impl DisplayList {
                 motion[axis][motion[axis].len() / 2]
             })
         });
-        let mut matched = 0;
-        let polygons = self
+        let pairs: Vec<_> = self
             .polygons
             .iter()
             .map(|polygon| {
-                let mut polygon = polygon.clone();
                 let id = identity(polygon.id);
                 let before = &earlier[&id];
-                let after = later.get(&id).and_then(|candidates| {
+                later.get(&id).and_then(|candidates| {
                     if before.len() == 1
                         && candidates.len() == 1
                         && self.submitted.get(&id) == Some(&1)
                         && next.submitted.get(&id) == Some(&1)
                     {
-                        return pairs_with(&polygon, candidates[0]).then_some(candidates[0]);
+                        return pairs_with(polygon, candidates[0]).then_some(candidates[0]);
                     }
                     if camera.is_none() && self.submitted.get(&id) != next.submitted.get(&id) {
                         return None;
                     }
                     let shift = camera.unwrap_or([0.0; 2]);
                     let tolerance = camera.map(|_| 3.0);
-                    let candidate = nearest_polygon(&polygon, candidates, shift, tolerance)?;
+                    let candidate = nearest_polygon(polygon, candidates, shift, tolerance)?;
                     let reverse = nearest_polygon(candidate, before, shift.map(|v| -v), tolerance)?;
                     (reverse.id == polygon.id).then_some(candidate)
-                });
+                })
+            })
+            .collect();
+        // Different materials can share a geometric boundary. If just one
+        // material changes between frames, leaving its edge behind opens a
+        // crack (notably between a battle's ground and sky). Move shared
+        // endpoints together, provided every paired neighbor agrees.
+        let key = |polygon: &Polygon, vertex: &Vertex| {
+            (
+                polygon.viewport,
+                vertex
+                    .clip
+                    .map(|value| if value == 0.0 { 0 } else { value.to_bits() }),
+            )
+        };
+        let shape = |polygon: &Polygon| {
+            let mut vertices: Vec<_> = polygon
+                .vertices
+                .iter()
+                .map(|vertex| key(polygon, vertex).1)
+                .collect();
+            vertices.sort_unstable();
+            (polygon.viewport, vertices)
+        };
+        let mut shared = HashMap::new();
+        let mut matched_shapes = std::collections::HashSet::new();
+        for (polygon, after) in self.polygons.iter().zip(&pairs) {
+            if let Some(after) = after {
+                matched_shapes.insert(shape(polygon));
+                for (vertex, after) in polygon.vertices.iter().zip(&after.vertices) {
+                    let target = shared
+                        .entry(key(polygon, vertex))
+                        .or_insert(Some(after.clip));
+                    if target.is_some_and(|position| position != after.clip) {
+                        *target = None;
+                    }
+                }
+            }
+        }
+        let matched = pairs.iter().filter(|pair| pair.is_some()).count();
+        let polygons = self
+            .polygons
+            .iter()
+            .zip(pairs)
+            .map(|(before, after)| {
+                let mut polygon = before.clone();
                 if let Some(after) = after {
-                    matched += 1;
                     for (vertex, after) in polygon.vertices.iter_mut().zip(&after.vertices) {
                         let moved = vertex.lerp(*after, alpha);
                         vertex.clip = moved.clip;
                         vertex.color = moved.color;
+                    }
+                } else if !matched_shapes.contains(&shape(before)) {
+                    // Complete coincident meshes can be separate objects;
+                    // only their material-independent boundaries are shared.
+                    for vertex in &mut polygon.vertices {
+                        if let Some(Some(target)) = shared.get(&key(before, vertex)) {
+                            vertex.clip = std::array::from_fn(|axis| {
+                                vertex.clip[axis] + (target[axis] - vertex.clip[axis]) * alpha
+                            });
+                        }
                     }
                 }
                 polygon
@@ -2505,6 +2557,85 @@ mod tests {
                 (ratio - 4.0 / 3.0).abs() < 0.02,
                 "{width}x{height}: {bounds:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_battle_horizon_stays_closed_when_one_material_changes_during_camera_motion() {
+        let list = |offset: i32, ground_texture: u32| {
+            let mut g = Geometry::default();
+            command(&mut g, 0x10, &[2]);
+            command(&mut g, 0x1c, &[0, offset as u32, 0]);
+            for (bottom, top, color, texture) in
+                [(0, 4096, 31 << 10, 0), (-4096, 0, 31 << 5, ground_texture)]
+            {
+                command(&mut g, 0x2a, &[texture]);
+                command(&mut g, 0x29, &[(31 << 16) | 0xc0]);
+                command(&mut g, 0x20, &[color]);
+                command(&mut g, 0x40, &[1]);
+                for (x, y) in [(-4096, bottom), (4096, bottom), (4096, top), (-4096, top)] {
+                    vertex(&mut g, x, y, 0);
+                }
+                command(&mut g, 0x41, &[]);
+            }
+            command(&mut g, 0x50, &[0]);
+            g.vblank();
+            g
+        };
+        let mut io = io();
+        io.geometry = list(0, 0);
+        io.set16(0x0400_0304, 0x800a);
+        io.set32(0x0400_0000, 0x10108);
+        let memory = super::super::memory::Memory::new();
+        let frame = super::super::gpu2d::render_scaled(&io, &memory);
+        let next = list(205, 1 << 26);
+        let Ok(mut gpu) = crate::runtime::scaled::Headless::new() else {
+            return;
+        };
+        for alpha in [0.25, 0.5, 0.75, 1.0] {
+            let (width, _, pixels) = gpu
+                .render_interpolated(&frame, 3, &next.displayed, alpha)
+                .unwrap();
+            for y in 88 * 3..100 * 3 {
+                for x in 1..width - 1 {
+                    let at = ((y * width + x) * 4) as usize;
+                    assert!(
+                        pixels[at + 1] != 0 || pixels[at + 2] != 0,
+                        "black horizon at {x},{y}, alpha {alpha}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coincident_objects_with_conflicting_motion_do_not_drag_an_unmatched_object() {
+        let list = |offsets: [i32; 3], change_last: bool| {
+            let mut g = Geometry::default();
+            command(&mut g, 0x10, &[2]);
+            for (id, offset) in offsets.into_iter().enumerate() {
+                command(&mut g, 0x15, &[]);
+                command(&mut g, 0x1c, &[offset as u32, 0, 0]);
+                command(
+                    &mut g,
+                    0x2a,
+                    &[if change_last && id == 2 { 1 << 26 } else { 0 }],
+                );
+                triangle(&mut g, 31, 0, 31, id as u32);
+            }
+            command(&mut g, 0x50, &[0]);
+            g.vblank();
+            g.displayed
+        };
+        let mut shown = list([0, 0, 0], false);
+        let third = &mut Arc::make_mut(&mut shown).polygons[2];
+        third.vertices[1].clip[0] += 0.1;
+        third.vertices[2].clip[1] += 0.1;
+        let next = list([205, -205, 0], true);
+        let (half, matched) = shown.interpolated(Some(&next), 0.5);
+        assert_eq!(matched.matched, 2);
+        for (before, after) in shown.polygons[2].vertices.iter().zip(&half[2].vertices) {
+            assert_eq!(before.clip, after.clip);
         }
     }
 
