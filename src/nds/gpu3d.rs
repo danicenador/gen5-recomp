@@ -97,6 +97,8 @@ pub struct Pixel {
 struct Vertex {
     /// The submitted model-space coordinates, before camera/animation matrices.
     model: [i32; 3],
+    /// Submitted UVs identify the mesh even when a texture matrix animates it.
+    raw_uv: [f64; 2],
     clip: [f64; 4],
     color: [f64; 3],
     uv: [f64; 2],
@@ -106,6 +108,7 @@ impl Vertex {
     fn lerp(self, other: Self, t: f64) -> Self {
         Self {
             model: self.model,
+            raw_uv: self.raw_uv,
             clip: std::array::from_fn(|i| self.clip[i] + (other.clip[i] - self.clip[i]) * t),
             color: std::array::from_fn(|i| self.color[i] + (other.color[i] - self.color[i]) * t),
             uv: std::array::from_fn(|i| self.uv[i] + (other.uv[i] - self.uv[i]) * t),
@@ -223,7 +226,7 @@ fn pairs_with(before: &Polygon, after: &Polygon) -> bool {
         return false;
     }
     before.vertices.iter().zip(&after.vertices).all(|(a, b)| {
-        if a.model != b.model || a.uv != b.uv {
+        if a.model != b.model || a.raw_uv != b.raw_uv {
             return false;
         }
         let (wa, wb) = (a.clip[3], b.clip[3]);
@@ -698,6 +701,7 @@ impl Geometry {
         let clip = transform(self.position, self.clip_matrix());
         self.vertices.push(Vertex {
             model: std::array::from_fn(|i| (self.position[i] * 4096.0) as i32),
+            raw_uv: self.raw_uv,
             clip,
             color: self.color,
             uv: self.uv,
@@ -725,7 +729,7 @@ impl Geometry {
         let mut geometry = std::collections::hash_map::DefaultHasher::new();
         for vertex in &vertices {
             vertex.model.hash(&mut geometry);
-            vertex.uv.map(f64::to_bits).hash(&mut geometry);
+            vertex.raw_uv.map(f64::to_bits).hash(&mut geometry);
         }
         let mut id = PolygonId {
             texture: self.texture,
@@ -1958,18 +1962,21 @@ mod tests {
             vertices: vec![
                 Vertex {
                     model: [0; 3],
+                    raw_uv: [0.0, 0.0],
                     clip: [-1.0, -1.0, 0.0, 1.0],
                     uv: [0.0, 0.0],
                     color: [31.0; 3],
                 },
                 Vertex {
                     model: [0; 3],
+                    raw_uv: [8.0, 0.0],
                     clip: [2.0, -2.0, 0.0, 2.0],
                     uv: [8.0, 0.0],
                     color: [31.0; 3],
                 },
                 Vertex {
                     model: [0; 3],
+                    raw_uv: [0.0, 0.0],
                     clip: [-1.0, 1.0, 0.0, 1.0],
                     uv: [0.0, 0.0],
                     color: [31.0; 3],
@@ -2106,11 +2113,42 @@ mod tests {
     fn changed_texture_coordinates_and_viewports_are_not_interpolated() {
         let shown = list_at(&[0]);
         let mut next = list_at(&[205]);
-        Arc::make_mut(&mut next).polygons[0].vertices[0].uv[0] = 8.0;
+        Arc::make_mut(&mut next).polygons[0].vertices[0].raw_uv[0] = 8.0;
         assert_eq!(shown.build(Some(&next), 0.5, false).matched.matched, 0);
         let mut next = list_at(&[205]);
         Arc::make_mut(&mut next).polygons[0].viewport = [0, 0, 127, 191];
         assert_eq!(shown.build(Some(&next), 0.5, false).matched.matched, 0);
+    }
+
+    #[test]
+    fn animated_texture_matrices_do_not_detach_flags_from_the_moving_scene() {
+        let list = |offset: i32, texture_offset: i32| {
+            let mut g = Geometry::default();
+            command(&mut g, 0x2a, &[(1 << 30) | (4 << 26)]);
+            command(&mut g, 0x10, &[3]);
+            command(&mut g, 0x1c, &[texture_offset as u32, 0, 0]);
+            command(&mut g, 0x22, &[0]);
+            command(&mut g, 0x10, &[2]);
+            command(&mut g, 0x1c, &[offset as u32, 0, 0]);
+            triangle(&mut g, 0x7fff, 0, 31, 0);
+            command(&mut g, 0x50, &[0]);
+            g.vblank();
+            g.displayed
+        };
+        let shown = list(0, 0);
+        let next = list(410, 65536);
+        assert_ne!(
+            shown.polygons[0].vertices[0].uv,
+            next.polygons[0].vertices[0].uv
+        );
+        let half = shown.build(Some(&next), 0.5, false);
+        assert_eq!(half.matched.matched, 1);
+        assert!((left_edges(&half)[0] - 70.4).abs() < 0.1);
+        // The current frame's texture is sampled at its own UVs.
+        assert_eq!(
+            half.vertices[0].uv,
+            shown.build(None, 0.0, false).vertices[0].uv
+        );
     }
 
     #[test]
