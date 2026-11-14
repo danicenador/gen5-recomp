@@ -430,7 +430,10 @@ matrix changes only by the camera, so `before⁻¹ · after` is the camera's
 motion, and the motion most paired objects agree on wins over characters
 that move by themselves. Repeated identical meshes (stepping stones, gym
 flags, fence posts) pair with the copy where that motion takes them. A
-polygon that still cannot be paired, such as a flag's cloth whose shape
+sprite animated from a sheet, such as the walking player, picks each frame
+by texture coordinates; it pairs with the one polygon of the same shape in
+the next list whatever its texture coordinates. A polygon that still cannot
+be paired, such as a flag's cloth whose shape
 changes every list, moves with the paired polygons drawn through the same
 matrix, or else with the camera, instead of standing still for the
 in-between frames.
@@ -442,7 +445,8 @@ line includes the largest polygon list kept and any lists that overflowed
 polygon or vertex RAM. `GEN5_SCREEN_RANGE=first-last:every` adds denser
 screenshots in one stretch of a run. `GEN5_3D_TRACE=frame:path` writes every
 polygon of the 3D list that follows that frame to `path`: whether it was kept
-or culled (and why), its attributes and screen coordinates, plus box tests;
+or culled (and why), its attributes and screen coordinates, its occurrence
+number and model-space vertices with texture coordinates, plus box tests;
 `first-last:path` writes one `path.frame` file per list in that range.
 The report also says where host time went per frame (game code, 3D, 2D,
 capture, sound) and how many frames took longer than a DS frame.

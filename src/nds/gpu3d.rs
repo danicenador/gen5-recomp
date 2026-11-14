@@ -124,6 +124,11 @@ struct Polygon {
     palette: u32,
     viewport: [u8; 4],
     id: PolygonId,
+    /// The id without the texture coordinates (`PolygonId::geometry` of
+    /// the model-space vertices only, no occurrence). A sprite drawn from a
+    /// sheet, such as the walking player, keeps it when its animation frame
+    /// changes.
+    shape: PolygonId,
     /// The model-to-clip matrix (position times projection) its vertices
     /// were transformed with. A static object's matrix changes between two
     /// lists only by the camera, which is how interpolation finds the
@@ -157,6 +162,8 @@ pub struct DisplayList {
     /// Submission counts include culled polygons. If repeated geometry changes
     /// count, occurrence numbers cannot reliably identify the same object.
     submitted: HashMap<PolygonId, u32>,
+    /// Submission counts by `Polygon::shape`, culled polygons included.
+    shapes: HashMap<PolygonId, u32>,
     render_w: bool,
     /// SWAP_BUFFERS bit 0: translucent polygons keep submission order
     /// instead of being sorted by Y.
@@ -278,6 +285,34 @@ impl DisplayList {
                     let candidate = nearest_polygon(polygon, candidates, shift, tolerance)?;
                     let reverse = nearest_polygon(candidate, before, shift.map(|v| -v), tolerance)?;
                     (reverse.id == polygon.id).then_some(candidate)
+                })
+            })
+            .collect();
+        // A sprite drawn from a sheet picks its animation frame by texture
+        // coordinates, so a new frame (each step of the walking player) is a
+        // new id. Moved with the camera instead, the player slid with the
+        // scenery for the in-between frames and snapped back at the next
+        // list, a ghost that fast-forward, whose shown lists are a few game
+        // frames apart, showed on nearly every frame. What is left pairs
+        // with the polygon of the same shape in the next list, provided
+        // each list submitted just one.
+        let mut shaped: HashMap<PolygonId, &Polygon> = HashMap::new();
+        for polygon in &next.polygons {
+            if next.shapes.get(&polygon.shape) == Some(&1) {
+                shaped.insert(polygon.shape, polygon);
+            }
+        }
+        let pairs: Vec<_> = self
+            .polygons
+            .iter()
+            .zip(pairs)
+            .map(|(polygon, pair)| {
+                pair.or_else(|| {
+                    let candidate = *shaped.get(&polygon.shape)?;
+                    (self.shapes.get(&polygon.shape) == Some(&1)
+                        && candidate.id != polygon.id
+                        && moves_to(polygon, candidate))
+                    .then_some(candidate)
                 })
             })
             .collect();
@@ -605,11 +640,22 @@ fn nearest_polygon<'a>(
 /// Whether `before` can be drawn part way to `after`: the same shape, in
 /// front of the camera both times, and not too far apart on screen.
 fn pairs_with(before: &Polygon, after: &Polygon) -> bool {
+    moves_to(before, after)
+        && before
+            .vertices
+            .iter()
+            .zip(&after.vertices)
+            .all(|(a, b)| a.raw_uv == b.raw_uv)
+}
+
+/// `pairs_with` whatever the texture coordinates: the same model-space
+/// shape, in front of the camera both times, and not too far apart.
+fn moves_to(before: &Polygon, after: &Polygon) -> bool {
     if before.vertices.len() != after.vertices.len() || before.viewport != after.viewport {
         return false;
     }
     before.vertices.iter().zip(&after.vertices).all(|(a, b)| {
-        if a.model != b.model || a.raw_uv != b.raw_uv {
+        if a.model != b.model {
             return false;
         }
         let (wa, wb) = (a.clip[3], b.clip[3]);
@@ -646,6 +692,8 @@ pub struct Geometry {
     /// Polygons submitted to the list being built, by look (`PolygonId`
     /// without the occurrence), culled ones included.
     occurrences: HashMap<PolygonId, u32>,
+    /// The same by `Polygon::shape`.
+    shapes: HashMap<PolygonId, u32>,
     displayed: Arc<DisplayList>,
     vertices: Vec<Vertex>,
     vertex_count: usize,
@@ -723,6 +771,7 @@ impl Default for Geometry {
             strip_stored: false,
             building: Vec::new(),
             occurrences: HashMap::new(),
+            shapes: HashMap::new(),
             displayed: Arc::default(),
             vertices: Vec::new(),
             vertex_count: 0,
@@ -853,6 +902,7 @@ impl Geometry {
             self.displayed = Arc::new(DisplayList {
                 polygons: std::mem::take(&mut self.building),
                 submitted: self.occurrences.clone(),
+                shapes: std::mem::take(&mut self.shapes),
                 render_w: flags & 2 != 0,
                 manual_sort: flags & 1 != 0,
                 swap: self.swaps,
@@ -1111,9 +1161,11 @@ impl Geometry {
         // wide scene submits far more than it keeps.
         self.submitted_polygons += 1;
         let mut geometry = std::collections::hash_map::DefaultHasher::new();
+        let mut model = std::collections::hash_map::DefaultHasher::new();
         for vertex in &vertices {
             vertex.model.hash(&mut geometry);
             vertex.raw_uv.map(f64::to_bits).hash(&mut geometry);
+            vertex.model.hash(&mut model);
         }
         let mut id = PolygonId {
             texture: self.texture,
@@ -1123,9 +1175,14 @@ impl Geometry {
             geometry: geometry.finish(),
             occurrence: 0,
         };
+        let shape = PolygonId {
+            geometry: model.finish(),
+            ..id
+        };
         let seen = self.occurrences.entry(id).or_default();
         id.occurrence = *seen;
         *seen += 1;
+        *self.shapes.entry(shape).or_default() += 1;
         let reach = reach(self.viewport, self.wide);
         let verdict = self.visible(&vertices, reach);
         // Only widescreen's extra columns show this polygon.
@@ -1157,6 +1214,7 @@ impl Geometry {
                     palette: self.palette,
                     viewport: self.viewport,
                     id,
+                    shape,
                     matrix,
                 });
             }
@@ -1188,6 +1246,14 @@ impl Geometry {
                     (1.0 - v.clip[1] / w) * 96.0,
                     v.clip[2] / w,
                     w
+                );
+            }
+            let _ = write!(trace, " #{} model", id.occurrence);
+            for v in &vertices {
+                let _ = write!(
+                    trace,
+                    " [{} {} {} uv {} {}]",
+                    v.model[0], v.model[1], v.model[2], v.raw_uv[0], v.raw_uv[1]
                 );
             }
             trace.push('\n');
@@ -2372,6 +2438,7 @@ mod tests {
             palette: 0,
             viewport: [0, 0, 255, 191],
             id: PolygonId::default(),
+            shape: PolygonId::default(),
             matrix: identity(),
         });
         let mut v = texture_vram();
@@ -2657,16 +2724,16 @@ mod tests {
     #[test]
     fn an_unpaired_part_moves_with_the_rest_of_its_own_object() {
         // A character walks right on its own while the camera stays: its
-        // body pairs, its face (new texture coordinates) does not, and the
-        // face goes with the body rather than with the scenery.
-        let list = |walk: i32, face_v: u32| {
+        // body pairs, its face (a new mesh) does not, and the face goes with
+        // the body rather than with the scenery.
+        let list = |walk: i32, face: i16| {
             let mut g = Geometry::default();
             command(&mut g, 0x10, &[2]);
             for (offset, size, v) in [
-                (-2048, 400, 0),
+                (-2048, 400, 0u32),
                 (0, 300, 0),
                 (2048 + walk, 200, 0),
-                (2048 + walk, 100, face_v),
+                (2048 + walk, face, 0),
             ] {
                 command(&mut g, 0x15, &[]);
                 command(&mut g, 0x1c, &[offset as u32, 0, 0]);
@@ -2682,8 +2749,8 @@ mod tests {
             g.vblank();
             g.displayed.clone()
         };
-        let shown = list(0, 0);
-        let next = list(410, 16);
+        let shown = list(0, 100);
+        let next = list(410, 120);
         let half = shown.build(Some(&next), 0.5, false);
         assert_eq!(half.matched.matched, 3);
         let before = left_edges(&shown.build(None, 0.0, false));
@@ -2698,6 +2765,35 @@ mod tests {
             (moved[2] - 6.4).abs() < 0.05 && (moved[3] - 6.4).abs() < 0.05,
             "{moved:?}"
         );
+    }
+
+    #[test]
+    fn a_sprite_that_changes_animation_frame_stays_with_the_camera_that_follows_it() {
+        // The camera follows the walking player, who stays in the middle of
+        // the screen while the scenery scrolls. Its next walking frame comes
+        // from the same sheet at other texture coordinates: it must still
+        // pair, and stay where it is, rather than slide with the scenery.
+        let shown = camera_list(&[0, 0, 0], &[(-2048, 400, 0), (2048, 300, 0), (0, 200, 0)]);
+        let next = camera_list(
+            &[410, 0, 0],
+            &[(-2048, 400, 0), (2048, 300, 0), (-410, 200, 16)],
+        );
+        let half = shown.build(Some(&next), 0.5, false);
+        assert_eq!(half.matched.matched, 3);
+        let before = left_edges(&shown.build(None, 0.0, false));
+        let mut moved: Vec<_> = left_edges(&half)
+            .iter()
+            .zip(&before)
+            .map(|(half, before)| (*before, half - before))
+            .collect();
+        moved.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Left to right: scenery, the player, scenery.
+        let moved: Vec<_> = moved.into_iter().map(|(_, moved)| moved).collect();
+        assert!(
+            (moved[0] - 6.4).abs() < 0.05 && (moved[2] - 6.4).abs() < 0.05,
+            "{moved:?}"
+        );
+        assert!(moved[1].abs() < 0.05, "{moved:?}");
     }
 
     #[test]
