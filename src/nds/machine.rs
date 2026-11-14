@@ -313,6 +313,8 @@ pub struct Machine {
     /// Whether the field menu was open at the last frame.
     field_menu_open: bool,
     startup: Option<super::startup::Hooks>,
+    /// Keep the validated Continue menu hidden through its fade and teardown.
+    startup_finish: Option<u32>,
     /// GEN5_OVERLAY_LOG=path: each frame the overlays in RAM change, the
     /// frame number and the overlays loaded and unloaded, and each frame
     /// the field menu opens or closes.
@@ -698,7 +700,9 @@ impl Machine {
             || self.io.geometry.wide;
         let frame =
             (render && self.options.on_frame.is_some() || self.profile.is_some()).then(|| {
-                if scaled {
+                if self.startup.is_some() || self.startup_finish.is_some() {
+                    gpu2d::Frame::blank()
+                } else if scaled {
                     gpu2d::Frame {
                         top: Vec::new(),
                         bottom: Vec::new(),
@@ -1756,11 +1760,22 @@ pub(super) fn call_any(cpu: *mut Cpu, target: u32) {
 fn startup_call(cpu: *mut Cpu, target: u32) -> bool {
     let action = {
         let machine = unsafe { machine(cpu) };
+        let address = target & !1;
+        if machine.startup_finish == Some(address) {
+            // The menu has finished fading out and freeing its display state.
+            // Let its normal exit callback queue the saved game's field event.
+            machine.startup_finish = None;
+        }
         let Some(hooks) = machine.startup else {
             return false;
         };
         let r = unsafe { (*cpu).r };
-        let address = target & !1;
+        if address == hooks.tick && machine.read32(r[3] + 0x19c) != 0 {
+            // Save validation can require a dialog before Select is reached.
+            // Reveal the original UI immediately so the player can respond.
+            machine.startup = None;
+            return false;
+        }
         if address == hooks.boot && machine.read32(r[1]) == 0 {
             // The resident boot process idles while the normal start menu
             // loads and validates the save, without queuing logos/title.
@@ -1779,6 +1794,7 @@ fn startup_call(cpu: *mut Cpu, target: u32) -> bool {
             machine.write8(work + 0x17a, 0); // selection: Continue
             machine.write8(work + 0x17b, 0); // cleanup starts at FREE_BEGIN
             machine.write8(work + 0x17d, 1); // start with wireless C-Gear off
+            machine.startup_finish = Some(hooks.finish);
             Some((hooks.wipe_out, [work, 1, 0], false))
         } else {
             None
@@ -2381,6 +2397,7 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         field_menu,
         field_menu_open: false,
         startup,
+        startup_finish: None,
         overlay_log: std::env::var_os("GEN5_OVERLAY_LOG")
             .and_then(|path| fs::File::create(path).ok()),
         _library: library,

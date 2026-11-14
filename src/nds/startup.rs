@@ -11,6 +11,8 @@ pub(super) struct Hooks {
     pub queue: u32,
     pub menu: u32,
     pub select: u32,
+    pub tick: u32,
+    pub finish: u32,
     pub wipe_out: u32,
     pub select_word: u32,
 }
@@ -26,6 +28,8 @@ impl Hooks {
             0xc0, 0x88,
         ];
         if !matches!(menu.bytes.len(), 19584 | 19648)
+            || menu.bytes.get(0xb58..0xb5a) != Some(&[0xf8, 0xb5])
+            || menu.bytes.get(0xb24..0xb28) != Some(&[0x38, 0xb5, 0x19, 0x25])
             || menu.bytes.get(0xed0..0xeda)
                 != Some(&[0x70, 0xb5, 0x5b, 0x25, 0x04, 0x1c, 0xad, 0x00, 0x60, 0x59])
         {
@@ -70,6 +74,8 @@ impl Hooks {
             queue: queue?,
             menu: menu.base + menu_table as u32,
             select: menu.base + 0xed0,
+            tick: menu.base + 0xb24,
+            finish: menu.base + 0xb58,
             wipe_out: menu.base + 0x3160,
             select_word: menu.u32_at(menu.base + 0xed0)?,
         })
@@ -118,6 +124,9 @@ mod tests {
                 ],
             };
             assert!(Hooks::find(&program).is_some(), "{name}");
+            program.modules[1].bytes[0xb58] ^= 1;
+            assert!(Hooks::find(&program).is_none());
+            program.modules[1].bytes[0xb58] ^= 1;
             program.modules[1].bytes[0xed0] ^= 1;
             assert!(Hooks::find(&program).is_none());
         }

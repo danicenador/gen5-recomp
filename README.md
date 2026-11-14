@@ -229,7 +229,9 @@ Changes, including the existing display/speed shortcuts, are saved in
 `GEN5_SETTINGS_FILE=path` selects an isolated preferences file for testing.
 **Start in saved game** skips the opening and selects the game's validated
 Continue entry on the next launch, with the wireless C-Gear off. It is off
-by default; `--continue` or `GEN5_AUTO_CONTINUE=1` also enables it. Missing
+by default. The menu stays hidden while the game checks the save and enters
+Continue, so its buttons do not flash before the saved game appears.
+`--continue` or `GEN5_AUTO_CONTINUE=1` also enables it. Missing
 or damaged saves retain the game's normal checks and menu. English Black 2
 and White 2 are supported; other builds keep their normal startup.
 Explicit launch flags and environment settings override saved preferences at
