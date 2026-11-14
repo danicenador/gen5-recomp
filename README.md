@@ -416,6 +416,22 @@ helper copies its input file into the run directory before starting.
 `GEN5_BOOT_FPS` optionally caps headless frame progression for live diagnosis
 (0, the default, runs as fast as possible); windowed play keeps its normal pacing
 (see fast-forward above for `GEN5_SPEED`).
+`GEN5_INTERP_SHOTS=1` adds, for each screenshot that shows a new 3D list, a
+`frame-NNNNN-half.png` of the frame before it drawn half way to that list,
+exactly as 3D interpolation draws the in-between frames in the window. With
+`GEN5_SCREEN_RANGE=first-last:1` it shows polygons that tear or stay behind.
+
+3D interpolation pairs each polygon with the same one in the next list. It
+also works out the camera's motion between the two lists from the matrices
+the game drew the paired scenery with: a static object's model-to-clip
+matrix changes only by the camera, so `before⁻¹ · after` is the camera's
+motion, and the motion most paired objects agree on wins over characters
+that move by themselves. Repeated identical meshes (stepping stones, gym
+flags, fence posts) pair with the copy where that motion takes them. A
+polygon that still cannot be paired, such as a flag's cloth whose shape
+changes every list, moves with the paired polygons drawn through the same
+matrix, or else with the camera, instead of standing still for the
+in-between frames.
 `GEN5_AUDIO_WAV=path` records a headless run's sound as a 16-bit stereo WAV
 at the DS mixer rate. `GEN5_SOUND=off` acknowledges sound commands without
 playing them, to rule sound in or out when diagnosing. `GEN5_STOP_FILE=path`

@@ -124,6 +124,11 @@ struct Polygon {
     palette: u32,
     viewport: [u8; 4],
     id: PolygonId,
+    /// The model-to-clip matrix (position times projection) its vertices
+    /// were transformed with. A static object's matrix changes between two
+    /// lists only by the camera, which is how interpolation finds the
+    /// camera's motion (`camera_motion`).
+    matrix: Matrix,
 }
 
 /// What a polygon looks like, and how many polygons that look the same were
@@ -201,9 +206,29 @@ impl DisplayList {
         for polygon in &next.polygons {
             later.entry(identity(polygon.id)).or_default().push(polygon);
         }
-        // Unique meshes provide camera motion. Repeated fence segments,
-        // grass and shore tiles can enter/leave the submitted list or change
-        // order; their occurrence number is not an object identity.
+        // Meshes submitted once to each list pair up directly, and give the
+        // camera's motion between the lists.
+        let unique = |polygon: &Polygon, id: &PolygonId| {
+            earlier[id].len() == 1
+                && later.get(id).is_some_and(|after| after.len() == 1)
+                && self.submitted.get(id) == Some(&1)
+                && next.submitted.get(id) == Some(&1)
+                && pairs_with(polygon, later[id][0])
+        };
+        let direct: Vec<_> = self
+            .polygons
+            .iter()
+            .filter_map(|polygon| {
+                let id = identity(polygon.id);
+                unique(polygon, &id).then(|| (polygon, later[&id][0]))
+            })
+            .collect();
+        let camera = camera_motion(&direct);
+        let back = camera.and_then(invert);
+        // Without it, fall back on the screen motion of unique meshes.
+        // Repeated fence segments, grass and shore tiles can enter/leave the
+        // submitted list or change order; their occurrence number is not an
+        // object identity.
         let mut motion = [Vec::new(), Vec::new()];
         for (id, before) in &earlier {
             if before.len() == 1
@@ -216,7 +241,7 @@ impl DisplayList {
                 }
             }
         }
-        let camera = (!motion[0].is_empty()).then(|| {
+        let shift = (!motion[0].is_empty()).then(|| {
             std::array::from_fn(|axis| {
                 motion[axis].sort_by(f64::total_cmp);
                 motion[axis][motion[axis].len() / 2]
@@ -229,24 +254,58 @@ impl DisplayList {
                 let id = identity(polygon.id);
                 let before = &earlier[&id];
                 later.get(&id).and_then(|candidates| {
-                    if before.len() == 1
-                        && candidates.len() == 1
-                        && self.submitted.get(&id) == Some(&1)
-                        && next.submitted.get(&id) == Some(&1)
-                    {
-                        return pairs_with(polygon, candidates[0]).then_some(candidates[0]);
+                    if unique(polygon, &id) {
+                        return Some(candidates[0]);
                     }
-                    if camera.is_none() && self.submitted.get(&id) != next.submitted.get(&id) {
+                    // Repeated meshes (stepping stones, flags, fence posts)
+                    // pair with the copy found where the camera's motion
+                    // takes them, if exactly one is there.
+                    if let (Some(camera), Some(back)) = (&camera, &back) {
+                        let candidate = predicted_polygon(polygon, candidates, camera)?;
+                        let reverse = predicted_polygon(candidate, before, back)?;
+                        return (reverse.id == polygon.id).then_some(candidate);
+                    }
+                    // Submitted once to both lists but not paired above:
+                    // it jumped or changed shape.
+                    if self.submitted.get(&id) == Some(&1) && next.submitted.get(&id) == Some(&1) {
                         return None;
                     }
-                    let shift = camera.unwrap_or([0.0; 2]);
-                    let tolerance = camera.map(|_| 3.0);
+                    if shift.is_none() && self.submitted.get(&id) != next.submitted.get(&id) {
+                        return None;
+                    }
+                    let tolerance = shift.map(|_| 3.0);
+                    let shift = shift.unwrap_or([0.0; 2]);
                     let candidate = nearest_polygon(polygon, candidates, shift, tolerance)?;
                     let reverse = nearest_polygon(candidate, before, shift.map(|v| -v), tolerance)?;
                     (reverse.id == polygon.id).then_some(candidate)
                 })
             })
             .collect();
+        // What could not be paired still moves: with the paired polygons
+        // drawn through the same matrix (the rest of that object), or else
+        // with the camera. Left where it was, it would stand still for the
+        // in-between frames while everything around it moves on.
+        let mut objects: HashMap<Matrix, Option<Matrix>> = HashMap::new();
+        for (polygon, after) in self.polygons.iter().zip(&pairs) {
+            if let Some(after) = after {
+                let entry = objects.entry(polygon.matrix).or_insert(Some(after.matrix));
+                if *entry != Some(after.matrix) {
+                    *entry = None;
+                }
+            }
+        }
+        let follow = |polygon: &Polygon| -> Option<Vec<[f64; 4]>> {
+            let object = match objects.get(&polygon.matrix) {
+                Some(Some(after)) => motion_between(&polygon.matrix, after),
+                Some(None) => None,
+                None => camera,
+            }?;
+            polygon
+                .vertices
+                .iter()
+                .map(|vertex| followed(vertex.clip, &object))
+                .collect()
+        };
         // Different materials can share a geometric boundary. If just one
         // material changes between frames, leaving its edge behind opens a
         // crack (notably between a battle's ground and sky). Move shared
@@ -296,11 +355,17 @@ impl DisplayList {
                         vertex.clip = moved.clip;
                         vertex.color = moved.color;
                     }
-                } else if !matched_shapes.contains(&shape(before)) {
+                } else {
                     // Complete coincident meshes can be separate objects;
                     // only their material-independent boundaries are shared.
-                    for vertex in &mut polygon.vertices {
-                        if let Some(Some(target)) = shared.get(&key(before, vertex)) {
+                    let boundaries = !matched_shapes.contains(&shape(before));
+                    let follows = follow(before);
+                    for (index, vertex) in polygon.vertices.iter_mut().enumerate() {
+                        let target = match shared.get(&key(before, vertex)) {
+                            Some(Some(target)) if boundaries => Some(*target),
+                            _ => follows.as_ref().map(|targets| targets[index]),
+                        };
+                        if let Some(target) = target {
                             vertex.clip = std::array::from_fn(|axis| {
                                 vertex.clip[axis] + (target[axis] - vertex.clip[axis]) * alpha
                             });
@@ -312,6 +377,186 @@ impl DisplayList {
             .collect();
         (Cow::Owned(polygons), Matched { matched, total })
     }
+}
+
+/// A motion in clip space between two lists: a vertex at `clip` in the
+/// first is at `clip · motion` in the second (row vectors, as `transform`).
+type Motion = [[f64; 4]; 4];
+
+fn to_motion(m: &Matrix) -> Motion {
+    std::array::from_fn(|r| std::array::from_fn(|c| f64::from(m[r * 4 + c]) / 4096.0))
+}
+
+fn compose(a: &Motion, b: &Motion) -> Motion {
+    std::array::from_fn(|r| std::array::from_fn(|c| (0..4).map(|k| a[r][k] * b[k][c]).sum()))
+}
+
+fn moved(v: [f64; 4], m: &Motion) -> [f64; 4] {
+    std::array::from_fn(|c| (0..4).map(|k| v[k] * m[k][c]).sum())
+}
+
+/// Gauss-Jordan elimination with partial pivoting.
+fn invert(m: Motion) -> Option<Motion> {
+    let mut a = m;
+    let mut inverse: Motion =
+        std::array::from_fn(|r| std::array::from_fn(|c| if r == c { 1.0 } else { 0.0 }));
+    let scale = m.iter().flatten().fold(0.0f64, |max, v| max.max(v.abs()));
+    if scale == 0.0 || !scale.is_finite() {
+        return None;
+    }
+    for column in 0..4 {
+        let pivot =
+            (column..4).max_by(|&x, &y| a[x][column].abs().total_cmp(&a[y][column].abs()))?;
+        if a[pivot][column].abs() <= scale * 1e-9 {
+            return None;
+        }
+        a.swap(column, pivot);
+        inverse.swap(column, pivot);
+        let divisor = a[column][column];
+        for c in 0..4 {
+            a[column][c] /= divisor;
+            inverse[column][c] /= divisor;
+        }
+        for row in 0..4 {
+            if row != column {
+                let factor = a[row][column];
+                for c in 0..4 {
+                    a[row][c] -= factor * a[column][c];
+                    inverse[row][c] -= factor * inverse[column][c];
+                }
+            }
+        }
+    }
+    Some(inverse)
+}
+
+/// How a mesh drawn through `before` in one list and `after` in the next
+/// moved: exactly the camera's motion if the mesh itself stood still,
+/// since its model matrix cancels out.
+fn motion_between(before: &Matrix, after: &Matrix) -> Option<Motion> {
+    Some(compose(&invert(to_motion(before))?, &to_motion(after)))
+}
+
+/// A clip-space position in DS pixels from the screen's center, if it is
+/// in front of the camera.
+fn on_screen(clip: [f64; 4]) -> Option<[f64; 2]> {
+    (clip[3] > 0.0).then(|| [clip[0] / clip[3] * 128.0, clip[1] / clip[3] * 96.0])
+}
+
+/// Where `motion` takes a vertex, unless it goes behind the camera or
+/// jumps further than a cut (`SNAP_PIXELS`).
+fn followed(clip: [f64; 4], motion: &Motion) -> Option<[f64; 4]> {
+    let target = moved(clip, motion);
+    let (from, to) = (on_screen(clip)?, on_screen(target)?);
+    ((to[0] - from[0]).abs() <= SNAP_PIXELS && (to[1] - from[1]).abs() <= SNAP_PIXELS)
+        .then_some(target)
+}
+
+/// A camera motion predicts a paired vertex within this many DS pixels.
+const CAMERA_TOLERANCE: f64 = 0.5;
+
+/// The camera's motion between two lists, from meshes paired between them
+/// (`direct`). Each mesh drawn through one matrix proposes the motion that
+/// takes its matrix to its partner's; the proposal that also explains the
+/// most other meshes wins, so characters and animated parts that move on
+/// their own are outvoted by the scenery. At least two meshes must agree.
+fn camera_motion(direct: &[(&Polygon, &Polygon)]) -> Option<Motion> {
+    type Samples = Vec<([f64; 4], [f64; 4])>;
+    // Per matrix of the first list: its partner matrix (None if its
+    // polygons disagree) and some vertex positions to check proposals on.
+    let mut order = Vec::new();
+    let mut objects: HashMap<Matrix, (Option<Matrix>, Samples)> = HashMap::new();
+    for (before, after) in direct {
+        let object = objects.entry(before.matrix).or_insert_with(|| {
+            order.push(before.matrix);
+            (Some(after.matrix), Vec::new())
+        });
+        if object.0 != Some(after.matrix) {
+            object.0 = None;
+        }
+        for (a, b) in before.vertices.iter().zip(&after.vertices) {
+            if object.1.len() < 8 {
+                object.1.push((a.clip, b.clip));
+            }
+        }
+    }
+    let proposals: Vec<_> = order
+        .iter()
+        .filter_map(|matrix| {
+            let (after, samples) = &objects[matrix];
+            Some((motion_between(matrix, after.as_ref()?)?, samples))
+        })
+        .collect();
+    let explains = |motion: &Motion, samples: &Samples| {
+        samples.iter().all(|&(before, after)| {
+            let (Some(predicted), Some(actual)) =
+                (on_screen(moved(before, motion)), on_screen(after))
+            else {
+                return false;
+            };
+            (predicted[0] - actual[0]).abs() <= CAMERA_TOLERANCE
+                && (predicted[1] - actual[1]).abs() <= CAMERA_TOLERANCE
+        })
+    };
+    let mut best: Option<(usize, Motion)> = None;
+    for (motion, _) in &proposals {
+        let support = proposals
+            .iter()
+            .filter(|(_, samples)| explains(motion, samples))
+            .count();
+        if best.is_none_or(|(most, _)| support > most) {
+            best = Some((support, *motion));
+        }
+    }
+    best.filter(|&(support, _)| support >= 2)
+        .map(|(_, motion)| motion)
+}
+
+/// The one candidate whose vertices are where `motion` takes `polygon`'s,
+/// within `CAMERA_TOLERANCE` and with no other candidate as close.
+fn predicted_polygon<'a>(
+    polygon: &Polygon,
+    candidates: &[&'a Polygon],
+    motion: &Motion,
+) -> Option<&'a Polygon> {
+    let predicted: Vec<_> = polygon
+        .vertices
+        .iter()
+        .map(|vertex| on_screen(moved(vertex.clip, motion)))
+        .collect::<Option<_>>()?;
+    let mut best = None;
+    let mut distance = f64::INFINITY;
+    let mut ambiguous = false;
+    for &candidate in candidates {
+        if !pairs_with(polygon, candidate) {
+            continue;
+        }
+        let Some(score) = candidate
+            .vertices
+            .iter()
+            .zip(&predicted)
+            .map(|(vertex, predicted)| {
+                on_screen(vertex.clip).map(|actual| {
+                    (actual[0] - predicted[0])
+                        .abs()
+                        .max((actual[1] - predicted[1]).abs())
+                })
+            })
+            .try_fold(0.0f64, |worst, error| Some(worst.max(error?)))
+        else {
+            continue;
+        };
+        if score + 1e-6 < distance {
+            ambiguous = false;
+            best = Some(candidate);
+            distance = score;
+        } else if (score - distance).abs() < 1e-6 {
+            ambiguous = true;
+        }
+    }
+    (!ambiguous && distance <= CAMERA_TOLERANCE)
+        .then_some(best)
+        .flatten()
 }
 
 fn screen_motion(before: &Polygon, after: &Polygon) -> [f64; 2] {
@@ -836,7 +1081,8 @@ impl Geometry {
             p[3] = 0.0;
             self.texture_transform(p, 3);
         }
-        let clip = transform(self.position, self.clip_matrix());
+        let matrix = self.clip_matrix();
+        let clip = transform(self.position, matrix);
         self.vertices.push(Vertex {
             model: std::array::from_fn(|i| (self.position[i] * 4096.0) as i32),
             raw_uv: self.raw_uv,
@@ -911,6 +1157,7 @@ impl Geometry {
                     palette: self.palette,
                     viewport: self.viewport,
                     id,
+                    matrix,
                 });
             }
             self.overflowed |= !fits && !side;
@@ -2125,6 +2372,7 @@ mod tests {
             palette: 0,
             viewport: [0, 0, 255, 191],
             id: PolygonId::default(),
+            matrix: identity(),
         });
         let mut v = texture_vram();
         v.banks[0] = 0xe4;
@@ -2253,9 +2501,11 @@ mod tests {
         assert_eq!(half.matched.matched, 2); // anchor and retained tile
         let mut edges = left_edges(&half);
         edges.sort_by(f32::total_cmp);
-        assert!((edges[0] - 64.0).abs() < 0.1);
-        assert!((edges[1] - 67.2).abs() < 0.1);
-        assert!((edges[2] - 92.8).abs() < 0.1);
+        // The replaced tile pairs with neither neighbor; drawn through the
+        // anchor's matrix, it moves on with the anchor instead.
+        assert!((edges[0] - 67.2).abs() < 0.1, "{edges:?}");
+        assert!((edges[1] - 67.2).abs() < 0.1, "{edges:?}");
+        assert!((edges[2] - 92.8).abs() < 0.1, "{edges:?}");
     }
 
     #[test]
@@ -2326,6 +2576,127 @@ mod tests {
         assert_eq!(
             half.vertices[0].uv,
             shown.build(None, 0.0, false).vertices[0].uv
+        );
+    }
+
+    /// A list of triangles, each `(offset, size, texture_v)` drawn through
+    /// `camera`, a zoom `[scale]` or a translation `[x, y, z]` applied after
+    /// the object's own translation, as a view matrix is.
+    fn camera_list(camera: &[u32], shapes: &[(i32, i16, u32)]) -> Arc<DisplayList> {
+        let mut g = Geometry::default();
+        command(&mut g, 0x10, &[2]);
+        for &(offset, size, texture_v) in shapes {
+            command(&mut g, 0x15, &[]);
+            // One value zooms, three translate.
+            match camera {
+                [scale] => command(&mut g, 0x1b, &[*scale, *scale, 4096]),
+                _ => command(&mut g, 0x1c, camera),
+            }
+            command(&mut g, 0x1c, &[offset as u32, 0, 0]);
+            command(&mut g, 0x29, &[(31 << 16) | 0xc0]);
+            command(&mut g, 0x40, &[0]);
+            command(&mut g, 0x22, &[texture_v << 16]);
+            vertex(&mut g, -size, -size, 0);
+            vertex(&mut g, size, -size, 0);
+            vertex(&mut g, 0, size, 0);
+            command(&mut g, 0x41, &[]);
+        }
+        command(&mut g, 0x50, &[0]);
+        g.vblank();
+        g.displayed.clone()
+    }
+
+    fn sorted_edges(triangles: &Triangles) -> Vec<f32> {
+        let mut edges = left_edges(triangles);
+        edges.sort_by(f32::total_cmp);
+        edges
+    }
+
+    #[test]
+    fn repeated_stepping_stones_follow_the_camera_where_screen_shifts_differ() {
+        // A camera that zooms in by 10% moves things near the edge of the
+        // screen further than those in the middle, so one median screen
+        // shift cannot pair the two identical stones on the right. The
+        // camera's motion, from the two unique meshes, predicts both.
+        let shapes = [(-2048, 400, 0), (0, 300, 0), (2048, 200, 0), (2867, 200, 0)];
+        let shown = camera_list(&[4096], &shapes);
+        let next = camera_list(&[4506], &shapes);
+        let half = shown.build(Some(&next), 0.5, false);
+        assert_eq!(half.matched.matched, 4);
+        let (before, after) = (
+            sorted_edges(&shown.build(None, 0.0, false)),
+            sorted_edges(&next.build(None, 0.0, false)),
+        );
+        for ((half, before), after) in sorted_edges(&half).iter().zip(&before).zip(&after) {
+            assert!(
+                (half - (before + after) / 2.0).abs() < 0.05,
+                "{half} {before} {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flag_that_cannot_be_paired_moves_on_with_the_camera() {
+        // The flag's cloth changes shape every list (a new mesh each time),
+        // so it never pairs; it must not stand still while its pole and the
+        // building around it move.
+        let shown = camera_list(&[0, 0, 0], &[(-2048, 400, 0), (0, 300, 0), (2048, 200, 0)]);
+        let next = camera_list(
+            &[410, 0, 0],
+            &[(-2048, 400, 0), (0, 300, 0), (2048, 220, 0)],
+        );
+        let half = shown.build(Some(&next), 0.5, false);
+        assert_eq!(half.matched.matched, 2);
+        let before = sorted_edges(&shown.build(None, 0.0, false));
+        // 410 is 0.1 of the screen's half width: 12.8 pixels, 6.4 halfway.
+        for (half, before) in sorted_edges(&half).iter().zip(&before) {
+            assert!((half - before - 6.4).abs() < 0.05, "{half} {before}");
+        }
+    }
+
+    #[test]
+    fn an_unpaired_part_moves_with_the_rest_of_its_own_object() {
+        // A character walks right on its own while the camera stays: its
+        // body pairs, its face (new texture coordinates) does not, and the
+        // face goes with the body rather than with the scenery.
+        let list = |walk: i32, face_v: u32| {
+            let mut g = Geometry::default();
+            command(&mut g, 0x10, &[2]);
+            for (offset, size, v) in [
+                (-2048, 400, 0),
+                (0, 300, 0),
+                (2048 + walk, 200, 0),
+                (2048 + walk, 100, face_v),
+            ] {
+                command(&mut g, 0x15, &[]);
+                command(&mut g, 0x1c, &[offset as u32, 0, 0]);
+                command(&mut g, 0x29, &[(31 << 16) | 0xc0]);
+                command(&mut g, 0x40, &[0]);
+                command(&mut g, 0x22, &[v << 16]);
+                vertex(&mut g, -size, -size, 0);
+                vertex(&mut g, size, -size, 0);
+                vertex(&mut g, 0, size, 0);
+                command(&mut g, 0x41, &[]);
+            }
+            command(&mut g, 0x50, &[0]);
+            g.vblank();
+            g.displayed.clone()
+        };
+        let shown = list(0, 0);
+        let next = list(410, 16);
+        let half = shown.build(Some(&next), 0.5, false);
+        assert_eq!(half.matched.matched, 3);
+        let before = left_edges(&shown.build(None, 0.0, false));
+        let half = left_edges(&half);
+        // By where they started, left to right: the two pieces of scenery,
+        // then the body and face.
+        let mut moved: Vec<_> = before.iter().zip(&half).map(|(b, h)| (*b, h - b)).collect();
+        moved.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let moved: Vec<_> = moved.into_iter().map(|(_, moved)| moved).collect();
+        assert!(moved[0].abs() < 0.05 && moved[1].abs() < 0.05, "{moved:?}");
+        assert!(
+            (moved[2] - 6.4).abs() < 0.05 && (moved[3] - 6.4).abs() < 0.05,
+            "{moved:?}"
         );
     }
 
