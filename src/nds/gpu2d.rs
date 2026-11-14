@@ -142,7 +142,18 @@ pub fn render_scaled(io: &Io, memory: &Memory) -> ScaledFrame {
         let cover = (extra > 0)
             .then(|| widescreen_cover(screen, side))
             .flatten();
+        let bars = if extra > 0 {
+            letterbox(screen)
+        } else {
+            (0, HEIGHT)
+        };
         for (line, row) in screen.chunks(WIDTH).enumerate() {
+            if line < bars.0 || line >= bars.1 {
+                pixels.extend(std::iter::repeat_n(row[0].pack(), extra));
+                pixels.extend(row.iter().map(Composed::pack));
+                pixels.extend(std::iter::repeat_n(row[0].pack(), extra));
+                continue;
+            }
             if let Some(cover) = cover {
                 pixels.extend(std::iter::repeat_n(cover.pack(), extra));
                 pixels.extend(row.iter().map(Composed::pack));
@@ -203,6 +214,28 @@ fn side_of(side: Composed, mirrored: Composed, outer: Composed) -> Composed {
     } else {
         side
     }
+}
+
+/// Letterbox bars: opaque black lines across the whole screen from its top
+/// or bottom edge, in front of everything (the evolution scene's, for
+/// example). They are drawn for the DS's width, so widescreen carries them
+/// into its extra columns instead of showing the picture beside them.
+/// Returns the first line below the top bar and the first line of the
+/// bottom bar (`(0, HEIGHT)` without bars).
+fn letterbox(screen: &[Composed]) -> (usize, usize) {
+    let black = Composed::fixed(0);
+    let is_bar = |row: &[Composed]| {
+        row.iter()
+            .all(|pixel| pixel.with == black.with && pixel.without & 0x7FFF == 0)
+    };
+    let rows: Vec<&[Composed]> = screen.chunks_exact(WIDTH).collect();
+    let top = rows.iter().take_while(|row| is_bar(row)).count();
+    if top == rows.len() {
+        // A black screen is a fade, which the sides follow anyway.
+        return (0, rows.len());
+    }
+    let bottom = rows.len() - rows.iter().rev().take_while(|row| is_bar(row)).count();
+    (top, bottom)
 }
 
 /// A uniform foreground covering the entire screen is a screen effect (the
@@ -1662,6 +1695,43 @@ mod tests {
         assert_eq!(
             side_of(Composed::fixed(0), gradient, gradient),
             Composed::fixed(0)
+        );
+    }
+
+    #[test]
+    fn letterbox_bars_reach_across_the_widescreen_sides() {
+        // The evolution scene: black bars over the top 24 and bottom 23
+        // lines, the 3D picture between them, a dialogue box's black border
+        // inside the picture.
+        let state = BlendState {
+            blend: 0,
+            effects: true,
+            coefficients: Coefficients::default(),
+        };
+        let backdrop = Layer {
+            color: 0,
+            layer: LAYER_BACKDROP,
+            semi: false,
+            three_d: false,
+        };
+        let picture = Composed {
+            without: 0,
+            with: state.three_d_first(backdrop),
+            coefficients: state.coefficients,
+        };
+        let mut screen = vec![picture; WIDTH * HEIGHT];
+        screen[..24 * WIDTH].fill(Composed::fixed(0));
+        screen[169 * WIDTH..].fill(Composed::fixed(0));
+        screen[100 * WIDTH..101 * WIDTH].fill(Composed::fixed(0));
+        assert_eq!(letterbox(&screen), (24, 169));
+        // A line that is not black all the way across is not a bar.
+        screen[5 * WIDTH + 128] = Composed::fixed(0x7FFF);
+        assert_eq!(letterbox(&screen), (5, 169));
+        // A picture without bars has none, and a black screen is a fade.
+        assert_eq!(letterbox(&vec![picture; WIDTH * HEIGHT]), (0, HEIGHT));
+        assert_eq!(
+            letterbox(&vec![Composed::fixed(0); WIDTH * HEIGHT]),
+            (0, HEIGHT)
         );
     }
 

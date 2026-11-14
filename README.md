@@ -313,6 +313,8 @@ instead of the backdrop color. Foreground text and dialogue boxes stay in
 the original 256 columns, including translucent ones. A uniform overlay
 covering the entire screen, such as the season banner's black background
 and its fade, extends into both margins while its lettering stays centered.
+Letterbox bars, opaque black lines across the whole screen from its top or
+bottom edge (the evolution scene's), also reach across both margins.
 Where opaque 2D is in front of the 3D there, the last column carries on, and
 where it is in front at the end of the line as well, the backdrop is used.
 The bottom screen stays 4:3 and is centered under the top one. Display
