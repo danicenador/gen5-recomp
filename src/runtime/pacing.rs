@@ -8,6 +8,7 @@
 //! tick that newer frame is shown as is, so the motion is continuous.
 
 use super::screen::FRAME_TIME;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// How often the window draws.
@@ -91,17 +92,60 @@ pub fn pick(frames: &[FrameTime], now: Instant) -> Pick {
     pick_at(frames, desired_time(frames, now))
 }
 
+/// How long the window remembers that it was starved for frames.
+const STARVED_MEMORY: Duration = Duration::from_millis(500);
+
 /// A continuous presentation clock. The game's 3D cadence can change between
 /// one, two and more vblanks; changing the delay in one step skips geometry
 /// poses and can briefly show older texture/2D snapshots.
 #[derive(Default)]
 pub struct Timeline {
     previous: Option<(Instant, Instant)>,
+    /// The newest pose there was to move toward at the last pick (the
+    /// first frame of the newest list), and how old it was then.
+    latest: Option<(Instant, Duration)>,
+    /// When each recent pose arrived, and how old its predecessor had got
+    /// by then (at the last pick before it).
+    starved: VecDeque<(Instant, Duration)>,
 }
 
 impl Timeline {
+    /// How far behind `now` the window must run to keep a pose ahead of it:
+    /// the oldest the newest pose got before its successor arrived, over
+    /// the last `STARVED_MEMORY`.
+    ///
+    /// Frames are due at steady deadlines but do not arrive steadily: the
+    /// game sleeps between frames, and fast-forwarding runs several short
+    /// frames per vblank, so a sleep that overruns delays a few of them at
+    /// once. Running just one list interval behind, the window overtook the
+    /// newest pose, stood still for a draw and then caught up an eighth
+    /// faster, several times a second. In a battle, whose 3D is the swaying
+    /// background and floor, that was all the motion there was.
+    fn starvation(&mut self, latest: Instant, now: Instant) -> Duration {
+        if let Some((previous, age)) = self.latest
+            && latest > previous
+            // Older than any cadence, the game held its list (the field
+            // while it saves): not a delay to keep running behind by.
+            && age <= FRAME_TIME * MAX_SPAN
+        {
+            self.starved.push_back((now, age));
+        }
+        self.latest = Some((latest, now.saturating_duration_since(latest)));
+        while self
+            .starved
+            .front()
+            .is_some_and(|&(at, _)| now.saturating_duration_since(at) > STARVED_MEMORY)
+        {
+            self.starved.pop_front();
+        }
+        self.starved
+            .iter()
+            .map(|&(_, age)| age)
+            .max()
+            .unwrap_or_default()
+    }
+
     pub fn pick(&mut self, frames: &[FrameTime], now: Instant) -> Pick {
-        let wanted = desired_time(frames, now);
         let oldest = frames[0].deadline;
         let last = frames.len() - 1;
         let latest = if frames[last].list.is_some() {
@@ -116,6 +160,8 @@ impl Timeline {
         } else {
             frames[last].deadline
         };
+        let starved = self.starvation(latest, now).min(FRAME_TIME * MAX_SPAN);
+        let wanted = desired_time(frames, now).min(now.checked_sub(starved).unwrap_or(now));
         let at = match self.previous {
             Some((previous_now, previous_at))
                 if now.saturating_duration_since(previous_now) <= FRAME_TIME * 6 =>
@@ -401,6 +447,55 @@ mod tests {
                     pick.shown
                 );
             }
+        }
+    }
+
+    #[test]
+    fn late_frames_while_fast_forwarding_do_not_stall_the_motion() {
+        // Fast-forwarding at 4x, one frame (with a new list) is shown per
+        // vblank. Each is due a vblank after the last, and usually arrives
+        // just before then, but every fifth arrives late, after an overrun
+        // sleep, together with its successor: the newest frame is then
+        // about 30 ms old, as measured in the window.
+        let start = Instant::now();
+        let lists: Vec<_> = (0..400).map(Some).collect();
+        let all = timeline(start, &lists);
+        let arrival = |i: usize| {
+            let due = all[i].deadline;
+            if i % 5 == 3 {
+                due + FRAME_TIME * 3 / 2
+            } else {
+                due - Duration::from_millis(2)
+            }
+        };
+        let pose = |frames: &[FrameTime], pick: &Pick| {
+            frames[pick.shown].deadline
+                + pick.next.map_or(Duration::ZERO, |next| {
+                    frames[next]
+                        .deadline
+                        .duration_since(frames[pick.shown].deadline)
+                        .mul_f64(pick.alpha)
+                })
+        };
+        let mut clock = Timeline::default();
+        let mut previous = None;
+        for draw in 1..380u32 {
+            let now = start + FRAME_TIME * draw + FRAME_TIME / 3;
+            let arrived = (0..all.len()).take_while(|&i| arrival(i) <= now).count();
+            let frames = &all[..arrived];
+            let at = pose(frames, &clock.pick(frames, now));
+            // Once the window has seen a late frame or two, every draw
+            // moves the scene on by about a vblank.
+            if draw > 40
+                && let Some(previous) = previous
+            {
+                let step = at.duration_since(previous);
+                assert!(
+                    step > FRAME_TIME * 3 / 4 && step < FRAME_TIME * 5 / 4,
+                    "draw {draw}: moved {step:?}"
+                );
+            }
+            previous = Some(at);
         }
     }
 
