@@ -175,6 +175,12 @@ fn run() -> Result<(), String> {
                 Ok(resolution.height.div_ceil(192).clamp(1, 8))
             })?;
             let mut gpu: Option<gen5::runtime::scaled::Headless> = None;
+            // GEN5_INTERP_SHOTS=1: when a frame shows a new 3D list, also
+            // save the frame before it drawn half way to that list
+            // (`frame-NNNNN-half.png`), as the window's 3D interpolation
+            // draws it, to find polygons that tear or stay behind.
+            let interp_shots = std::env::var("GEN5_INTERP_SHOTS").is_ok_and(|value| value == "1");
+            let mut shown: Option<gen5::nds::gpu2d::ScaledFrame> = None;
             let on_frame = directory.map(|directory| {
                 Box::new(move |number: u64, frame: &gen5::nds::gpu2d::Frame, _| {
                     let (width, height, pixels) = match &frame.scaled {
@@ -187,6 +193,41 @@ fn run() -> Result<(), String> {
                                         std::process::exit(1);
                                     }
                                 }
+                            }
+                            if interp_shots
+                                && let Some(before) = shown.take()
+                                && let (Some(old), Some(new)) = (&before.three_d, &scaled.three_d)
+                                && old.scene.list.swap != new.scene.list.swap
+                            {
+                                let gpu = gpu.as_mut().unwrap();
+                                let half = match resolution {
+                                    Some(resolution) => gpu.render_interpolated_sized(
+                                        &before,
+                                        resolution.content(before.extra > 0),
+                                        &new.scene.list,
+                                        0.5,
+                                    ),
+                                    None => gpu.render_interpolated(
+                                        &before,
+                                        scale,
+                                        &new.scene.list,
+                                        0.5,
+                                    ),
+                                };
+                                if let Ok((width, height, pixels)) = half {
+                                    let image = gen5::nds::gpu2d::png(
+                                        width as usize,
+                                        height as usize,
+                                        &pixels,
+                                    );
+                                    let path =
+                                        directory.join(format!("frame-{number:05}-half.png"));
+                                    let _ = std::fs::create_dir_all(&directory)
+                                        .and_then(|()| std::fs::write(&path, image));
+                                }
+                            }
+                            if interp_shots {
+                                shown = Some((**scaled).clone());
                             }
                             let rendered = match resolution {
                                 Some(resolution) => gpu

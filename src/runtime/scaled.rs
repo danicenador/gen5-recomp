@@ -837,6 +837,19 @@ impl Headless {
         Self::readback(&self.device, &self.queue, output)
     }
 
+    /// `render_interpolated` at an exact output size, as `render_sized`.
+    pub fn render_interpolated_sized(
+        &mut self,
+        frame: &ScaledFrame,
+        size: (u32, u32),
+        next: &DisplayList,
+        alpha: f64,
+    ) -> Result<(u32, u32, Vec<u8>)> {
+        self.renderer.set_frame(frame);
+        let output = self.renderer.draw_sized(size, Some(next), alpha).0;
+        Self::readback(&self.device, &self.queue, output)
+    }
+
     fn readback(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
