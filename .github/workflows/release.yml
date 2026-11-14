@@ -39,7 +39,9 @@ jobs:
             throw "tag ${{ github.ref_name }} does not match version $version in Cargo.toml"
           }
 
-      - run: cargo test --release --locked
+      # One test at a time: the GPU tests share the runner's software
+      # renderer, which can crash when several start devices at once.
+      - run: cargo test --release --locked -- --test-threads=1
       - run: cargo build --release --locked
 
       - name: Package
