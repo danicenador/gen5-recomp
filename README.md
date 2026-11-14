@@ -190,7 +190,9 @@ stick moves a stylus on it that pressing the stick touches with.
 Press **F1** or click the controller's **left stick** to open PC Settings
 at any time. The game pauses while the menu is open. Use the D-pad or arrow
 keys to select a row, left/right to change it, A (keyboard X or Enter) to
-confirm, and B (keyboard Z or Escape) to go back. Mouse clicks work too;
+confirm, and B (keyboard Z or Escape) to go back. Closing the menu resumes
+from fresh game frames so time spent in settings does not add input delay.
+Mouse clicks work too;
 the mouse wheel scrolls the mappings. Menu navigation keeps these defaults
 even after gameplay controls are remapped, and F1 remains a recovery shortcut.
 

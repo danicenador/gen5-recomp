@@ -876,16 +876,28 @@ impl App {
                 self.save_settings();
             }
             Effect::Close => {
-                self.menu.open = false;
-                self.pressed = 0;
-                self.pad_pressed = 0;
-                self.blocked_pad = u32::MAX;
-                self.pen_down = false;
-                self.input.set_modal(false);
+                self.close_settings();
             }
             Effect::None => {}
         }
         self.request_redraw();
+    }
+
+    fn close_settings(&mut self) {
+        self.menu.open = false;
+        self.pressed = 0;
+        self.pad_pressed = 0;
+        self.blocked_pad = u32::MAX;
+        self.pen_down = false;
+        self.pad_cursor.touching = false;
+        // Paused frames have deadlines from before the menu opened. Keeping
+        // them makes the continuous interpolation clock spend seconds catching
+        // up, showing stale menus while the guest already handles fresh input.
+        self.history.clear();
+        self.screens.take();
+        self.timeline = pacing::Timeline::default();
+        self.drawn = None;
+        self.input.set_modal(false);
     }
 
     fn apply_settings(&mut self, event_loop: &ActiveEventLoop) {
@@ -1195,7 +1207,7 @@ impl App {
         self.history.extend(self.screens.take());
         let scale = self.scale.load(Ordering::Relaxed);
         if !self.history.is_empty() {
-            let pick = if self.interpolate {
+            let pick = if self.interpolate && !self.menu.open {
                 let times: Vec<FrameTime> = self.history.iter().map(Published::time).collect();
                 self.timeline.pick(&times, Instant::now())
             } else {
@@ -2653,6 +2665,53 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_settings_discards_the_paused_presentation_timeline() {
+        let input = Arc::new(Input::default());
+        let screens = Arc::new(Screens::default());
+        let mut app = App::new(
+            "Paused settings",
+            screens.clone(),
+            input.clone(),
+            Arc::new(AtomicU32::new(1)),
+            Fps::Display,
+            Arc::new(Speed::default()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(LoadedOverlays::default()),
+            Settings::default(),
+            PathBuf::new(),
+        );
+        let start = Instant::now();
+        screens.publish(1, &Frame::blank(), start);
+        app.history.extend(screens.take());
+        app.show_settings();
+        // The host keeps drawing throughout a long settings visit, even
+        // though the guest's last frame still has its pre-pause deadline.
+        let paused = start + Duration::from_secs(4);
+        app.timeline.pick(&[app.history[0].time()], paused);
+        screens.publish(2, &Frame::blank(), start + FRAME_TIME);
+        app.pressed = input::B;
+        app.pad_pressed = input::B;
+        app.pen_down = true;
+        app.pad_cursor.touching = true;
+        app.close_settings();
+        assert!(!app.menu.open);
+        assert!(app.history.is_empty());
+        assert!(screens.take().is_empty());
+        assert_eq!((app.pressed, app.pad_pressed), (0, 0));
+        assert!(!app.pen_down && !app.pad_cursor.touching);
+        assert_eq!(input.buttons(), 0);
+        assert!(!input.wait_for_ui());
+        // Resumed frames must be displayed immediately rather than waiting
+        // for the clock to crawl across the four-second gap.
+        screens.publish(3, &Frame::blank(), paused + FRAME_TIME);
+        screens.publish(4, &Frame::blank(), paused + FRAME_TIME * 2);
+        app.history.extend(screens.take());
+        let times: Vec<_> = app.history.iter().map(Published::time).collect();
+        let pick = app.timeline.pick(&times, paused + FRAME_TIME * 3);
+        assert_eq!(app.history[pick.shown].number, 4);
+    }
 
     #[cfg(target_os = "windows")]
     #[test]
