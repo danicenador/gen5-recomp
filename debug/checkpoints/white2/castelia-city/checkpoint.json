@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Castelia city",
+  "reproduction": "just after arriving",
+  "source": "debug/runs/1794681599232454900-9512/history/frame-0000346962",
+  "frame": 346962,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
