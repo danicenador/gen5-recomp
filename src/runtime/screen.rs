@@ -160,6 +160,7 @@ struct App {
     overlays: Arc<LoadedOverlays>,
     /// Raises and lowers the bottom screen as scenes change.
     scene: SceneWatch,
+    inherited: Inherited,
     /// The stylus the right stick moves on the raised bottom screen.
     pad_cursor: PadCursor,
     /// Alt held, for Alt+Enter.
@@ -393,6 +394,10 @@ const BATTLE_OVERLAYS: &[u16] = &[167, 168, 169, 170];
 /// whole opening, whose speeches are on the top screen.
 const MENU_OVERLAYS: &[u16] = &[140, 142, 165, 207, 316];
 
+/// The evolution scene's overlay (`evolution_demo`). After a battle the last
+/// battle overlay is still in RAM while it plays.
+const EVOLUTION_OVERLAY: u16 = 284;
+
 /// The naming keyboard's overlay. It stays in RAM through the whole
 /// opening, Professor Juniper's speeches included, so the keyboard itself
 /// is told by the screens: while it is up, the game swaps them, putting
@@ -409,8 +414,13 @@ enum Scene {
     Field,
     /// A battle. The bottom screen shows a Poké Ball while the battle plays
     /// out and the command buttons (FIGHT, BAG, RUN, POKéMON, then the
-    /// moves) while it waits for the player's choice.
+    /// moves) while it waits for the player's choice, as well as the
+    /// prompts for forgetting a move to learn a new one.
     Battle,
+    /// A Pokémon evolving, on the top screen. The bottom screen stays blank
+    /// unless the Pokémon wants to learn a move: then it asks whether to
+    /// forget one and lists the moves there.
+    Evolution,
     Menu,
     /// The opening, with the naming keyboard on the bottom screen when the
     /// player names themselves and the rival.
@@ -425,6 +435,8 @@ fn scene(overlays: &[u16]) -> Scene {
     // over, including the move-forgetting screen after a level-up.
     if any(MENU_OVERLAYS) {
         Scene::Menu
+    } else if overlays.contains(&EVOLUTION_OVERLAY) {
+        Scene::Evolution
     } else if any(BATTLE_OVERLAYS) {
         Scene::Battle
     } else if overlays.contains(&FIELD_OVERLAY) {
@@ -437,14 +449,28 @@ fn scene(overlays: &[u16]) -> Scene {
 }
 
 /// Whether the bottom screen should be up in `scene`: in menus; in battles
-/// while they wait for a command, which the bottom screen shows on BG0 and
-/// BG1 (the Poké Ball it shows meanwhile is on BG3); on the field while the
-/// X menu, or a screen opened from it, is up; and in the opening while the
-/// naming keyboard is.
-fn scene_wants_panel(scene: Scene, x_menu: bool, bottom: BottomScreen) -> Option<bool> {
+/// and evolutions while they wait for the player, which they show with BG1
+/// on; on the field while the X menu, or a screen opened from it, is up;
+/// and in the opening while the naming keyboard is.
+///
+/// A battle's bottom screen shows its Poké Ball on BG2 and BG3 while it
+/// plays out, and turns BG1 on for the command buttons, the yes/no question
+/// about forgetting a move and the list of moves to forget, which also keep
+/// BG3 on. The command buttons fade in on BG0 alone first. An evolution
+/// shows only BG0 until its yes/no question adds BG1 and BG2, and forgets
+/// moves on the battle's list. `inherited` says the bottom screen is still
+/// the one the previous scene left (see `Inherited`): a battle or an
+/// evolution says nothing until it has drawn its own.
+fn scene_wants_panel(
+    scene: Scene,
+    x_menu: bool,
+    bottom: BottomScreen,
+    inherited: bool,
+) -> Option<bool> {
     match scene {
         Scene::Menu => Some(true),
-        Scene::Battle => Some(!bottom.shows_bg(3) && (bottom.shows_bg(0) || bottom.shows_bg(1))),
+        Scene::Battle | Scene::Evolution if inherited => None,
+        Scene::Battle | Scene::Evolution => Some(bottom.shows_bg(1)),
         Scene::Field => Some(x_menu),
         Scene::Opening => Some(bottom.engine_a),
         Scene::Unknown => None,
@@ -489,6 +515,38 @@ impl SceneWatch {
         }
         self.decided = Some(wanted);
         Some(wanted)
+    }
+}
+
+/// The bottom screen a scene started with, for as long as it stays the same.
+/// A battle starts while the bottom screen still shows the field's C-Gear,
+/// whose layers are those of the battle's list of moves to forget, so what
+/// a battle or an evolution shows is only told apart once it has drawn its
+/// own bottom screen.
+#[derive(Clone, Copy, Debug)]
+struct Inherited {
+    scene: Scene,
+    /// The bottom screen as the scene began, until it changes.
+    bottom: Option<BottomScreen>,
+}
+
+impl Inherited {
+    fn new() -> Self {
+        Self {
+            scene: Scene::Unknown,
+            bottom: None,
+        }
+    }
+
+    /// Whether `bottom` is still what the previous scene left behind.
+    fn update(&mut self, scene: Scene, bottom: BottomScreen) -> bool {
+        if scene != self.scene {
+            self.scene = scene;
+            self.bottom = Some(bottom);
+        } else if self.bottom != Some(bottom) {
+            self.bottom = None;
+        }
+        self.bottom.is_some()
     }
 }
 
@@ -651,6 +709,7 @@ impl App {
             panel: Panel::new(Instant::now()),
             overlays,
             scene: SceneWatch::new(Instant::now()),
+            inherited: Inherited::new(),
             pad_cursor: PadCursor::new(Instant::now()),
             alt: false,
             widescreen,
@@ -1174,16 +1233,14 @@ impl App {
         let now = Instant::now();
         let touchable = self.panel.touchable();
         let scene = scene(&self.overlays.get());
+        let bottom = self.overlays.bottom_screen();
+        let inherited = self.inherited.update(scene, bottom);
         if self.layout == Layout::Single
             && self.settings.smart_bottom
             && !self.menu.open
             && let Some(up) = self.scene.update(
                 now,
-                scene_wants_panel(
-                    scene,
-                    self.overlays.field_menu(),
-                    self.overlays.bottom_screen(),
-                ),
+                scene_wants_panel(scene, self.overlays.field_menu(), bottom, inherited),
             )
             && up != self.panel.up
         {
@@ -3042,10 +3099,19 @@ mod tests {
         assert_eq!(scene(&[12, 27, 29, 331]), Scene::Unknown);
 
         let shown = BottomScreen::default();
-        assert_eq!(scene_wants_panel(Scene::Field, false, shown), Some(false));
-        assert_eq!(scene_wants_panel(Scene::Field, true, shown), Some(true));
-        assert_eq!(scene_wants_panel(Scene::Menu, false, shown), Some(true));
-        assert_eq!(scene_wants_panel(Scene::Unknown, true, shown), None);
+        assert_eq!(
+            scene_wants_panel(Scene::Field, false, shown, false),
+            Some(false)
+        );
+        assert_eq!(
+            scene_wants_panel(Scene::Field, true, shown, false),
+            Some(true)
+        );
+        assert_eq!(
+            scene_wants_panel(Scene::Menu, false, shown, false),
+            Some(true)
+        );
+        assert_eq!(scene_wants_panel(Scene::Unknown, true, shown, false), None);
     }
 
     #[test]
@@ -3057,12 +3123,66 @@ mod tests {
             engine_a: false,
             layers: (dispcnt >> 8) as u8 & 0x1F,
         };
-        let battle = |dispcnt| scene_wants_panel(Scene::Battle, false, layers(dispcnt));
+        let battle = |dispcnt| scene_wants_panel(Scene::Battle, false, layers(dispcnt), false);
         assert_eq!(battle(0x1C13), Some(false));
         assert_eq!(battle(0x1D13), Some(false));
         assert_eq!(battle(0x1713), Some(true));
         // As it starts, before the Poké Ball shows, no backgrounds are on.
         assert_eq!(battle(0x0013), Some(false));
+    }
+
+    #[test]
+    fn learning_a_move_raises_the_bottom_screen_for_its_questions() {
+        // Oshawott reaching level 17 at Virbank Complex: "Should a move be
+        // deleted?" with FORGET and KEEP OLD MOVES! (BG1, BG2 and sprites),
+        // the Poké Ball between them, then the moves to forget and a move's
+        // details, which leave every layer on.
+        let layers = |layers| BottomScreen {
+            engine_a: false,
+            layers,
+        };
+        let battle = |bits| scene_wants_panel(Scene::Battle, false, layers(bits), false);
+        assert_eq!(battle(0x16), Some(true));
+        assert_eq!(battle(0x1c), Some(false));
+        assert_eq!(battle(0x1f), Some(true));
+        assert_eq!(battle(0x0f), Some(true));
+        // It evolves next, with battle overlay 170 still in RAM; the bottom
+        // screen shows BG0 and sprites, all blank, unless a question is up.
+        let evolution = [12, 27, 33, 139, 166, 170, 284, 285, 287, 338];
+        assert_eq!(scene(&evolution), Scene::Evolution);
+        let evolving = |bits| scene_wants_panel(Scene::Evolution, false, layers(bits), false);
+        assert_eq!(evolving(0x11), Some(false));
+        assert_eq!(evolving(0x17), Some(true));
+        // Forgetting a move from the field opens the summary over it.
+        assert_eq!(scene(&[12, 27, 36, 207, 284]), Scene::Menu);
+    }
+
+    #[test]
+    fn a_battle_waits_for_its_own_bottom_screen() {
+        // The battle's overlays load while the bottom screen still shows the
+        // field's C-Gear (every layer on), the same layers as the list of
+        // moves to forget; the battle draws its Poké Ball 32 frames later.
+        let c_gear = BottomScreen {
+            engine_a: false,
+            layers: 0x1f,
+        };
+        let poke_ball = BottomScreen {
+            engine_a: false,
+            layers: 0x14,
+        };
+        let mut inherited = Inherited::new();
+        assert!(inherited.update(Scene::Field, c_gear));
+        let battle = Scene::Battle;
+        assert!(inherited.update(battle, c_gear));
+        assert_eq!(scene_wants_panel(battle, false, c_gear, true), None);
+        assert!(!inherited.update(battle, poke_ball));
+        assert_eq!(
+            scene_wants_panel(battle, false, poke_ball, false),
+            Some(false)
+        );
+        // Once the battle has drawn its own screen, the same layers are its.
+        assert!(!inherited.update(battle, c_gear));
+        assert_eq!(scene_wants_panel(battle, false, c_gear, false), Some(true));
     }
 
     #[test]
@@ -3076,14 +3196,14 @@ mod tests {
             overlays.push(*menu);
             assert_eq!(scene(&overlays), Scene::Menu);
             assert_eq!(
-                scene_wants_panel(scene(&overlays), false, background),
+                scene_wants_panel(scene(&overlays), false, background, false),
                 Some(true)
             );
             overlays.pop();
         }
         assert_eq!(scene(&overlays), Scene::Battle);
         assert_eq!(
-            scene_wants_panel(scene(&overlays), false, background),
+            scene_wants_panel(scene(&overlays), false, background, false),
             Some(false)
         );
     }
@@ -3101,11 +3221,11 @@ mod tests {
             layers: 0x1F,
         };
         assert_eq!(
-            scene_wants_panel(Scene::Opening, false, juniper),
+            scene_wants_panel(Scene::Opening, false, juniper, false),
             Some(false)
         );
         assert_eq!(
-            scene_wants_panel(Scene::Opening, false, keyboard),
+            scene_wants_panel(Scene::Opening, false, keyboard, false),
             Some(true)
         );
     }
@@ -3141,7 +3261,7 @@ mod tests {
         let start = Instant::now();
         let mut watch = SceneWatch::new(start);
         for (step, &(overlays, menu, expected)) in steps.iter().enumerate() {
-            let wanted = scene_wants_panel(scene(overlays), menu, BottomScreen::default());
+            let wanted = scene_wants_panel(scene(overlays), menu, BottomScreen::default(), false);
             let t = start + SCENE_SETTLE * 4 * step as u32;
             assert_eq!(watch.update(t, wanted), None, "step {step}");
             assert_eq!(

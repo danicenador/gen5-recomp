@@ -312,12 +312,15 @@ pub struct Machine {
     field_menu: Option<FieldMenu>,
     /// Whether the field menu was open at the last frame.
     field_menu_open: bool,
+    /// The bottom screen's engine and layers at the last frame.
+    bottom: BottomScreen,
     startup: Option<super::startup::Hooks>,
     /// Keep the validated Continue menu hidden through its fade and teardown.
     startup_finish: Option<u32>,
     /// GEN5_OVERLAY_LOG=path: each frame the overlays in RAM change, the
-    /// frame number and the overlays loaded and unloaded, and each frame
-    /// the field menu opens or closes.
+    /// frame number and the overlays loaded and unloaded, each frame the
+    /// field menu opens or closes, and each frame the bottom screen changes
+    /// engine or layers.
     overlay_log: Option<fs::File>,
     _library: Library,
 }
@@ -1376,9 +1379,20 @@ impl Machine {
         if self.options.overlays.is_none() && self.overlay_log.is_none() {
             return;
         }
+        let bottom = BottomScreen::read(&self.io);
         if let Some(overlays) = &self.options.overlays {
-            let bottom = BottomScreen::read(&self.io);
             overlays.bottom.store(bottom.pack(), Ordering::Relaxed);
+        }
+        if bottom != self.bottom {
+            self.bottom = bottom;
+            if let Some(log) = &mut self.overlay_log {
+                let engine = if bottom.engine_a { 'A' } else { 'B' };
+                let _ = writeln!(
+                    log,
+                    "{}: bottom screen engine {engine}, layers {:#04x}",
+                    self.presented, bottom.layers
+                );
+            }
         }
         let field_menu_open = self.field_menu.is_some_and(|menu| {
             self.loaded.contains(&field_menu::OVERLAY) && menu.is_open(&self.memory.main)
@@ -2396,6 +2410,7 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         signatures: Vec::new(),
         field_menu,
         field_menu_open: false,
+        bottom: BottomScreen::default(),
         startup,
         startup_finish: None,
         overlay_log: std::env::var_os("GEN5_OVERLAY_LOG")

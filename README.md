@@ -267,9 +267,14 @@ the ARM9 overlays in RAM (see `scene_wants_panel` in
 `src/runtime/screen.rs`); a scene has to hold for 100 ms first, so map
 transitions pass unnoticed, and scenes it cannot tell (the title screen)
 leave the bottom screen where it is. A battle's bottom screen shows a Poké
-Ball on BG3 while the battle plays out and the command buttons (FIGHT, BAG,
-RUN, POKéMON, then the moves) on BG0 and BG1 while it waits, so the bottom
-screen rises with the buttons and drops once a command is chosen. In the
+Ball on BG2 and BG3 while the battle plays out and turns BG1 on whenever it
+waits for the player: the command buttons (FIGHT, BAG, RUN, POKéMON, then the
+moves) and, after a level-up, the question whether to forget a move for a new
+one and the list of moves to forget. So the bottom screen rises with those
+and drops once they are answered. Until a battle has drawn its own bottom
+screen, the C-Gear the field left there is ignored. An evolution plays on the
+top screen with the bottom screen down, and raises it only when the Pokémon
+wants to learn a move and asks which to forget. In the
 opening it rises for the naming keyboard, which the game shows with the
 screens swapped (engine A on the bottom), and drops for Professor Juniper's
 speeches. The X menu loads no overlays of its own, so the runtime reads the
@@ -282,8 +287,9 @@ stick moves a stylus over the raised bottom screen, shown as a ring, and
 pressing the stick in touches with it (the ring fills); it hides three
 seconds after it last moved. `GEN5_OVERLAY_LOG=path` writes, for `run` or
 `boot`, each frame at which the overlays in RAM change, with those loaded
-and unloaded, and each frame at which the field menu opens or closes, for
-finding the overlays of new scenes.
+and unloaded, each frame at which the field menu opens or closes, and each
+frame at which the bottom screen's engine or layers change, for finding the
+overlays and layers of new scenes.
 
 F11 or Alt+Enter switches
 between borderless full screen and a window, in any layout. On returning from
