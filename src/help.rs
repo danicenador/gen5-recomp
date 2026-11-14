@@ -11,13 +11,58 @@ pub struct Command {
 
 pub const COMMANDS: &[Command] = &[
     Command {
+        name: "install",
+        usage: "gen5 install <rom.nds> [--data-dir=<directory>] [--cc=<c-compiler>] [--json]",
+        summary: "Install a game from a ROM in one step",
+        details: "\
+Runs every step a game needs: imports the ROM into
+<directory>/<game>/<rom-crc32>/ (default directory: .gen5-cache) with a
+copy of the ROM itself, finds the functions, translates them to C and
+builds the game library. The ROM can be moved or deleted afterwards. A full
+build takes a few minutes; running install again only redoes what changed.
+
+Options:
+  --data-dir=DIR  Where installs go (default .gen5-cache).
+  --cc=PATH       The C compiler (default gcc, MinGW-w64 on Windows).
+  --json          Report progress as JSON lines, for a launcher; writing
+                  `cancel` on a line of stdin stops it (exit code 2).
+                  docs/launcher.md describes the events.
+
+Example:
+  gen5 install \"roms/Pokemon White Version 2.nds\"
+  gen5 run .gen5-cache/pokemon-white-2/95AB5437",
+    },
+    Command {
+        name: "update",
+        usage: "gen5 update <install> [--cc=<c-compiler>] [--json]",
+        summary: "Rebuild an install after updating gen5",
+        details: "\
+Translates and builds the game again with this gen5, reusing whatever did
+not change. Options are those of install. `gen5 status` says whether an
+install needs it.
+
+Example:
+  gen5 update .gen5-cache/pokemon-white-2/95AB5437",
+    },
+    Command {
+        name: "status",
+        usage: "gen5 status <install> [--json]",
+        summary: "Say whether an install is ready to play",
+        details: "\
+Prints the game, whether the install keeps a copy of its ROM, the gen5
+that built it and its state: missing, not-built, outdated (built by another
+gen5: run update) or ready.",
+    },
+    Command {
         name: "inspect",
-        usage: "gen5 inspect <rom.nds>",
+        usage: "gen5 inspect <rom.nds> [--json]",
         summary: "Check a ROM and say which game it is",
         details: "\
 Validates the header checksums, the section ranges and the NitroFS tables,
 and prints the title, game code and size. Black, White, Black 2 and White 2
-are recognized by their game code.
+are recognized by their game code. With --json it prints the game, its
+CRC-32 and whether it is supported (English Black 2 / White 2), experimental
+(another Gen V game or region) or unsupported, as one JSON object.
 
 Example:
   gen5 inspect \"roms/Pokemon White Version 2.nds\"",
@@ -44,7 +89,7 @@ autoload blocks (ITCM, DTCM, ...) and every overlay.",
     Command {
         name: "import",
         usage: "gen5 import <rom.nds> [cache-directory]",
-        summary: "Step 1: copy the ROM's files and code into a cache",
+        summary: "Step 1 of install: copy the ROM's files and code into a cache",
         details: "\
 Copies every NitroFS file and the decompressed ARM9, ARM7 and overlay code
 into <cache-directory>/<game>/<rom-crc32>/ (default cache directory:
@@ -58,7 +103,7 @@ Example:
     Command {
         name: "analyze",
         usage: "gen5 analyze <cache>",
-        summary: "Step 2: find every function in the exported code",
+        summary: "Step 2 of install: find every function in the exported code",
         details: "\
 Decodes the ARM9 binary and its overlays and writes
 <cache>/analysis/functions.json. Build gen5 with --release: it is much
@@ -67,7 +112,7 @@ slower in a debug build.",
     Command {
         name: "codegen",
         usage: "gen5 codegen <cache>",
-        summary: "Step 3: translate every function to C",
+        summary: "Step 3 of install: translate every function to C",
         details: "\
 Writes the generated C into <cache>/recomp/. Run it again after updating
 gen5, since the generator changes with it; files whose contents did not
@@ -76,7 +121,7 @@ change are left alone, so the next build only recompiles the others.",
     Command {
         name: "build",
         usage: "gen5 build <cache> [c-compiler]",
-        summary: "Step 4: compile the generated C into the game library",
+        summary: "Step 4 of install: compile the generated C into the game library",
         details: "\
 Compiles <cache>/recomp/*.c in parallel into <cache>/recomp/build/game.dll,
 reusing objects whose sources have not changed. The compiler defaults to
@@ -85,10 +130,13 @@ minutes.",
     },
     Command {
         name: "run",
-        usage: "gen5 run <cache> <rom.nds> [scale] [--fps=ds|display|uncapped|N]\n           \
+        usage: "gen5 run <cache> [rom.nds] [scale] [--fps=ds|display|uncapped|N]\n           \
                 [--split-screens | --single-screen] [--widescreen]",
         summary: "Play the game in a window",
         details: "\
+The ROM may be left out for a game set up with `gen5 install`, which keeps a
+copy of it.
+
 Options:
   scale             Resolution multiple, 1 to 8 (also --scale=N or
                     GEN5_SCALE). Keys 1-8 change it while playing.
@@ -123,14 +171,14 @@ Keys (the defaults; PC Settings can remap them):
                     (the game pauses while it is open)
   Esc               Quit (asks first)
 
-Game controllers work too; see README.md.
+Game controllers work too; see docs/playing.md.
 
 Example:
-  gen5 run .gen5-cache/pokemon-white-2/95AB5437 \"roms/Pokemon White Version 2.nds\" 3",
+  gen5 run .gen5-cache/pokemon-white-2/95AB5437 3",
     },
     Command {
         name: "boot",
-        usage: "gen5 boot <cache> <rom.nds> [frames [png-directory]]",
+        usage: "gen5 boot <cache> [rom.nds] [frames [png-directory]]",
         summary: "Run the game headless, for testing and diagnosis",
         details: "\
 Runs for the given number of frames (default 60) without a window and ends
@@ -145,8 +193,8 @@ Common environment variables:
                                             there instead of the cache
   GEN5_BOOT_SECONDS=N                       Watchdog (default 20, 0 = off)
   GEN5_SPEED=N                              Run as if fast-forwarding at N
-Button names: a b x y l r start select up down left right. README.md lists
-the other diagnostic variables.
+Button names: a b x y l r start select up down left right.
+docs/debugging.md lists the other diagnostic variables.
 
 Example:
   GEN5_INPUT=1300-1305:start gen5 boot .gen5-cache/pokemon-white-2/95AB5437 \\
@@ -160,7 +208,8 @@ Example:
 Runs `run` or `boot` with a fresh save of its own under debug/runs/, and
 keeps snapshots of the save in the session's history/ directory as the game
 writes it. --checkpoint starts from a copy of a saved checkpoint. The other
-arguments are those of `run` or `boot`. See debug/checkpoints/README.md.
+arguments are those of `run` or `boot`, and the ROM path is required. See
+debug/checkpoints/README.md.
 
 Example:
   gen5 debug run .gen5-cache/pokemon-white-2/95AB5437 \\
@@ -188,6 +237,13 @@ Example:
   gen5 disasm .gen5-cache/pokemon-white-2/95AB5437 ov011 0x0218B360",
     },
     Command {
+        name: "version",
+        usage: "gen5 version [--json]",
+        summary: "Show gen5's version",
+        details: "\
+Prints the version and the commit gen5 was built from (also --version).",
+    },
+    Command {
         name: "help",
         usage: "gen5 help [command]",
         summary: "Show this help, or a command's",
@@ -196,15 +252,12 @@ Example:
 ];
 
 const GETTING_STARTED: &str = "\
-Getting started (build gen5 with `cargo build --release`, and have gcc on
-PATH):
-  1. gen5 import  \"roms/Pokemon White Version 2.nds\"
-  2. gen5 analyze .gen5-cache/pokemon-white-2/<crc>
-  3. gen5 codegen .gen5-cache/pokemon-white-2/<crc>
-  4. gen5 build   .gen5-cache/pokemon-white-2/<crc>
-  5. gen5 run     .gen5-cache/pokemon-white-2/<crc> \"roms/Pokemon White Version 2.nds\"
-`import` prints the cache directory to use. Through cargo, put the
-arguments after `--`: cargo run --release -- run <cache> <rom.nds>";
+Getting started (have gcc on PATH; MinGW-w64 on Windows):
+  1. gen5 install \"roms/Pokemon White Version 2.nds\"
+  2. gen5 run     .gen5-cache/pokemon-white-2/<crc>
+`install` prints the directory to use, and runs import, analyze, codegen and
+build in one go. Through cargo, put the arguments after `--`:
+cargo run --release -- install <rom.nds>";
 
 /// Finds a command by name.
 pub fn command(name: &str) -> Option<&'static Command> {

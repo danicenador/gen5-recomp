@@ -10,9 +10,18 @@ mod help;
 fn main() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("gen5=info"));
+    // With --json, stdout carries only JSON lines, so logs go to stderr.
+    let json = env::args().any(|arg| arg == "--json");
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(move || -> Box<dyn std::io::Write> {
+            if json {
+                Box::new(std::io::stderr())
+            } else {
+                Box::new(std::io::stdout())
+            }
+        })
         .try_init();
     if let Err(error) = run() {
         eprintln!("error: {error}");
@@ -22,6 +31,10 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
+        println!("gen5 {}", gen5::install::version());
+        return Ok(());
+    }
     if let Some(help) = help::requested(&args) {
         println!("{}", help?);
         return Ok(());
@@ -37,6 +50,26 @@ fn run() -> Result<(), String> {
             gen5::debug::promote(Path::new(&args[1]), Path::new(&args[2]), &args[3], &args[4])
         }
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
+        Some("inspect") if args.len() == 3 && args[2] == "--json" => {
+            print_json(&gen5::install::inspect(Path::new(&args[1]))?)
+        }
+        Some("version") if args.len() == 1 => {
+            println!("gen5 {}", gen5::install::version());
+            Ok(())
+        }
+        Some("version") if args.len() == 2 && args[1] == "--json" => {
+            print_json(&serde_json::json!({ "version": gen5::install::version() }))
+        }
+        Some("status") if args.len() == 2 || (args.len() == 3 && args[2] == "--json") => {
+            let status = gen5::install::status(Path::new(&args[1]));
+            if args.len() == 3 {
+                print_json(&status)
+            } else {
+                print_status(&status);
+                Ok(())
+            }
+        }
+        Some("install" | "update") if args.len() >= 2 => install_command(&args),
         Some("code-info") if args.len() == 2 => code_info(Path::new(&args[1])),
         Some("analyze") if args.len() == 2 => analyze(Path::new(&args[1])),
         Some("codegen") if args.len() == 2 => codegen(Path::new(&args[1])),
@@ -44,9 +77,16 @@ fn run() -> Result<(), String> {
             let compiler = args.get(2).map_or("gcc", String::as_str);
             build(Path::new(&args[1]), compiler)
         }
-        Some("boot") if (3..=5).contains(&args.len()) => {
-            let max_frames = args
-                .get(3)
+        Some("boot") if (2..=5).contains(&args.len()) => {
+            let (rom, rest) = rom_argument(Path::new(&args[1]), &args[2..])?;
+            if rest.len() > 2 {
+                return Err(format!(
+                    "wrong arguments for 'boot'\n\nUsage: {}",
+                    help::command("boot").unwrap().usage
+                ));
+            }
+            let max_frames = rest
+                .first()
                 .map(|value| {
                     value
                         .parse::<u64>()
@@ -164,7 +204,7 @@ fn run() -> Result<(), String> {
                         .map(|(_, point)| *point),
                 );
             }) as Box<dyn FnMut(u64) + Send>);
-            let directory = args.get(4).map(std::path::PathBuf::from);
+            let directory = rest.get(1).map(std::path::PathBuf::from);
             // GEN5_SCALE: screenshots at a multiple of the DS resolution,
             // drawn by the GPU renderer.
             let resolution = std::env::var("GEN5_RESOLUTION")
@@ -261,7 +301,7 @@ fn run() -> Result<(), String> {
             });
             gen5::nds::machine::boot(
                 Path::new(&args[1]),
-                Path::new(&args[2]),
+                &rom,
                 gen5::nds::machine::Options {
                     auto_continue: std::env::var("GEN5_AUTO_CONTINUE")
                         .is_ok_and(|value| value == "1"),
@@ -300,7 +340,8 @@ fn run() -> Result<(), String> {
                 },
             )
         }
-        Some("run") if args.len() >= 3 => {
+        Some("run") if args.len() >= 2 => {
+            let (rom, rest) = rom_argument(Path::new(&args[1]), &args[2..])?;
             use gen5::runtime::screen::Layout;
             use gen5::runtime::settings::Settings;
             let settings_path = Settings::path(Path::new(&args[1]));
@@ -326,7 +367,7 @@ fn run() -> Result<(), String> {
                 scale = Some(scale_from_env()?);
                 settings.resolution = None;
             }
-            for value in &args[3..] {
+            for value in rest {
                 let chosen = match value.as_str() {
                     "--split-screens" => Some(Layout::Split),
                     "--single-screen" => Some(Layout::Single),
@@ -387,7 +428,7 @@ fn run() -> Result<(), String> {
                 None if settings.interpolate => gen5::runtime::pacing::Fps::Display,
                 None => gen5::runtime::pacing::Fps::Ds,
             };
-            gen5::runtime::play_recompiled(Path::new(&args[1]), Path::new(&args[2]), fps, settings)
+            gen5::runtime::play_recompiled(Path::new(&args[1]), &rom, fps, settings)
         }
         Some("disasm") if args.len() == 4 => {
             let module = args[2].parse::<ModuleId>()?;
@@ -465,7 +506,182 @@ fn inspect(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `first-last:button+button,...` into frame ranges and held buttons.
+/// The ROM argument of `run` and `boot`, and the arguments after it. The ROM
+/// path may be left out for an install that keeps its own copy (`rom.nds`);
+/// a number or an option in its place is taken as the next argument.
+fn rom_argument<'a>(cache: &Path, rest: &'a [String]) -> Result<(PathBuf, &'a [String]), String> {
+    match rest.first() {
+        Some(first) if !first.starts_with("--") && first.parse::<u64>().is_err() => {
+            Ok((PathBuf::from(first), &rest[1..]))
+        }
+        _ => {
+            let copy = cache.join(gen5::install::ROM_FILE);
+            if copy.is_file() {
+                Ok((copy, rest))
+            } else {
+                Err(format!(
+                    "no ROM given, and '{}' has no copy of it (pass the ROM's path, or install \
+                     the game with `gen5 install`)",
+                    cache.display()
+                ))
+            }
+        }
+    }
+}
+
+fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string(value).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn print_status(status: &gen5::install::Status) {
+    use gen5::install::State;
+    println!("Install: {}", status.cache.display());
+    if let (Some(game), Some(crc)) = (&status.game, &status.rom_crc32) {
+        let name = status.game_name.unwrap_or(game.as_str());
+        let code = status.game_code.as_deref().unwrap_or("?");
+        println!("Game: {name} ({code}, ROM CRC-32 {crc})");
+    }
+    println!(
+        "ROM copy: {}",
+        if status.has_rom {
+            "yes"
+        } else {
+            "no (`run` needs the ROM's path)"
+        }
+    );
+    println!(
+        "Built with: {}",
+        status.built_with.as_deref().unwrap_or("unknown")
+    );
+    println!("This gen5: {}", status.current);
+    println!(
+        "State: {}",
+        match status.state {
+            State::Missing => "not installed (run `gen5 install <rom.nds>`)",
+            State::NotBuilt => "imported but not built (run `gen5 update <install>`)",
+            State::Outdated => "built by another gen5 (run `gen5 update <install>`)",
+            State::Ready => "ready to play",
+        }
+    );
+}
+
+/// `install <rom.nds> [--data-dir=<dir>] [--cc=<compiler>] [--json]` and
+/// `update <install> [--cc=<compiler>] [--json]`.
+fn install_command(args: &[String]) -> Result<(), String> {
+    use gen5::install::{self, Event};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let updating = args[0] == "update";
+    let usage = || {
+        format!(
+            "Usage: {}\n\nRun `gen5 help {}` for more.",
+            help::command(&args[0]).unwrap().usage,
+            args[0]
+        )
+    };
+    let mut data_dir = PathBuf::from(".gen5-cache");
+    let mut compiler = "gcc".to_owned();
+    let mut json = false;
+    let mut target = None;
+    for arg in &args[1..] {
+        if let Some(value) = arg.strip_prefix("--data-dir=").filter(|_| !updating) {
+            data_dir = PathBuf::from(value);
+        } else if let Some(value) = arg.strip_prefix("--cc=") {
+            compiler = value.to_owned();
+        } else if arg == "--json" {
+            json = true;
+        } else if !arg.starts_with("--") && target.is_none() {
+            target = Some(PathBuf::from(arg));
+        } else {
+            return Err(format!("unexpected argument '{arg}'\n\n{}", usage()));
+        }
+    }
+    let Some(target) = target else {
+        return Err(format!("wrong arguments for '{}'\n\n{}", args[0], usage()));
+    };
+    let cancel: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    if json {
+        // The launcher asks to stop by writing `cancel` on a line of stdin.
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines() {
+                match line {
+                    Ok(line) if line.trim() == "cancel" => cancel.store(true, Ordering::Relaxed),
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    let shown = AtomicUsize::new(usize::MAX);
+    let report = |event: Event| {
+        if json {
+            if let Ok(line) = serde_json::to_string(&event) {
+                println!("{line}");
+            }
+            return;
+        }
+        match event {
+            Event::Step {
+                number,
+                steps,
+                title,
+                ..
+            } => println!("[{number}/{steps}] {title}"),
+            Event::Progress { done, total, .. } => {
+                // Every tenth, and the end.
+                let tenth = done * 10 / total.max(1);
+                if shown.swap(tenth, Ordering::Relaxed) != tenth {
+                    println!("      {done} of {total} files");
+                }
+            }
+        }
+    };
+    let options = install::Options {
+        compiler: &compiler,
+        cancel,
+        report: &report,
+    };
+    let started = std::time::Instant::now();
+    let result = if updating {
+        install::update(&target, &options).map(|()| target.clone())
+    } else {
+        install::install(&target, &data_dir, &options)
+    };
+    match result {
+        Ok(cache) => {
+            let status = install::status(&cache);
+            if json {
+                let mut value = serde_json::to_value(&status).map_err(|error| error.to_string())?;
+                value["event"] = "finished".into();
+                print_json(&value)
+            } else {
+                println!(
+                    "Done in {:.0}s. Play with: gen5 run \"{}\"",
+                    started.elapsed().as_secs_f32(),
+                    cache.display()
+                );
+                Ok(())
+            }
+        }
+        Err(error) if install::is_cancelled(&error) => {
+            if json {
+                print_json(&serde_json::json!({ "event": "cancelled" }))?;
+            } else {
+                eprintln!("cancelled");
+            }
+            std::process::exit(2)
+        }
+        Err(error) if json => {
+            print_json(&serde_json::json!({ "event": "failed", "message": error }))?;
+            std::process::exit(1)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// GEN5_WIDESCREEN=1: draw the top screen 16:9.
 fn widescreen_from_env() -> bool {
     std::env::var("GEN5_WIDESCREEN").is_ok_and(|value| value == "1")

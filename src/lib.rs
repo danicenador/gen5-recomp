@@ -6,6 +6,7 @@
 pub mod debug;
 pub mod formats;
 pub mod importer;
+pub mod install;
 pub mod nds;
 pub mod recomp;
 pub mod runtime;

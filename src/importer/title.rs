@@ -9,6 +9,8 @@ pub enum Gen5Title {
 }
 
 impl Gen5Title {
+    pub const ALL: [Self; 4] = [Self::Black, Self::White, Self::Black2, Self::White2];
+
     pub const fn cache_key(self) -> &'static str {
         match self {
             Self::Black => "pokemon-black",

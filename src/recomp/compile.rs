@@ -7,10 +7,10 @@
 use crate::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime};
 
 pub const LIBRARY_NAME: &str = "game.dll";
 
@@ -25,9 +25,42 @@ fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
+/// Reports `(files done, files in all)` as the build goes.
+pub type Progress<'a> = &'a (dyn Fn(usize, usize) + Sync);
+
+/// What `build_library_with` needs beyond the directory.
+pub struct BuildOptions<'a> {
+    pub compiler: &'a str,
+    /// Set to stop the build: running compilers are killed and the library is
+    /// not linked.
+    pub cancel: Option<&'a AtomicBool>,
+    pub progress: Option<Progress<'a>>,
+}
+
+/// The message a cancelled build fails with.
+pub const CANCELLED: &str = "cancelled";
+
 /// Compile every `.c` file in `recomp_dir` with `compiler` and link the
 /// objects into `recomp_dir/build/game.dll`.
 pub fn build_library(recomp_dir: &Path, compiler: &str) -> Result<BuildReport> {
+    build_library_with(
+        recomp_dir,
+        &BuildOptions {
+            compiler,
+            cancel: None,
+            progress: None,
+        },
+    )
+}
+
+/// `build_library` with cancellation and progress reports.
+pub fn build_library_with(recomp_dir: &Path, options: &BuildOptions) -> Result<BuildReport> {
+    let compiler = options.compiler;
+    let cancelled = || {
+        options
+            .cancel
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    };
     let build_dir = recomp_dir.join("build");
     fs::create_dir_all(&build_dir)
         .map_err(|error| format!("could not create '{}': {error}", build_dir.display()))?;
@@ -51,6 +84,16 @@ pub fn build_library(recomp_dir: &Path, compiler: &str) -> Result<BuildReport> {
 
     let next = AtomicUsize::new(0);
     let reused = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let finished = || {
+        let count = done.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(progress) = options.progress {
+            progress(count, sources.len());
+        }
+    };
+    if let Some(progress) = options.progress {
+        progress(0, sources.len());
+    }
     let errors = Mutex::new(Vec::new());
     let objects: Vec<PathBuf> = sources
         .iter()
@@ -64,6 +107,9 @@ pub fn build_library(recomp_dir: &Path, compiler: &str) -> Result<BuildReport> {
         for _ in 0..threads {
             scope.spawn(|| {
                 loop {
+                    if cancelled() {
+                        break;
+                    }
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(source) = sources.get(index) else {
                         break;
@@ -78,30 +124,21 @@ pub fn build_library(recomp_dir: &Path, compiler: &str) -> Result<BuildReport> {
                     };
                     if fresh {
                         reused.fetch_add(1, Ordering::Relaxed);
+                        finished();
                         continue;
                     }
-                    let output = Command::new(compiler)
-                        .args(["-O1", "-fwrapv", "-fno-strict-aliasing", "-c"])
-                        .arg(source)
-                        .arg("-o")
-                        .arg(object)
-                        .output();
-                    let failure = match output {
-                        Ok(output) if output.status.success() => None,
-                        Ok(output) => Some(format!(
-                            "{} failed:\n{}",
-                            source.display(),
-                            String::from_utf8_lossy(&output.stderr)
-                        )),
-                        Err(error) => Some(format!("could not run {compiler}: {error}")),
-                    };
-                    if let Some(failure) = failure {
-                        errors.lock().unwrap().push(failure);
+                    match compile(compiler, source, object, &cancelled) {
+                        Ok(true) => finished(),
+                        Ok(false) => break,
+                        Err(failure) => errors.lock().unwrap().push(failure),
                     }
                 }
             });
         }
     });
+    if cancelled() {
+        return Err(CANCELLED.to_owned());
+    }
     let errors = errors.into_inner().unwrap();
     if !errors.is_empty() {
         return Err(errors.join("\n"));
@@ -136,4 +173,51 @@ pub fn build_library(recomp_dir: &Path, compiler: &str) -> Result<BuildReport> {
         compiled: sources.len() - reused,
         reused,
     })
+}
+
+/// Compiles one file, with the compiler's messages kept beside the object
+/// (`<object>.log`). Returns false when the build was cancelled meanwhile.
+fn compile(
+    compiler: &str,
+    source: &Path,
+    object: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> std::result::Result<bool, String> {
+    let log_path = object.with_extension("log");
+    let log = fs::File::create(&log_path)
+        .map_err(|error| format!("could not create '{}': {error}", log_path.display()))?;
+    let mut child = Command::new(compiler)
+        .args(["-O1", "-fwrapv", "-fno-strict-aliasing", "-c"])
+        .arg(source)
+        .arg("-o")
+        .arg(object)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log)
+        .spawn()
+        .map_err(|error| format!("could not run {compiler}: {error}"))?;
+    let status = loop {
+        if cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            // A half-written object must not look fresh to the next build.
+            let _ = fs::remove_file(object);
+            return Ok(false);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => return Err(format!("could not wait for {compiler}: {error}")),
+        }
+    };
+    if status.success() {
+        return Ok(true);
+    }
+    let _ = fs::remove_file(object);
+    Err(format!(
+        "{} failed:
+{}",
+        source.display(),
+        fs::read_to_string(&log_path).unwrap_or_default()
+    ))
 }
