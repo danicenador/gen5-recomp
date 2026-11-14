@@ -124,7 +124,18 @@ impl Timeline {
                 let nominal = previous_at + elapsed;
                 let correction = elapsed / 8;
                 if wanted >= nominal {
-                    nominal + wanted.duration_since(nominal).min(correction)
+                    let behind = wanted.duration_since(nominal);
+                    // A cadence change moves the wanted time by a few
+                    // frames at most. Further behind, the game held one
+                    // list for longer than any cadence (the field's 3D
+                    // stands still while it saves): its successor is too
+                    // far to move toward, so go straight to the present
+                    // instead of spending seconds showing old frames.
+                    if behind > FRAME_TIME * MAX_SPAN {
+                        wanted
+                    } else {
+                        nominal + behind.min(correction)
+                    }
                 } else {
                     nominal - nominal.duration_since(wanted).min(correction)
                 }
@@ -357,6 +368,39 @@ mod tests {
             );
             assert_eq!(picked.shown, frame - 1);
             assert_eq!((picked.next, picked.alpha), (None, 0.0));
+        }
+    }
+
+    #[test]
+    fn a_long_held_list_does_not_leave_the_window_behind() {
+        // The field draws a list every other frame, then holds one for
+        // 200 frames while the game saves, then carries on.
+        let start = Instant::now();
+        let mut lists = Vec::new();
+        for frame in 0..420u64 {
+            lists.push(Some(match frame {
+                0..20 => frame / 2,
+                20..220 => 10,
+                _ => 11 + (frame - 220) / 2,
+            }));
+        }
+        let all = timeline(start, &lists);
+        let mut clock = Timeline::default();
+        for tick in 0..all.len() * 2 {
+            let now = start + FRAME_TIME * tick as u32 / 2;
+            let frames = &all[..(tick / 2 + 1).min(all.len())];
+            let pick = clock.pick(frames, now);
+            // A few frames after the game carries on, the window shows
+            // its recent frames rather than the ones from the hold.
+            if tick / 2 >= 230 {
+                let newest = frames.len() - 1;
+                assert!(
+                    newest - pick.shown <= MAX_SPAN as usize + 1,
+                    "frame {}: showing {} of {newest}",
+                    tick / 2,
+                    pick.shown
+                );
+            }
         }
     }
 
