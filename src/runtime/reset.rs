@@ -7,9 +7,14 @@ use std::process::{Command, ExitStatus};
 
 pub const RESET_EXIT_CODE: i32 = 75;
 const WORKER: &str = "GEN5_RUNTIME_WORKER";
+const SOFT_RESTART: &str = "GEN5_SOFT_RESTART";
 
 pub fn is_worker() -> bool {
     std::env::var_os(WORKER).is_some()
+}
+
+pub fn is_soft_restart() -> bool {
+    std::env::var(SOFT_RESTART).is_ok_and(|value| value == "1")
 }
 
 pub fn is_reset_command(data: u32) -> bool {
@@ -19,19 +24,22 @@ pub fn is_reset_command(data: u32) -> bool {
 
 pub fn supervise(args: &[String]) -> Result<()> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    supervise_with(|| {
+    supervise_with(|restarting| {
         Command::new(&executable)
             .args(args)
             .env(WORKER, "1")
+            .env(SOFT_RESTART, if restarting { "1" } else { "0" })
             .status()
             .map_err(|error| format!("could not start game: {error}"))
     })
 }
 
-fn supervise_with(mut start: impl FnMut() -> Result<ExitStatus>) -> Result<()> {
+fn supervise_with(mut start: impl FnMut(bool) -> Result<ExitStatus>) -> Result<()> {
+    let mut restarting = false;
     loop {
-        let status = start()?;
+        let status = start(restarting)?;
         if status.code() == Some(RESET_EXIT_CODE) {
+            restarting = true;
             println!("Soft reset: restarting the game from the cartridge.");
             continue;
         }
@@ -59,7 +67,8 @@ mod tests {
     fn restarting_preserves_normal_exit_and_propagates_launch_errors() {
         use std::os::windows::process::ExitStatusExt;
         let mut attempts = 0;
-        supervise_with(|| {
+        supervise_with(|restarting| {
+            assert_eq!(restarting, attempts != 0);
             attempts += 1;
             Ok(ExitStatus::from_raw(if attempts < 3 {
                 RESET_EXIT_CODE as u32
@@ -69,9 +78,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(attempts, 3);
-        assert!(supervise_with(|| Ok(ExitStatus::from_raw(1))).is_err());
+        assert!(supervise_with(|_| Ok(ExitStatus::from_raw(1))).is_err());
         assert_eq!(
-            supervise_with(|| Err("launch failed".into())),
+            supervise_with(|_| Err("launch failed".into())),
             Err("launch failed".into())
         );
     }

@@ -2258,9 +2258,11 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
     let header = fs::read(code_dir.join("header.bin"))
         .map_err(|error| format!("could not read ROM header (re-run `import`): {error}"))?;
     let program = Program::load(&code_dir)?;
-    let startup = (options.auto_continue && backup.data.iter().any(|&byte| byte != 0xff))
-        .then(|| super::startup::Hooks::find(&program))
-        .flatten();
+    let startup = (options.auto_continue
+        && !crate::runtime::reset::is_soft_restart()
+        && backup.data.iter().any(|&byte| byte != 0xff))
+    .then(|| super::startup::Hooks::find(&program))
+    .flatten();
 
     let library_path = cache_root
         .join("recomp")
