@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same toolchain as local development: Rust's GNU target, and a
+      # UCRT MinGW gcc for linking and for the tests that compile generated C.
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+          path-type: inherit
+      - name: Put gcc on PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin"
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo test --release --locked
