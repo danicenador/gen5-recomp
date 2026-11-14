@@ -30,6 +30,21 @@ fn slashed(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
+/// The part of a checkpoint's source path that names the run, from `debug/runs/`
+/// on, so committed checkpoints never carry the absolute path of a user's checkout.
+fn portable_source(path: &Path) -> String {
+    let path = slashed(path);
+    if let Some(start) = path.find("debug/runs/") {
+        return path[start..].into();
+    }
+    // Checked by hand: on Windows `/x` is not absolute, on Unix `C:/x` is not.
+    if !path.starts_with('/') && path.get(1..2) != Some(":") {
+        return path;
+    }
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    parts[parts.len().saturating_sub(3)..].join("/")
+}
+
 fn read_metadata(path: &Path) -> Result<Metadata> {
     let meta: Metadata =
         serde_json::from_slice(&fs::read(path.join("checkpoint.json")).map_err(io)?).map_err(io)?;
@@ -162,7 +177,7 @@ pub fn promote(
     let (save, firmware) = read_state(source)?;
     meta.description = description.into();
     meta.reproduction = reproduction.into();
-    meta.source = Some(slashed(source));
+    meta.source = Some(portable_source(source));
     meta.status = "manual-checkpoint; verify by loading Continue".into();
     write_checkpoint(destination, &meta, &save, &firmware)
 }
@@ -245,7 +260,23 @@ mod tests {
             slashed(Path::new(
                 r"D:\gen5\debug/runs\1-2\history\frame-0000084621"
             )),
-            "D:\gen5\debug/runs/1-2/history/frame-0000084621"
+            "D:/gen5/debug/runs/1-2/history/frame-0000084621"
+        );
+    }
+
+    #[test]
+    fn checkpoint_sources_keep_only_the_run() {
+        assert_eq!(
+            portable_source(Path::new(r"D:\gen5\debug\runs\1-2\history\frame-0000084621")),
+            "debug/runs/1-2/history/frame-0000084621"
+        );
+        assert_eq!(
+            portable_source(Path::new("debug/runs/1-2/history/frame-0000084621")),
+            "debug/runs/1-2/history/frame-0000084621"
+        );
+        assert_eq!(
+            portable_source(Path::new("/elsewhere/1-2/history/frame-0000084621")),
+            "1-2/history/frame-0000084621"
         );
     }
 

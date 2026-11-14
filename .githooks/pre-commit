@@ -1,0 +1,14 @@
+#!/bin/sh
+# Refuse a commit whose identity, added lines or file names hold blocked data.
+. "$(dirname "$0")/privacy.sh"
+
+check_email "$(git var GIT_AUTHOR_IDENT | sed -n 's/.*<\(.*\)>.*/\1/p')" author
+check_email "$(git var GIT_COMMITTER_IDENT | sed -n 's/.*<\(.*\)>.*/\1/p')" committer
+
+{
+    git diff --cached --name-only
+    git diff --cached --text --no-color -U0 | grep -a '^+' | grep -a -v '^+++ '
+} > "$privacy_scratch"
+check_file "$privacy_scratch" "staged changes"
+
+exit $fail

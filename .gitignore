@@ -2,3 +2,8 @@
 /.gen5-cache
 /roms/*.nds
 /debug/runs/
+
+# Local tooling and crash dumps
+/.claude/worktrees/
+/.claude/settings.local.json
+*.stackdump

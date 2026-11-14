@@ -1,0 +1,5 @@
+#!/bin/sh
+# Refuse a commit message that holds blocked data.
+. "$(dirname "$0")/privacy.sh"
+check_file "$1" "commit message"
+exit $fail

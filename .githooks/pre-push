@@ -1,0 +1,29 @@
+#!/bin/sh
+# Check every commit about to leave this clone (its emails, message, file
+# names and changes), including whole histories pushed to a new remote.
+. "$(dirname "$0")/privacy.sh"
+
+remote=$1
+zero=0000000000000000000000000000000000000000
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue
+    if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha" 2>/dev/null; then
+        range="$remote_sha..$local_sha"
+    else
+        range="$local_sha --not --remotes=$remote"
+    fi
+
+    # shellcheck disable=SC2086
+    git log --format='%H %ae %ce' $range > "$privacy_scratch"
+    if [ -n "$privacy_email" ]; then
+        bad=$(awk -v ok="$privacy_email" '$2 != ok || $3 != ok' "$privacy_scratch" | head -5)
+        [ -z "$bad" ] || privacy_block "$remote_ref: commits with another email (hash, author, committer):
+$bad"
+    fi
+
+    # shellcheck disable=SC2086
+    git log --format='commit %H%n%B' -p --text --no-color $range > "$privacy_scratch"
+    check_file "$privacy_scratch" "$remote_ref"
+done
+
+exit $fail

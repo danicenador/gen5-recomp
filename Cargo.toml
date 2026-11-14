@@ -3,6 +3,7 @@ name = "gen5"
 version = "0.1.0"
 edition = "2024"
 description = "A static recompiler and Nintendo DS runtime for Pokémon Gen V"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 bytemuck = { version = "1.22", features = ["derive"] }
