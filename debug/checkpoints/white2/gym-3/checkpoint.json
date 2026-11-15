@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Castelia city gym",
+  "reproduction": "before defeating leader",
+  "source": "debug/runs/1794772119222682600-15480/history/frame-0000220589",
+  "frame": 220589,
+  "status": "manual-checkpoint; verify by loading Continue"
+}

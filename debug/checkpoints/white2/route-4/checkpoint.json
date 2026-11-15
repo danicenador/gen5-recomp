@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Route 4",
+  "reproduction": "before colress battle",
+  "source": "debug/runs/1794772119222682600-15480/history/frame-0000393398",
+  "frame": 393398,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
