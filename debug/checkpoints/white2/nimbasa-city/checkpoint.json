@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Nimbasa city",
+  "reproduction": "before finding Erika in the roller coaster building",
+  "source": "debug/runs/1794774223459707400-5528/history/frame-0000189531",
+  "frame": 189531,
+  "status": "manual-checkpoint; verify by loading Continue"
+}

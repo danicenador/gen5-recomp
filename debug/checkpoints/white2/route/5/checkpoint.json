@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Route 5",
+  "reproduction": ".",
+  "source": "debug/runs/1794774223459707400-5528/history/frame-0000196682",
+  "frame": 196682,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
