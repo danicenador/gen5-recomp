@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Gym 5",
+  "reproduction": "before defeating anyone",
+  "source": "debug/runs/1795031721332843900-1952/history/frame-0000400451",
+  "frame": 400451,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
