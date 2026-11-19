@@ -166,6 +166,11 @@ of the picture being stretched: the left and right clip planes are moved out
 by 43 columns, so polygons and box tests beside the screen are kept and
 drawn there, with polygon RAM of their own so the DS's own view never loses
 polygons to them. Viewports narrower than the screen keep their edges.
+A flat 3D picture drawn across the whole screen, all of it at one depth
+(an orthographic projection, which no 3D scene uses), is made for the DS's
+256 columns, so instead the sides show it reflected at the screen's edges:
+the curtain that falls over the field as a wild battle starts in a cave or
+the Castelia sewers covers the whole 16:9 screen.
 Backgrounds and sprites stay in the middle 256 columns; beside them the top
 screen shows the 3D layer, with the same blending and master brightness, or
 black when it shows no 3D (menus and other 2D screens). Under the 3D layer

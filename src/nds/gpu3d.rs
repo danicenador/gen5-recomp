@@ -1555,13 +1555,30 @@ impl Geometry {
 
 /// A list's polygons as triangles in drawing order: clipped, culled, and
 /// sorted as the hardware sorts polygons. `wide` clips them to the
-/// widescreen view (see `reach`) instead of the DS's.
+/// widescreen view (see `reach`) instead of the DS's, or, for a flat
+/// picture drawn across the screen (`flat_across_screen`), shows its
+/// reflection in the extra columns.
 fn triangles(polygons: &[Polygon], manual_sort: bool, wide: bool) -> Vec<Triangle<'_>> {
     // Opaque polygons precede translucent ones. The hardware sorts
     // opaque polygons, and translucent ones unless SWAP_BUFFERS asked
     // for manual order, by their lowest then highest screen Y. The sort
     // is stable, like submission order within equal keys.
     let mut triangles = Vec::new();
+    let mirrored = wide && flat_across_screen(polygons);
+    fn fan<'a>(
+        triangles: &mut Vec<Triangle<'a>>,
+        vertices: &[Vertex],
+        polygon: &'a Polygon,
+        translucent: bool,
+    ) {
+        for i in 1..vertices.len().saturating_sub(1) {
+            triangles.extend(Triangle::new(
+                [vertices[0], vertices[i], vertices[i + 1]],
+                polygon,
+                translucent,
+            ));
+        }
+    }
     for translucent in [false, true] {
         let mut group: Vec<&Polygon> = polygons
             .iter()
@@ -1575,20 +1592,75 @@ fn triangles(polygons: &[Polygon], manual_sort: bool, wide: bool) -> Vec<Triangl
             group.sort_by_cached_key(|polygon| sort_key(polygon));
         }
         for polygon in group {
-            let vertices = clip_polygon(&polygon.vertices, reach(polygon.viewport, wide));
-            if vertices.len() < 3 {
-                continue;
-            }
-            for i in 1..vertices.len() - 1 {
-                triangles.extend(Triangle::new(
-                    [vertices[0], vertices[i], vertices[i + 1]],
-                    polygon,
-                    translucent,
-                ));
+            if mirrored {
+                for part in mirrored_parts(&polygon.vertices) {
+                    fan(&mut triangles, &part, polygon, translucent);
+                }
+            } else {
+                let vertices = clip_polygon(&polygon.vertices, reach(polygon.viewport, wide));
+                fan(&mut triangles, &vertices, polygon, translucent);
             }
         }
     }
     triangles
+}
+
+/// Whether a list is a flat picture drawn across the whole screen, such as
+/// the curtain that falls over the field as a wild battle starts in a cave
+/// or the sewers: every polygon through the full-width viewport and at the
+/// same depth from the eye (an orthographic projection, which no 3D scene
+/// uses: even sprites facing the camera in a scene are at different
+/// distances), reaching past both sides of the screen. Drawing what lies
+/// beside the screen does not widen such a picture, as the game draws it
+/// for the DS's 256 columns, so widescreen's extra columns show it
+/// reflected at the screen's edges instead (`mirrored_parts`), as they do
+/// the 2D layers under the 3D.
+fn flat_across_screen(polygons: &[Polygon]) -> bool {
+    let Some(w) = polygons
+        .first()
+        .and_then(|polygon| polygon.vertices.first())
+        .map(|vertex| vertex.clip[3])
+    else {
+        return false;
+    };
+    let (mut left, mut right) = (false, false);
+    for polygon in polygons {
+        if polygon.viewport[0] != 0 || polygon.viewport[2] != 255 {
+            return false;
+        }
+        for vertex in &polygon.vertices {
+            if vertex.clip[3] != w {
+                return false;
+            }
+            left |= vertex.clip[0] <= -w;
+            right |= vertex.clip[0] >= w;
+        }
+    }
+    w > 0.0 && left && right
+}
+
+/// A polygon of a picture drawn across the screen (`flat_across_screen`),
+/// clipped to the DS's view, and reflected at its left and right edges and
+/// clipped to the widescreen columns beyond them: column -1 - i shows
+/// column i, column 256 + i column 255 - i.
+fn mirrored_parts(vertices: &[Vertex]) -> [Vec<Vertex>; 3] {
+    let reach = reach([0, 0, 255, 191], true);
+    // `side` is -1 for the left edge (x = -w) and 1 for the right (x = w).
+    let reflected = |side: f64| {
+        // Reversed, so that the reflection faces the same way.
+        let vertices: Vec<Vertex> = vertices
+            .iter()
+            .rev()
+            .map(|vertex| {
+                let mut vertex = *vertex;
+                vertex.clip[0] = side * 2.0 * vertex.clip[3] - vertex.clip[0];
+                vertex
+            })
+            .collect();
+        let vertices = clip_polygon(&vertices, reach);
+        clip_plane(&vertices, |clip| side * clip[0] - clip[3])
+    };
+    [clip_polygon(vertices, 1.0), reflected(-1.0), reflected(1.0)]
 }
 
 /// Triangles for the GPU rasterizer, with the list's polygons part way to
@@ -1792,23 +1864,33 @@ fn plane_distance(c: [f64; 4], plane: usize, reach: f64) -> f64 {
 fn clip_polygon(input: &[Vertex], reach: f64) -> Vec<Vertex> {
     let mut vertices = input.to_vec();
     for plane in 0..6 {
-        let old = std::mem::take(&mut vertices);
-        if old.is_empty() {
+        if vertices.is_empty() {
             break;
         }
-        let mut previous = *old.last().unwrap();
-        let mut pd = plane_distance(previous.clip, plane, reach);
-        for current in old {
-            let cd = plane_distance(current.clip, plane, reach);
-            if (pd < 0.0) != (cd < 0.0) {
-                vertices.push(previous.lerp(current, pd / (pd - cd)));
-            }
-            if cd >= 0.0 {
-                vertices.push(current);
-            }
-            previous = current;
-            pd = cd;
+        vertices = clip_plane(&vertices, |clip| plane_distance(clip, plane, reach));
+    }
+    vertices
+}
+
+/// The part of a polygon on the side of a plane where `distance` is not
+/// negative.
+fn clip_plane(input: &[Vertex], distance: impl Fn([f64; 4]) -> f64) -> Vec<Vertex> {
+    let mut vertices = Vec::with_capacity(input.len() + 1);
+    let Some(&last) = input.last() else {
+        return vertices;
+    };
+    let mut previous = last;
+    let mut pd = distance(previous.clip);
+    for &current in input {
+        let cd = distance(current.clip);
+        if (pd < 0.0) != (cd < 0.0) {
+            vertices.push(previous.lerp(current, pd / (pd - cd)));
         }
+        if cd >= 0.0 {
+            vertices.push(current);
+        }
+        previous = current;
+        pd = cd;
     }
     vertices
 }
@@ -3144,6 +3226,55 @@ mod tests {
         // only in the wide render.
         assert_eq!(wide[96 * columns + WIDE_EXTRA + 278].alpha, 31);
         assert_eq!(wide[96 * columns + WIDE_EXTRA + 300].alpha, 0);
+    }
+
+    #[test]
+    fn widescreen_reflects_a_flat_picture_across_the_screen_at_its_edges() {
+        let mut g = Geometry {
+            wide: true,
+            ..Default::default()
+        };
+        // A red quad, front faces only, across the screen and a little
+        // past both sides (x -1.05 to 1.05), with nothing in perspective.
+        command(&mut g, 0x29, &[(31 << 16) | 0x80]);
+        command(&mut g, 0x40, &[1]);
+        command(&mut g, 0x20, &[31]);
+        vertex(&mut g, -4301, -4096, 0);
+        vertex(&mut g, 4301, -4096, 0);
+        vertex(&mut g, 4301, 4096, 0);
+        vertex(&mut g, -4301, 4096, 0);
+        command(&mut g, 0x41, &[]);
+        // A blue triangle in front of it at the left edge: DS columns 0 to
+        // 19 on row 96.
+        command(&mut g, 0x29, &[(31 << 16) | 0xc0]);
+        command(&mut g, 0x40, &[0]);
+        command(&mut g, 0x20, &[31 << 10]);
+        vertex(&mut g, -4096, -2048, -2048);
+        vertex(&mut g, -3482, 0, -2048);
+        vertex(&mut g, -4096, 2048, -2048);
+        command(&mut g, 0x41, &[]);
+        command(&mut g, 0x50, &[0]);
+        g.vblank();
+        let columns = WIDTH + 2 * WIDE_EXTRA;
+        let narrow = g.render(&io(), &Vram::new());
+        let wide = g.render_wide(&io(), &Vram::new());
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let (a, b) = (wide[y * columns + WIDE_EXTRA + x], narrow[y * WIDTH + x]);
+                assert_eq!((a.color, a.alpha), (b.color, b.alpha), "pixel {x},{y}");
+            }
+        }
+        let side = |x: i32, y: usize| {
+            let pixel = wide[y * columns + (WIDE_EXTRA as i32 + x) as usize];
+            (pixel.color, pixel.alpha)
+        };
+        // Column -1 - i shows column i, and 256 + i column 255 - i, all
+        // the way out, rather than the quad stopping 6 columns out.
+        assert_eq!(side(-10, 96), (31 << 10, 31));
+        assert_eq!(side(-40, 96), (31, 31));
+        assert_eq!(side(-43, 0), (31, 31));
+        assert_eq!(side(256 + 30, 96), (31, 31));
+        assert_eq!(side(256 + 42, 191), (31, 31));
     }
 
     #[test]
