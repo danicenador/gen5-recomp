@@ -17,12 +17,44 @@ struct Params {
     padding: vec2<u32>,
     // MASTER_BRIGHT of the top and bottom screens.
     brightness: vec4<u32>,
+    // The 3D layer's DISP3DCNT, FOG_COLOR and FOG_OFFSET.
+    fog: vec4<u32>,
+    // FOG_TABLE, four entries to a word.
+    fog_table: array<vec4<u32>, 2>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var composed: texture_2d<u32>;
 @group(0) @binding(2) var layer_color: texture_2d<f32>;
 @group(0) @binding(3) var layer_alpha: texture_2d<f32>;
+@group(0) @binding(4) var layer_fog: texture_2d<f32>;
+@group(0) @binding(5) var layer_depth: texture_depth_2d;
+
+fn fog_entry(index: f32) -> f32 {
+    let n = u32(clamp(index, 0.0, 31.0));
+    return f32((params.fog_table[n / 16u][(n / 4u) % 4u] >> ((n % 4u) * 8u)) & 0x7Fu);
+}
+
+// Follows `nds::gpu3d::Fog::density`: 0 for none to 128 for full.
+fn fog_density(depth: f32) -> u32 {
+    let shift = (params.fog.x >> 8u) & 15u;
+    let position = (depth * 32767.0 - f32(params.fog.z)) * f32(1u << shift) / 1024.0;
+    var density: f32;
+    if position < 0.0 {
+        density = fog_entry(0.0);
+    } else if position >= 32.0 {
+        density = fog_entry(31.0);
+    } else {
+        let index = floor(position);
+        let fraction = position - index;
+        density = fog_entry(index - 1.0) * (1.0 - fraction) + fog_entry(index) * fraction;
+    }
+    let d = u32(density);
+    if d >= 127u {
+        return 128u;
+    }
+    return d;
+}
 
 @vertex
 fn screen_vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
@@ -120,10 +152,19 @@ fn screen_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<
         let sx = i32(floor(position.x + f32(scroll) * scale));
         if sx >= 0 && sx < i32(params.width) {
             let at = vec2<u32>(u32(sx), y % params.height);
-            let alpha = u32(round(textureLoad(layer_alpha, at, 0).x * 31.0));
+            var alpha = u32(round(textureLoad(layer_alpha, at, 0).x * 31.0));
+            let layer = textureLoad(layer_color, at, 0);
+            var c = vec3<u32>(clamp(round(layer.xyz / max(layer.w, 1e-6) * 31.0), vec3<f32>(0.0), vec3<f32>(31.0)));
+            if (params.fog.x & 0x80u) != 0u && textureLoad(layer_fog, at, 0).x > 0.5 {
+                let density = fog_density(textureLoad(layer_depth, at, 0));
+                let fog = params.fog.y;
+                if (params.fog.x & 0x40u) == 0u {
+                    let fog_rgb = vec3<u32>(fog & 31u, (fog >> 5u) & 31u, (fog >> 10u) & 31u);
+                    c = (fog_rgb * density + c * (128u - density)) / 128u;
+                }
+                alpha = (((fog >> 16u) & 31u) * density + alpha * (128u - density)) / 128u;
+            }
             if alpha != 0u {
-                let layer = textureLoad(layer_color, at, 0);
-                let c = vec3<u32>(clamp(round(layer.xyz / max(layer.w, 1e-6) * 31.0), vec3<f32>(0.0), vec3<f32>(31.0)));
                 color = resolve(record, c.x | (c.y << 5u) | (c.z << 10u), alpha);
             }
         }

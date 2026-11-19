@@ -15,7 +15,10 @@
 //! DS alpha (the most opaque polygon drawn, as on hardware) is a second
 //! target blended with `Max`. Translucent polygon IDs live in the stencil
 //! buffer: opaque pixels store 64, translucent ones their ID, and a
-//! translucent polygon does not draw over its own ID.
+//! translucent polygon does not draw over its own ID. Fog flags are a third
+//! target, which translucent polygons blend with `Min` so that one without
+//! fog clears the flag; the screens apply fog from them and the depth
+//! buffer as they compose the 3D layer.
 //!
 //! In widescreen the 3D layer and the top screen are `extra` columns wider
 //! on each side (`ScaledFrame::extra`), and the output is that wide, with
@@ -23,12 +26,14 @@
 
 use crate::Result;
 use crate::nds::gpu2d::{HEIGHT, ScaledFrame, WIDTH};
-use crate::nds::gpu3d::{AlphaTest, Batch, DisplayList, Matched, Scene, SceneVertex};
+use crate::nds::gpu3d::{AlphaTest, Batch, DisplayList, Fog, Matched, Scene, SceneVertex};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const ALPHA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+/// Each pixel's fog flag (see `gpu3d::Fog`): 1 where fog applies.
+const FOG_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
 /// Both screens, stacked. Written raw; the window samples it through an
 /// sRGB view when its surface is sRGB, as it does with software frames.
@@ -55,6 +60,10 @@ struct ScreenUniform {
     span: f32,
     padding: [u32; 2],
     brightness: [u32; 4],
+    /// DISP3DCNT, FOG_COLOR and FOG_OFFSET of the 3D layer, and FOG_TABLE
+    /// four entries to a word.
+    fog: [u32; 4],
+    fog_table: [u32; 8],
 }
 
 /// What `set_frame` keeps for drawing the frame, perhaps several times.
@@ -72,6 +81,8 @@ struct ShownLayer {
     clear_color: u16,
     clear_alpha: u8,
     clear_depth: f32,
+    clear_fog: bool,
+    fog: Fog,
 }
 
 /// Everything sized by the scale and the width.
@@ -80,6 +91,7 @@ struct Targets {
     extra: usize,
     color: wgpu::TextureView,
     alpha: wgpu::TextureView,
+    fog: wgpu::TextureView,
     depth: wgpu::TextureView,
     output: wgpu::Texture,
     output_view: wgpu::TextureView,
@@ -257,6 +269,8 @@ impl Renderer {
                 texture_entry(1, wgpu::TextureSampleType::Uint),
                 texture_entry(2, wgpu::TextureSampleType::Float { filterable: false }),
                 texture_entry(3, wgpu::TextureSampleType::Float { filterable: false }),
+                texture_entry(4, wgpu::TextureSampleType::Float { filterable: false }),
+                texture_entry(5, wgpu::TextureSampleType::Depth),
             ],
         });
         let screen_pipeline_layout =
@@ -346,15 +360,29 @@ impl Renderer {
                 &[],
             )
             .create_view(&Default::default());
-            let depth = texture(
+            let fog = texture(
+                device,
+                "scaled 3D fog flags",
+                size,
+                FOG_FORMAT,
+                attachment,
+                &[],
+            )
+            .create_view(&Default::default());
+            // Fog reads the depth buffer once the list is drawn.
+            let depth_texture = texture(
                 device,
                 "scaled 3D depth",
                 size,
                 DEPTH_FORMAT,
-                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                attachment,
                 &[],
-            )
-            .create_view(&Default::default());
+            );
+            let depth = depth_texture.create_view(&Default::default());
+            let depth_only = depth_texture.create_view(&wgpu::TextureViewDescriptor {
+                aspect: wgpu::TextureAspect::DepthOnly,
+                ..Default::default()
+            });
             let output = texture(
                 device,
                 "scaled screens",
@@ -384,6 +412,14 @@ impl Renderer {
                         binding: 3,
                         resource: wgpu::BindingResource::TextureView(&alpha),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&fog),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&depth_only),
+                    },
                 ],
             });
             self.targets = Some(Targets {
@@ -391,6 +427,7 @@ impl Renderer {
                 extra,
                 color,
                 alpha,
+                fog,
                 depth,
                 output,
                 output_view,
@@ -430,6 +467,16 @@ impl Renderer {
                 depth_fail_op: wgpu::StencilOperation::Keep,
                 pass_op: wgpu::StencilOperation::Replace,
             };
+            // A translucent polygon without fog clears the fog flag of
+            // what is under it; one with fog keeps it.
+            let fog_blend = translucent.then_some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Min,
+                },
+                alpha: wgpu::BlendComponent::REPLACE,
+            });
             let (color_blend, alpha_blend) = if translucent {
                 let over = wgpu::BlendComponent {
                     src_factor: wgpu::BlendFactor::One,
@@ -502,6 +549,11 @@ impl Renderer {
                         Some(wgpu::ColorTargetState {
                             format: ALPHA_FORMAT,
                             blend: alpha_blend,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: FOG_FORMAT,
+                            blend: fog_blend,
                             write_mask: wgpu::ColorWrites::ALL,
                         }),
                     ],
@@ -604,6 +656,8 @@ impl Renderer {
                 clear_color: layer.scene.clear_color,
                 clear_alpha: layer.scene.clear_alpha,
                 clear_depth: layer.scene.clear_depth,
+                clear_fog: layer.scene.clear_fog,
+                fog: layer.scene.fog,
             }),
         };
     }
@@ -634,6 +688,7 @@ impl Renderer {
         let size = (size.0.max(1), size.1.max(1));
         let layer = self.shown.layer.as_ref();
         let extra = self.shown.extra;
+        let fog = layer.map(|layer| layer.fog).unwrap_or_default();
         let span = if extra == 0 {
             WIDTH as f32
         } else {
@@ -653,6 +708,10 @@ impl Renderer {
                 0,
                 0,
             ],
+            fog: [u32::from(fog.control), fog.color, u32::from(fog.offset), 0],
+            fog_table: std::array::from_fn(|i| {
+                u32::from_le_bytes(std::array::from_fn(|j| fog.table[i * 4 + j]))
+            }),
         };
         self.queue
             .write_buffer(&self.screen_uniform, 0, bytemuck::bytes_of(&uniform));
@@ -712,12 +771,26 @@ impl Renderer {
                             store: wgpu::StoreOp::Store,
                         },
                     }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.fog,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: f64::from(u8::from(scene.clear_fog)),
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
                 ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &targets.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(scene.clear_depth),
-                        store: wgpu::StoreOp::Discard,
+                        store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(64),

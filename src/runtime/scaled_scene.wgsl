@@ -178,6 +178,8 @@ struct FragmentOut {
     @location(0) color: vec4<f32>,
     // The DS pixel alpha, out of 31.
     @location(1) alpha: vec4<f32>,
+    // The fog flag: POLYGON_ATTR bit 15.
+    @location(2) fog: vec4<f32>,
     @builtin(frag_depth) depth: f32,
 };
 
@@ -230,6 +232,7 @@ fn scene_fragment(in: VertexOut) -> FragmentOut {
     var out: FragmentOut;
     out.color = vec4<f32>(c * weight, weight);
     out.alpha = vec4<f32>(f32(alpha) / 31.0, 0.0, 0.0, 0.0);
+    out.fog = vec4<f32>(f32((attr >> 15u) & 1u), 0.0, 0.0, 0.0);
     if scene.w_buffer != 0u {
         out.depth = clamp(in.w / 4096.0, 0.0, 1.0);
     } else {

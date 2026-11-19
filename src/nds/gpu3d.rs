@@ -1500,8 +1500,11 @@ impl Geometry {
             columns * HEIGHT
         ];
         // Only a previously drawn translucent polygon suppresses another
-        // translucent polygon with the same ID; opaque IDs do not.
-        let mut ids = vec![64; columns * HEIGHT];
+        // translucent polygon with the same ID; opaque IDs do not. Each
+        // pixel's fog flag (`FOG_FLAG`) is kept with its ID; the rear
+        // plane's is CLEAR_COLOR bit 15.
+        let clear_fog = if clear & 0x8000 != 0 { FOG_FLAG } else { 0 };
+        let mut ids = vec![64 | clear_fog; columns * HEIGHT];
         let state = RenderState::read(io, list.render_w);
         // The DS's own view: display capture and native-resolution screens
         // show exactly the screen's 256 columns. A wide render keeps what
@@ -1510,26 +1513,35 @@ impl Geometry {
         if wide {
             triangles = triangles.into_iter().map(Triangle::widened).collect();
         }
-        if triangles.is_empty() {
-            return pixels;
-        }
         // Every pixel only depends on the polygons drawn over it, in order,
         // so bands of rows render in parallel with the same result.
-        pixels
-            .par_chunks_mut(BAND_ROWS * columns)
-            .zip(depths.par_chunks_mut(BAND_ROWS * columns))
-            .zip(ids.par_chunks_mut(BAND_ROWS * columns))
-            .enumerate()
-            .for_each(|(index, ((pixels, depths), ids))| {
-                let top = index * BAND_ROWS;
-                let bottom = top + pixels.len() / columns;
-                for triangle in &triangles {
-                    let rows = triangle.min_y.max(top)..triangle.max_y.min(bottom);
-                    if !rows.is_empty() {
-                        triangle.draw(rows, top, &state, vram, pixels, depths, ids);
+        if !triangles.is_empty() {
+            pixels
+                .par_chunks_mut(BAND_ROWS * columns)
+                .zip(depths.par_chunks_mut(BAND_ROWS * columns))
+                .zip(ids.par_chunks_mut(BAND_ROWS * columns))
+                .enumerate()
+                .for_each(|(index, ((pixels, depths), ids))| {
+                    let top = index * BAND_ROWS;
+                    let bottom = top + pixels.len() / columns;
+                    for triangle in &triangles {
+                        let rows = triangle.min_y.max(top)..triangle.max_y.min(bottom);
+                        if !rows.is_empty() {
+                            triangle.draw(rows, top, &state, vram, pixels, depths, ids);
+                        }
                     }
+                });
+        }
+        let fog = Fog::read(io);
+        if fog.enabled() {
+            // The W-buffer holds w, which fills its 24 bits at 4096.
+            let scale = if list.render_w { 1.0 / 4096.0 } else { 1.0 };
+            for ((pixel, &depth), &id) in pixels.iter_mut().zip(&depths).zip(&ids) {
+                if id & FOG_FLAG != 0 {
+                    *pixel = fog.apply(*pixel, depth * scale);
                 }
-            });
+            }
+        }
         pixels
     }
 
@@ -1543,6 +1555,8 @@ impl Geometry {
             clear_color: clear as u16 & 0x7fff,
             clear_alpha: ((clear >> 16) & 31) as u8,
             clear_depth: f32::from(io.get16(0x0400_0354) & 0x7fff) / 32767.0,
+            clear_fog: clear & 0x8000 != 0,
+            fog: Fog::read(io),
             control: state.control,
             alpha_ref: state.alpha_ref,
             toon: state.toon,
@@ -1748,6 +1762,9 @@ pub struct Scene {
     pub clear_color: u16,
     pub clear_alpha: u8,
     pub clear_depth: f32,
+    /// Whether fog covers the rear plane (CLEAR_COLOR bit 15).
+    pub clear_fog: bool,
+    pub fog: Fog,
     /// DISP3DCNT.
     pub control: u16,
     pub alpha_ref: u8,
@@ -1828,6 +1845,87 @@ impl RenderState {
             alpha_ref: io.get8(0x0400_0340),
             toon: std::array::from_fn(|i| io.get16(0x0400_0380 + i as u32 * 2)),
             w_buffer,
+        }
+    }
+}
+
+/// A pixel's fog flag, kept beside its polygon ID while rasterizing: set by
+/// an opaque polygon with fog enabled (POLYGON_ATTR bit 15), cleared by an
+/// opaque or translucent polygon without it.
+const FOG_FLAG: u32 = 1 << 8;
+
+/// Fog (DISP3DCNT bit 7), applied to the finished 3D layer: each pixel
+/// whose fog flag is set moves toward FOG_COLOR, and its alpha toward
+/// FOG_COLOR's (only the alpha with DISP3DCNT bit 6), by a density read
+/// from its depth. Gyms use it for darkness: Driftveil's is fogged black
+/// all over but for a disc around the player, whose translucent polygon
+/// has fog disabled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fog {
+    /// DISP3DCNT: enable (bit 7), alpha only (bit 6), FOG_SHIFT (8-11).
+    pub control: u16,
+    /// FOG_COLOR: the color, and the alpha in bits 16-20.
+    pub color: u32,
+    /// FOG_OFFSET, in the depth buffer's top 15 bits.
+    pub offset: u16,
+    /// FOG_TABLE: densities from 0 to 127.
+    pub table: [u8; 32],
+}
+
+impl Fog {
+    fn read(io: &Io) -> Self {
+        Self {
+            control: io.get16(0x0400_0060),
+            color: io.get32(0x0400_0358),
+            offset: io.get16(0x0400_035C) & 0x7fff,
+            table: std::array::from_fn(|i| io.get8(0x0400_0360 + i as u32) & 0x7f),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.control & 0x80 != 0
+    }
+
+    /// The density at `depth` (0 near to 1 far, as the depth buffer
+    /// stores it): 0 for none to 128 for full. The table's entries are at
+    /// depths FOG_OFFSET + FOG_STEP * (1 to 32), FOG_STEP being 0x400 >>
+    /// FOG_SHIFT, with linear steps between them; nearer than the first
+    /// the first applies, beyond the last the last.
+    pub fn density(&self, depth: f64) -> u32 {
+        let shift = (self.control >> 8) & 15;
+        let position =
+            (depth * 32767.0 - f64::from(self.offset)) * f64::from(1u32 << shift) / 1024.0;
+        let entry = |index: f64| f64::from(self.table[index.clamp(0.0, 31.0) as usize]);
+        let density = if position < 0.0 {
+            entry(0.0)
+        } else if position >= 32.0 {
+            entry(31.0)
+        } else {
+            let index = position.floor();
+            let fraction = position - index;
+            entry(index - 1.0) * (1.0 - fraction) + entry(index) * fraction
+        } as u32;
+        if density >= 127 { 128 } else { density }
+    }
+
+    /// A pixel at `depth` (see `density`) with fog.
+    pub fn apply(&self, pixel: Pixel, depth: f64) -> Pixel {
+        let density = self.density(depth);
+        let mix = |fog: u32, value: u32| (fog * density + value * (128 - density)) / 128;
+        let color = if self.control & 0x40 != 0 {
+            pixel.color
+        } else {
+            [0, 5, 10].into_iter().fold(0, |color, shift| {
+                let channel = mix(
+                    self.color >> shift & 31,
+                    u32::from(pixel.color >> shift & 31),
+                );
+                color | (channel as u16) << shift
+            })
+        };
+        Pixel {
+            color,
+            alpha: mix(self.color >> 16 & 31, u32::from(pixel.alpha)) as u8,
         }
     }
 }
@@ -2170,6 +2268,11 @@ impl<'a> Triangle<'a> {
         let mode = (polygon.attr >> 4) & 3;
         let depth_equal = polygon.attr & (1 << 14) != 0;
         let translucent_depth = polygon.attr & (1 << 11) != 0;
+        let fog = if polygon.attr & (1 << 15) != 0 {
+            FOG_FLAG
+        } else {
+            0
+        };
         let textured = control & 1 != 0;
         for y in rows {
             for x in self.span(y) {
@@ -2254,7 +2357,7 @@ impl<'a> Triangle<'a> {
                     _ => std::array::from_fn(|i| texture_color[i] * vertex_color[i] / 31.0),
                 };
                 if alpha < 31 {
-                    if ids[at] == id {
+                    if ids[at] & !FOG_FLAG == id {
                         continue;
                     }
                     if control & 8 != 0 && pixels[at].alpha != 0 {
@@ -2270,13 +2373,15 @@ impl<'a> Triangle<'a> {
                             alpha,
                         };
                     }
-                    ids[at] = id;
+                    // A translucent polygon only keeps the fog flag of
+                    // what is under it, or clears it.
+                    ids[at] = id | (ids[at] & fog);
                 } else {
                     pixels[at] = Pixel {
                         color: pack(color),
                         alpha,
                     };
-                    ids[at] = 64;
+                    ids[at] = 64 | fog;
                 }
                 if alpha == 31 || translucent_depth {
                     depths[at] = depth;
@@ -3065,6 +3170,122 @@ mod tests {
                 let two = &doubled[((2 * y + dy) * 512 + 2 * x + dx) * 4..][..4];
                 assert_eq!(one, two, "pixel {x},{y}");
             }
+        }
+    }
+
+    /// Fog over everything: DISP3DCNT with alpha blending, FOG_SHIFT 10,
+    /// full density from the first step, in `color` with alpha 31.
+    fn full_fog(io: &mut Io, color: u16) {
+        io.set16(0x0400_0060, 0x80 | 8 | (10 << 8));
+        io.set32(0x0400_0358, u32::from(color) | (31 << 16));
+        io.set16(0x0400_035C, 0);
+        for i in 0..32 {
+            io.set8(0x0400_0360 + i, 127);
+        }
+    }
+
+    /// An opaque red triangle with fog at z 0.25, and a translucent blue
+    /// one (alpha 15) in front of its left part, with fog if `fogged`.
+    fn fog_scene(g: &mut Geometry, fogged: bool) {
+        command(g, 0x29, &[(31 << 16) | (1 << 15) | 0xc0]);
+        command(g, 0x40, &[0]);
+        command(g, 0x20, &[31]);
+        vertex(g, -2048, -2048, 1024);
+        vertex(g, 2048, -2048, 1024);
+        vertex(g, 0, 2048, 1024);
+        command(g, 0x41, &[]);
+        let fog = if fogged { 1 << 15 } else { 0 };
+        command(g, 0x29, &[(15 << 16) | fog | 0xc0 | (1 << 24)]);
+        command(g, 0x40, &[0]);
+        command(g, 0x20, &[31 << 10]);
+        vertex(g, -4096, -1024, 0);
+        vertex(g, 1024, -1024, 0);
+        vertex(g, 1024, 3072, 0);
+        command(g, 0x41, &[]);
+        command(g, 0x50, &[0]);
+        g.vblank();
+    }
+
+    #[test]
+    fn fog_density_follows_the_table_between_its_steps() {
+        let fog = |shift: u16, offset: u16, table: [u8; 32]| Fog {
+            control: 0x80 | (shift << 8),
+            color: 0,
+            offset,
+            table,
+        };
+        let ramp: [u8; 32] = std::array::from_fn(|i| 4 * i as u8);
+        // FOG_SHIFT 0: the entries are 1024 apart, the first at 1024.
+        let depth = |depth15: f64| depth15 / 32767.0;
+        assert_eq!(fog(0, 0, ramp).density(0.0), 0);
+        // 2.6 steps in: 40% of entry 1 (4), 60% of entry 2 (8).
+        assert_eq!(fog(0, 0, ramp).density(depth(2.6 * 1024.0)), 6);
+        // Beyond the last entry (FOG_SHIFT 1 ends half way), the last one.
+        assert_eq!(fog(1, 0, ramp).density(1.0), 124);
+        // Nearer than FOG_OFFSET, the first entry.
+        assert_eq!(fog(0, 1000, [9; 32]).density(depth(500.0)), 9);
+        // FOG_SHIFT 10: a step of 1; 127 is full fog.
+        assert_eq!(fog(10, 0, [127; 32]).density(0.5), 128);
+    }
+
+    #[test]
+    fn fog_covers_fogged_pixels_unless_a_translucent_polygon_without_it_is_in_front() {
+        for (fogged, rear) in [(false, false), (true, false), (false, true)] {
+            let mut g = Geometry::default();
+            fog_scene(&mut g, fogged);
+            let mut io = io();
+            full_fog(&mut io, 31 << 5);
+            // A transparent rear plane, with fog if `rear`.
+            io.set32(0x0400_0350, if rear { 0x8000 } else { 0 });
+            let pixels = g.render(&io, &Vram::new());
+            let at = |x: usize, y: usize| {
+                let pixel = pixels[y * WIDTH + x];
+                (pixel.color, pixel.alpha)
+            };
+            let green = (31 << 5, 31);
+            // The red triangle alone.
+            assert_eq!(at(165, 110), green);
+            // Under the translucent triangle.
+            if fogged {
+                assert_eq!(at(120, 110), green);
+            } else {
+                let (color, alpha) = at(120, 110);
+                assert_eq!((color >> 5 & 31, alpha), (0, 31));
+            }
+            // The rear plane.
+            assert_eq!(at(20, 20), if rear { green } else { (0, 0) });
+        }
+    }
+
+    #[test]
+    fn gpu_renderer_fogs_as_the_software_one_does() {
+        let Ok(mut gpu) = crate::runtime::scaled::Headless::new() else {
+            eprintln!("no graphics adapter; skipping");
+            return;
+        };
+        for (fogged, rear) in [(false, false), (true, true)] {
+            let mut io = io();
+            let mut memory = super::super::memory::Memory::new();
+            fog_scene(&mut io.geometry, fogged);
+            io.advance_to_vblank();
+            io.set16(0x0400_0304, 0x800a);
+            io.set32(0x0400_0000, 0x10108);
+            full_fog(&mut io, 0x4210);
+            io.set32(0x0400_0350, if rear { 0x8000 } else { 0 });
+            memory.palette[0..2].copy_from_slice(&(31u16 << 5).to_le_bytes());
+            let software = super::super::gpu2d::render(&io, &memory);
+            let scaled = super::super::gpu2d::render_scaled(&io, &memory);
+            let (_, _, pixels) = gpu.render(&scaled, 1).unwrap();
+            let differing = software
+                .top
+                .chunks(4)
+                .zip(pixels.chunks(4))
+                .filter(|(a, b)| (0..3).any(|i| a[i].abs_diff(b[i]) > 9))
+                .count();
+            assert_eq!(differing, 0, "fogged {fogged}, rear {rear}");
+            // Fog shows: the red triangle alone is gray.
+            let pixel = &pixels[(110 * 256 + 165) * 4..][..3];
+            assert_eq!(pixel, [132, 132, 132]);
         }
     }
 

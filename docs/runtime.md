@@ -34,7 +34,12 @@ The `nds` module provides:
   the shader, translucent polygon IDs in the stencil buffer). Matrix and
   geometry-test results are readable by the game. Commands run synchronously
   except buffer swaps, which wait for vblank; FIFO timing is approximate.
-  Fog, edge marking, antialiasing, wireframe, shadow polygons and rear-plane
+  Fog follows the hardware: each pixel keeps a fog flag (set by opaque
+  polygons with fog enabled, cleared by any polygon without it, the rear
+  plane's from CLEAR_COLOR), and flagged pixels move toward the fog color
+  and alpha by the density table at their depth. Driftveil's gym is dark
+  this way, and the sewers and Route 4's sandstorm haze use it too.
+  Edge marking, antialiasing, wireframe, shadow polygons and rear-plane
   bitmaps remain unsupported. Lighting and depth are functional approximations rather than
   hardware-exact arithmetic.
 - `gpu2d::capture`: frame-based display capture into LCDC VRAM, from engine A,

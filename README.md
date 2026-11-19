@@ -20,7 +20,7 @@ checkpoints in `debug/checkpoints/white2/` go through the first gym, Virbank
 Complex and Route 20 to Castelia City, and the game saves and reloads. Music
 and sound effects play, and the 3D can be drawn above the DS resolution, in
 widescreen and at the monitor's refresh rate. Some 3D effects are still
-missing (fog, edge marking, shadow polygons), and some geometry and shadows
+missing (edge marking, shadow polygons), and some geometry and shadows
 show artifacts. Black 2 shares White 2's code but is less tested; Black and
 White are analyzed but untested. Windows is the only platform for now.
 
