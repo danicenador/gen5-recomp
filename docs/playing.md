@@ -229,7 +229,11 @@ animations speed up, but it leaves three things at normal speed:
 
 The window shows about one frame per DS frame of real time while
 fast-forwarding, which leaves more time for the game; how fast it can go
-depends on the host. `GEN5_SPEED=N` starts `run` fast-forwarding at N, and
+depends on the host. Where the host cannot keep up (drawing at a high
+frame rate takes time from the game too), the game runs as fast as it
+can and its frames are timed by when they really come, so drawing between
+them stays smooth instead of catching up with them and standing still.
+`GEN5_SPEED=N` starts `run` fast-forwarding at N, and
 makes `boot` run as if fast-forwarding at N, counting each frame as 1/N of a
 DS frame of real time for sound and key repeat (or as a whole one where a
 key pressed in a menu away from the field runs it at normal speed), so

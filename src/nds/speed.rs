@@ -125,6 +125,33 @@ pub struct Pace {
 /// slow host) does not turn into a burst of sound or repeats.
 const MAX_STEP: Duration = Duration::from_nanos(4 * 16_715_646);
 
+/// How far behind its schedule the game may end a frame before the
+/// schedule starts to follow it (`next_deadline`).
+const BEHIND: Duration = Duration::from_nanos(16_715_646);
+
+/// When the frame after one due at `previous` is due, `interval` later,
+/// for a frame that ended at `now`.
+///
+/// A game that ends its frames more than `BEHIND` late cannot keep up:
+/// fast-forwarding on a host that is also drawing the window at a high
+/// frame rate, say, or after a stall. The schedule then moves a quarter of
+/// the way toward `BEHIND` before the frame's end each frame, so it
+/// follows the game's real pace, a few milliseconds further back, evened
+/// out over several frames (each frame's own cost varies, and those that
+/// are shown cost more). A sleep that overruns now and then only moves it
+/// by a fraction of the overrun. Kept to the schedule, frames came later
+/// and later until they were six DS frames late and it jumped ahead: the
+/// window, which runs at most four DS frames behind the newest frame
+/// (`runtime::pacing`), caught up with the frames and stood still several
+/// times a second, then skipped a tenth of a second.
+fn next_deadline(previous: Instant, now: Instant, interval: Duration) -> Instant {
+    let next = previous + interval;
+    match now.checked_sub(BEHIND) {
+        Some(late) if late > next => next + (late - next) / 4,
+        _ => next,
+    }
+}
+
 impl Pace {
     pub fn reset(&mut self) {
         self.next = Instant::now();
@@ -196,11 +223,7 @@ impl Pace {
         if !self.real_time {
             return now;
         }
-        // After a long stall carry on from now instead of catching up.
-        self.next += FRAME_TIME / step.factor;
-        if now > self.next && now - self.next > FRAME_TIME * 6 {
-            self.next = now;
-        }
+        self.next = next_deadline(self.next, now, FRAME_TIME / step.factor);
         self.next
     }
 
@@ -621,6 +644,54 @@ mod tests {
         assert_eq!(step.real_frames, 1.0);
         assert_eq!(step.sound_cycles, CYCLES_PER_FRAME);
         assert_eq!(pace.start(false).factor, 4);
+    }
+
+    #[test]
+    fn deadlines_follow_a_game_that_cannot_keep_up() {
+        let interval = FRAME_TIME / 4;
+        let start = Instant::now();
+        // Fast-forwarding at 4x on a host where each frame takes 6 ms,
+        // not 4.2, and the shown ones 7: the deadlines stay well within
+        // the four DS frames the window can run behind, never jump, and
+        // settle at the game's real pace, so the window always has a frame
+        // ahead of it to move toward.
+        let mut deadline = start;
+        let mut ended = start;
+        let mut gaps = Vec::new();
+        for frame in 0..400 {
+            ended += Duration::from_millis(if frame % 3 == 0 { 7 } else { 6 });
+            let next = next_deadline(deadline, ended, interval);
+            assert!(ended.duration_since(next) < FRAME_TIME * 2, "frame {frame}");
+            gaps.push(next.duration_since(deadline));
+            deadline = next;
+        }
+        assert!(gaps.iter().all(|&gap| gap < Duration::from_millis(7)));
+        let settled = &gaps[100..];
+        let (low, high) = (settled.iter().min().unwrap(), settled.iter().max().unwrap());
+        assert!(
+            *high - *low < Duration::from_micros(500),
+            "{low:?} to {high:?}"
+        );
+        // A game that keeps up keeps its steady deadlines, and a sleep
+        // that overruns by more than a DS frame now and then moves them
+        // by only a fraction of that.
+        let mut deadline = start;
+        for frame in 1..400u32 {
+            let due = start + interval * frame;
+            let ended = if frame % 20 == 0 {
+                due + FRAME_TIME * 3 / 2
+            } else {
+                due - Duration::from_millis(1)
+            };
+            let next = next_deadline(deadline, ended, interval);
+            let gap = next.duration_since(deadline);
+            if frame % 20 == 0 {
+                assert!(gap < interval + Duration::from_millis(3), "frame {frame}");
+            } else {
+                assert_eq!(gap, interval, "frame {frame}");
+            }
+            deadline = next;
+        }
     }
 
     /// The update count as the field leaves it (0 and 1 in turn) and as a
