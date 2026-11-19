@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Route 6",
+  "reproduction": "After defeating gym 5. 1 Battle away of Dewott evolving",
+  "source": "debug/runs/1795120148979361400-4160/history/frame-0000022369",
+  "frame": 22369,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
