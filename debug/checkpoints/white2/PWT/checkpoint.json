@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Pokemon World Tournament",
+  "reproduction": "Inside PWT",
+  "source": "debug/runs/1795466984444147900-16640/history/frame-0000014171",
+  "frame": 14171,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
