@@ -254,13 +254,14 @@ impl DisplayList {
                 motion[axis][motion[axis].len() / 2]
             })
         });
+        let partners = object_partners(self, next);
         let pairs: Vec<_> = self
             .polygons
             .iter()
             .map(|polygon| {
                 let id = identity(polygon.id);
                 let before = &earlier[&id];
-                later.get(&id).and_then(|candidates| {
+                let placed = later.get(&id).and_then(|candidates| {
                     if unique(polygon, &id) {
                         return Some(candidates[0]);
                     }
@@ -285,6 +286,14 @@ impl DisplayList {
                     let candidate = nearest_polygon(polygon, candidates, shift, tolerance)?;
                     let reverse = nearest_polygon(candidate, before, shift.map(|v| -v), tolerance)?;
                     (reverse.id == polygon.id).then_some(candidate)
+                });
+                // Repeated meshes neither placed: the copy in the object
+                // the polygon's object became (`object_partners`).
+                placed.or_else(|| {
+                    partners
+                        .get(&polygon.matrix)
+                        .and_then(|object| object.get(&id))
+                        .copied()
                 })
             })
             .collect();
@@ -635,6 +644,117 @@ fn nearest_polygon<'a>(
     (!ambiguous && tolerance.is_none_or(|limit| distance <= limit * limit))
         .then_some(best)
         .flatten()
+}
+
+/// Objects (the polygons drawn through one matrix) of one list paired with
+/// those of the next, for meshes that repeat across objects: a battle draws
+/// both platforms from one mesh, so each piece of a platform has a copy in
+/// the other. The camera's motion places such copies, but a battle's
+/// backdrop moves with the camera, so the motion most meshes agree on can
+/// be a Pokémon sprite growing as it comes out of its ball, which places
+/// neither platform; moved with it instead, a platform slid over the ground
+/// without its depth following and sank under it, so fast-forward, whose
+/// shown lists are a few game frames apart, lost the floor on frames in
+/// between. Each object pairs with the object of the next list holding the
+/// most of its meshes within reach (`pairs_with`), the nearest on screen
+/// among those holding as many, provided no other is nearly as near and no
+/// other object pairs with the same one. Objects that draw a mesh twice are
+/// left out, their copies told apart by the camera if at all, and so are
+/// those with a mesh drawn more or fewer times in the second list: with a
+/// copy added or gone, which one went where is anyone's guess. The map
+/// gives, per matrix of the first list, its meshes' polygons in the second.
+fn object_partners<'a>(
+    first: &'a DisplayList,
+    second: &'a DisplayList,
+) -> HashMap<Matrix, HashMap<PolygonId, &'a Polygon>> {
+    let (earlier, later) = (&first.polygons, &second.polygons);
+    let identity = |id: PolygonId| PolygonId {
+        occurrence: 0,
+        ..id
+    };
+    // Per matrix, each mesh's polygon, or None for a mesh drawn twice.
+    let group = |polygons: &'a [Polygon]| {
+        let mut objects: HashMap<Matrix, HashMap<PolygonId, Option<&'a Polygon>>> = HashMap::new();
+        for polygon in polygons {
+            objects
+                .entry(polygon.matrix)
+                .or_default()
+                .entry(identity(polygon.id))
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(polygon));
+        }
+        objects
+    };
+    let before = group(earlier);
+    let after = group(later);
+    let mut holders: HashMap<PolygonId, Vec<Matrix>> = HashMap::new();
+    for (matrix, meshes) in &after {
+        for id in meshes.keys() {
+            holders.entry(*id).or_default().push(*matrix);
+        }
+    }
+    let mut chosen: HashMap<Matrix, Matrix> = HashMap::new();
+    let mut taken: HashMap<Matrix, usize> = HashMap::new();
+    for (matrix, meshes) in &before {
+        if meshes.values().any(Option::is_none)
+            || meshes
+                .keys()
+                .any(|id| first.submitted.get(id) != second.submitted.get(id))
+        {
+            continue;
+        }
+        let mut candidates: Vec<Matrix> = meshes
+            .keys()
+            .filter_map(|id| holders.get(id))
+            .flatten()
+            .copied()
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        // (meshes within reach, mean distance on screen, matrix)
+        let mut scores: Vec<(usize, f64, Matrix)> = candidates
+            .into_iter()
+            .filter_map(|candidate| {
+                let mut reached = 0;
+                let mut distance = 0.0;
+                for (id, polygon) in meshes {
+                    let (Some(polygon), Some(Some(other))) = (polygon, after[&candidate].get(id))
+                    else {
+                        continue;
+                    };
+                    if pairs_with(polygon, other) {
+                        let delta = screen_motion(polygon, other);
+                        reached += 1;
+                        distance += delta[0].hypot(delta[1]);
+                    }
+                }
+                (reached > 0).then(|| (reached, distance / reached as f64, candidate))
+            })
+            .collect();
+        scores.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.total_cmp(&b.1)));
+        let Some(&(reached, distance, best)) = scores.first() else {
+            continue;
+        };
+        let close_second = scores.get(1).is_some_and(|&(other, other_distance, _)| {
+            other == reached && other_distance <= distance * 2.0 + 1.0
+        });
+        if 2 * reached < meshes.len() || close_second {
+            continue;
+        }
+        chosen.insert(*matrix, best);
+        *taken.entry(best).or_default() += 1;
+    }
+    chosen
+        .into_iter()
+        .filter(|(_, partner)| taken[partner] == 1)
+        .map(|(matrix, partner)| {
+            let meshes = after[&partner]
+                .iter()
+                .filter_map(|(id, polygon)| Some((*id, (*polygon)?)))
+                .collect();
+            (matrix, meshes)
+        })
+        .collect()
 }
 
 /// Whether `before` can be drawn part way to `after`: the same shape, in
@@ -2718,6 +2838,40 @@ mod tests {
             left_edges(&half),
             left_edges(&shown.build(None, 0.0, false))
         );
+    }
+
+    #[test]
+    fn copies_of_a_mesh_follow_their_own_objects_when_the_camera_misleads() {
+        // Two copies of one mesh far apart (a battle's two platforms), which
+        // move 205 to the right, and two unique meshes that agree on moving
+        // 600 (a sprite growing), so the camera's motion places neither copy.
+        let list = |copies: &[i32], anchors: &[i32]| {
+            let mut g = Geometry::default();
+            command(&mut g, 0x10, &[2]);
+            for &x in copies {
+                command(&mut g, 0x15, &[]);
+                command(&mut g, 0x1c, &[x as u32, 0, 0]);
+                triangle(&mut g, 31, 0, 31, 0);
+            }
+            for (index, &x) in anchors.iter().enumerate() {
+                command(&mut g, 0x15, &[]);
+                command(&mut g, 0x1c, &[x as u32, 0, 0]);
+                triangle(&mut g, 31, 0, 31, 1 + index as u32);
+            }
+            command(&mut g, 0x50, &[0]);
+            g.vblank();
+            g.displayed.clone()
+        };
+        let shown = list(&[-1300, 1300], &[100, -100]);
+        let next = list(&[-1095, 1505], &[700, 500]);
+        let half = shown.build(Some(&next), 0.5, false);
+        assert_eq!(half.matched.matched, 4);
+        let mut edges = left_edges(&half);
+        edges.sort_by(f32::total_cmp);
+        // Each copy half way to itself, not moved with the anchors.
+        for (edge, expected) in edges.iter().zip([26.58, 70.25, 76.5, 107.83]) {
+            assert!((edge - expected).abs() < 0.1, "{edges:?}");
+        }
     }
 
     #[test]

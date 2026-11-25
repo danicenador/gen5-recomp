@@ -134,7 +134,11 @@ the game drew the paired scenery with: a static object's model-to-clip
 matrix changes only by the camera, so `before⁻¹ · after` is the camera's
 motion, and the motion most paired objects agree on wins over characters
 that move by themselves. Repeated identical meshes (stepping stones, gym
-flags, fence posts) pair with the copy where that motion takes them. A
+flags, fence posts) pair with the copy where that motion takes them, or,
+where that motion places them nowhere, with the copy in the object
+(the polygons drawn through one matrix) their own object became: a
+battle draws both platforms from one mesh, and its backdrop moves with
+the camera, so the motion most meshes agree on can be a sprite's. A
 sprite animated from a sheet, such as the walking player, picks each frame
 by texture coordinates; it pairs with the one polygon of the same shape in
 the next list whatever its texture coordinates. A polygon that still cannot
