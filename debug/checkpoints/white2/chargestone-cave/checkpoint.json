@@ -1,0 +1,10 @@
+{
+  "format": "gen5-debug-save-v1",
+  "rom_crc32": "95AB5437",
+  "game_code": "IRDO",
+  "description": "Chargestone Cave",
+  "reproduction": "Just inside the entrance, 4 Escape Ropes in the bag (5th item of Items). X, Bag, Escape Rope, Use: the rope spins the player out of the cave and lands them outside (issue #34).",
+  "source": "debug/runs/1795640372048843300-10924/history/frame-0000040425",
+  "frame": 40425,
+  "status": "manual-checkpoint; verify by loading Continue"
+}
