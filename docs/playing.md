@@ -147,15 +147,17 @@ speeches. The X menu loads no overlays of its own, so the runtime reads the
 game's field events instead (`src/nds/field_menu.rs`): the bottom screen
 stays up while the menu or any screen opened from it (the Pokédex, the
 trainer card, the save prompt, ...) is up, and drops once the menu closes,
-whether by B, by X or by itself after saving. L2 or Space still moves it at
-any time; the next scene change takes over again. On a controller, the right
+whether by B, by X or by itself after saving, or gives way to something on
+the field, such as an Escape Rope used from the bag. L2 or Space still moves
+it at any time; the next scene change takes over again. On a controller, the right
 stick moves a stylus over the raised bottom screen, shown as a ring, and
 pressing the stick in touches with it (the ring fills); it hides three
 seconds after it last moved. `GEN5_OVERLAY_LOG=path` writes, for `run` or
 `boot`, each frame at which the overlays in RAM change, with those loaded
-and unloaded, each frame at which the field menu opens or closes, and each
-frame at which the bottom screen's engine or layers change, for finding the
-overlays and layers of new scenes.
+and unloaded, each frame at which the field menu opens or closes or the
+field events running change (their functions, the running one first), and
+each frame at which the bottom screen's engine or layers change, for finding
+the overlays, events and layers of new scenes.
 
 ## Widescreen
 

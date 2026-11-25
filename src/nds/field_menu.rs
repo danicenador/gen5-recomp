@@ -4,10 +4,18 @@
 //! walking as a field event (`GMEVENT`, from `game_event.c`): a script, a
 //! warp, or the field menu. The game system keeps the event running now,
 //! and each event points to the one that started it, so the field menu is
-//! open exactly while the first event of that chain runs the field menu's
-//! function. That covers every screen opened from the menu (the Pokédex,
-//! the trainer card, the save prompt, ...), which come back to it, and it
-//! ends however the menu closes, by B or X or by itself after saving.
+//! open while the first event of that chain runs the field menu's function.
+//! That covers every screen opened from the menu (the Pokédex, the trainer
+//! card, the save prompt, ...), which come back to it, and it ends however
+//! the menu closes, by B or X or by itself after saving.
+//!
+//! The menu also stays first in the chain while it hands over to something
+//! that happens on the field: an Escape Rope used from the bag spins the
+//! player out of the cave, warps and lands them as events under the menu's,
+//! which ends only after that. The menu opens its screens through an event
+//! of its own overlay, while those actions run code from elsewhere, so the
+//! menu counts as closed once the event it started runs code outside its
+//! overlay.
 
 use super::memory::Memory;
 
@@ -46,6 +54,9 @@ pub struct FieldMenu {
     system_pointer: u32,
     /// The field menu's event function, with the Thumb bit.
     function: u32,
+    /// Where the field menu's overlay is in RAM: its first and last addresses
+    /// plus one.
+    overlay: (u32, u32),
 }
 
 impl FieldMenu {
@@ -72,7 +83,27 @@ impl FieldMenu {
         Some(Self {
             system_pointer,
             function: function | 1,
+            overlay: (overlay_base, overlay_base + overlay.len() as u32),
         })
+    }
+
+    /// The functions of the events running now, from the one running to
+    /// the first of its chain, for GEN5_OVERLAY_LOG.
+    pub fn chain(&self, ram: &[u8]) -> Vec<u32> {
+        let system = read32(ram, self.system_pointer);
+        let mut functions = Vec::new();
+        if !in_main_ram(system) {
+            return functions;
+        }
+        let mut event = read32(ram, system + SYSTEM_EVENT);
+        while functions.len() < MAX_DEPTH
+            && in_main_ram(event)
+            && read32(ram, event + EVENT_SYSTEM) == system
+        {
+            functions.push(read32(ram, event + EVENT_FUNCTION));
+            event = read32(ram, event + EVENT_PARENT);
+        }
+        functions
     }
 
     /// Whether the field menu is open, given main RAM. Anything that does
@@ -83,14 +114,19 @@ impl FieldMenu {
             return false;
         }
         let mut event = read32(ram, system + SYSTEM_EVENT);
+        // The function of the event the first one started, if any.
+        let mut started = None;
         for _ in 0..MAX_DEPTH {
             if !in_main_ram(event) || read32(ram, event + EVENT_SYSTEM) != system {
                 return false;
             }
             let parent = read32(ram, event + EVENT_PARENT);
             if parent == 0 {
-                return read32(ram, event + EVENT_FUNCTION) == self.function;
+                let (start, end) = self.overlay;
+                return read32(ram, event + EVENT_FUNCTION) == self.function
+                    && started.is_none_or(|function: u32| (start..end).contains(&(function & !1)));
             }
+            started = Some(read32(ram, event + EVENT_FUNCTION));
             event = parent;
         }
         false
@@ -136,7 +172,8 @@ mod tests {
         arm9[0x100..0x102].copy_from_slice(&0x4821_u16.to_le_bytes());
         arm9[0x102..0x10A].copy_from_slice(&SYSTEM_STORE);
         arm9[0x188..0x18C].copy_from_slice(&POINTER.to_le_bytes());
-        let mut overlay = vec![0; 0xB000];
+        // As long as White 2's ov012.
+        let mut overlay = vec![0; 0x1_E280];
         let at = (MENU - OVERLAY_BASE) as usize;
         overlay[at..at + MENU_EVENT_START.len()].copy_from_slice(&MENU_EVENT_START);
         (arm9, overlay)
@@ -162,6 +199,7 @@ mod tests {
             Some(FieldMenu {
                 system_pointer: POINTER,
                 function: MENU | 1,
+                overlay: (OVERLAY_BASE, OVERLAY_BASE + 0x1_E280),
             })
         );
         // Without the overlay, or with the pattern twice, there is no telling.
@@ -194,6 +232,19 @@ mod tests {
         // A screen opened from it, and the save prompt under that.
         event(&mut ram, 0x0224_739C, 0x0224_72D0, 0x0215_B54D);
         event(&mut ram, 0x0224_7484, 0x0224_739C, 0x0215_C589);
+        write(&mut ram, SYSTEM + SYSTEM_EVENT, 0x0224_7484);
+        assert!(menu.is_open(&ram));
+        // Back to the menu, which hands over to an Escape Rope used from the
+        // bag: its event and the spin under it run code from another
+        // overlay, so the menu has given way to the field.
+        write(&mut ram, SYSTEM + SYSTEM_EVENT, 0x0224_72D0);
+        assert!(menu.is_open(&ram));
+        event(&mut ram, 0x0224_7600, 0x0224_72D0, 0x0217_D5E9);
+        write(&mut ram, SYSTEM + SYSTEM_EVENT, 0x0224_7600);
+        assert!(!menu.is_open(&ram));
+        event(&mut ram, 0x0224_7700, 0x0224_7600, 0x0215_C5DD);
+        write(&mut ram, SYSTEM + SYSTEM_EVENT, 0x0224_7700);
+        assert!(!menu.is_open(&ram));
         write(&mut ram, SYSTEM + SYSTEM_EVENT, 0x0224_7484);
         assert!(menu.is_open(&ram));
         // A script started by talking to someone is not the menu.

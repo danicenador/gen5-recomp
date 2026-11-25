@@ -312,6 +312,8 @@ pub struct Machine {
     field_menu: Option<FieldMenu>,
     /// Whether the field menu was open at the last frame.
     field_menu_open: bool,
+    /// The field events running at the last frame, for GEN5_OVERLAY_LOG.
+    event_chain: Vec<u32>,
     /// The bottom screen's engine and layers at the last frame.
     bottom: BottomScreen,
     startup: Option<super::startup::Hooks>,
@@ -1394,6 +1396,21 @@ impl Machine {
                 );
             }
         }
+        if self.overlay_log.is_some()
+            && let Some(menu) = self.field_menu
+        {
+            let chain = menu.chain(&self.memory.main);
+            if chain != self.event_chain {
+                if let Some(log) = &mut self.overlay_log {
+                    let names: Vec<String> = chain
+                        .iter()
+                        .map(|function| format!("{function:08X}"))
+                        .collect();
+                    let _ = writeln!(log, "{}: events {}", self.presented, names.join(" < "));
+                }
+                self.event_chain = chain;
+            }
+        }
         let field_menu_open = self.field_menu.is_some_and(|menu| {
             self.loaded.contains(&field_menu::OVERLAY) && menu.is_open(&self.memory.main)
         });
@@ -2467,6 +2484,7 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         signatures: Vec::new(),
         field_menu,
         field_menu_open: false,
+        event_chain: Vec::new(),
         bottom: BottomScreen::default(),
         startup,
         startup_finish: None,
