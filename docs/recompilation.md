@@ -81,7 +81,10 @@ cargo run --release -- disasm ".gen5-cache/pokemon-white-2/95AB5437" ov011 0x021
   entry point and the overlays' static initializers. It follows calls and tail
   calls, and accepts code pointers from literal pools and data once they decode
   cleanly. It recognizes the compiler's switch tables, `ldr`/`bx` veneers,
-  Thumb `bx pc` state switches and interworking returns.
+  Thumb `bx pc` state switches and interworking returns. A Thumb `bl` into
+  code that tears down or reads deep into the caller's stack frame (a shared
+  epilogue) is a long branch, not a call, and so is a `bl` to another such
+  `bl`, as White 2's evolution uses to set its next step and leave.
 
 `analyze` writes `analysis/functions.json` into the cache. Results:
 

@@ -218,7 +218,16 @@ fn flow(ins: &Instruction, previous: Option<&Instruction>) -> Flow {
 /// address at sp + 0x20 or more, past any plausible stack arguments).
 /// Compilers reach such code, a shared epilogue or the far side of a long
 /// loop, with a Thumb `bl` used as a long branch: the "call" is a jump.
+/// Such a branch can land on another one: White 2's evolution sets its next
+/// step with `bl 0x021E3366`, whose `bl 0x021E3D06` stores the step and
+/// goes on to the shared exit, so a `bl` into code inside the frame counts
+/// as a jump there too.
 pub fn inside_caller_frame(module: &Module, target: u32, thumb: bool) -> bool {
+    frame_released(module, target, thumb, 2)
+}
+
+/// `inside_caller_frame`, following up to `depth` more long branches.
+fn frame_released(module: &Module, target: u32, thumb: bool, depth: u32) -> bool {
     if !module.contains(target) {
         return false;
     }
@@ -266,6 +275,15 @@ pub fn inside_caller_frame(module: &Module, target: u32, thumb: bool) -> bool {
             _ => {}
         }
         match flow(&ins, None) {
+            Flow::Call {
+                target: callee,
+                thumb: callee_thumb,
+            } if callee_thumb == thumb
+                && depth > 0
+                && frame_released(module, callee, thumb, depth - 1) =>
+            {
+                return true;
+            }
             Flow::Continue | Flow::Call { .. } | Flow::IndirectCall => pending.push(ins.end()),
             Flow::Jump {
                 target,
@@ -1208,6 +1226,25 @@ mod tests {
         assert!(!function.instructions.contains_key(&0x0200_0008));
         assert!(function.instructions.contains_key(&0x0200_0018));
         assert!(function.calls.iter().all(|call| call.target != 0x0200_000a));
+    }
+
+    #[test]
+    fn a_long_branch_can_land_on_another_long_branch() {
+        // 0x00: push {r4, lr} ; 0x02: sub sp, #8 ; 0x04: bl 0x0C ;
+        // 0x08: movs r0, #1 ; 0x0A: bx lr (neither reached) ;
+        // 0x0C: bl 0x14 ; 0x10: movs r0, #3 ; 0x12: bx lr (not reached) ;
+        // 0x14: str r0, [r4, #0x28] ; 0x16: add sp, #8 ; 0x18: pop {r4, pc}
+        let program = program(&[
+            0xB510, 0xB082, 0xF000, 0xF802, 0x2001, 0x4770, 0xF000, 0xF802, 0x2003, 0x4770, 0x62A0,
+            0xB002, 0xBD10,
+        ]);
+        assert!(inside_caller_frame(&program.modules[0], 0x0200_0014, true));
+        assert!(inside_caller_frame(&program.modules[0], 0x0200_000C, true));
+        let function = analyze_function(&program, key(0x0200_0000), true, &HashSet::new());
+        assert!(function.calls.is_empty());
+        assert!(function.instructions.contains_key(&0x0200_0018));
+        assert!(!function.instructions.contains_key(&0x0200_0008));
+        assert!(!function.instructions.contains_key(&0x0200_0010));
     }
 
     fn arm_program(words: &[u32]) -> Program {
