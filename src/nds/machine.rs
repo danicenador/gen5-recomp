@@ -1475,9 +1475,53 @@ impl Machine {
         if let Some(static_target) = candidates.iter().find(|target| target.module >= 0xFF00) {
             return Some(*static_target);
         }
-        candidates
+        let mut loaded: Vec<Target> = candidates
             .into_iter()
-            .find(|candidate| self.overlay_loaded(candidate.module, address))
+            .filter(|candidate| self.overlay_loaded(candidate.module, address))
+            .collect();
+        if loaded.len() > 1 {
+            let mut modules: Vec<u16> = loaded.iter().map(|target| target.module).collect();
+            self.narrow_overlays(&mut modules, address);
+            loaded.retain(|target| modules.contains(&target.module));
+        }
+        loaded.first().copied()
+    }
+
+    /// Of overlays whose code at `address` starts with the bytes in RAM,
+    /// keep those that go on matching RAM the furthest.
+    ///
+    /// Overlays loaded at the same address often start their functions
+    /// alike: the Pokémon World Tournament's ov134 and a dozen others begin
+    /// their entry function with the same calls into the anti-piracy
+    /// overlay, so its first 16 bytes match ov094's, and running ov094's
+    /// code there jumped into the middle of an ov134 function. The bytes
+    /// after the first 16 are compared until one overlay is left, skipping
+    /// bytes none of them matches (data the game has changed since, or a
+    /// function it has decrypted), up to 4 KiB on.
+    fn narrow_overlays(&mut self, modules: &mut Vec<u16>, address: u32) {
+        const LIMIT: u32 = 0x1000;
+        let mut offset = 16;
+        while modules.len() > 1 && offset < LIMIT {
+            let ram = self.read8(address + offset) as u8;
+            let mut compared = false;
+            let survivors: Vec<u16> = modules
+                .iter()
+                .copied()
+                .filter(|module| {
+                    let (base, image) = &self.overlays[module];
+                    let byte = image.get((address + offset - base) as usize);
+                    compared |= byte.is_some();
+                    byte == Some(&ram)
+                })
+                .collect();
+            if !compared {
+                break;
+            }
+            if !survivors.is_empty() {
+                *modules = survivors;
+            }
+            offset += 1;
+        }
     }
 
     // --- Reports -----------------------------------------------------
@@ -1590,9 +1634,22 @@ impl Machine {
             .map(|(&id, (base, _))| (id, *base))
             .collect();
         modules.sort_unstable();
-        let loaded: Vec<String> = modules
+        let mut bases: Vec<u32> = modules.iter().map(|&(_, base)| base).collect();
+        bases.sort_unstable();
+        bases.dedup();
+        let mut resident: Vec<(u16, u32)> = Vec::new();
+        for base in bases {
+            let mut at_base: Vec<u16> = modules
+                .iter()
+                .filter(|&&(id, other)| other == base && self.overlay_loaded(id, base))
+                .map(|&(id, _)| id)
+                .collect();
+            self.narrow_overlays(&mut at_base, base);
+            resident.extend(at_base.into_iter().map(|id| (id, base)));
+        }
+        resident.sort_unstable();
+        let loaded: Vec<String> = resident
             .into_iter()
-            .filter(|&(id, base)| self.overlay_loaded(id, base))
             .map(|(id, base)| format!("ov{id:03} at 0x{base:08X}"))
             .collect();
         let _ = writeln!(report, "overlays in RAM: {}", loaded.join(", "));

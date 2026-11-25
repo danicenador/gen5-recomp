@@ -230,7 +230,8 @@ pub fn emit_function(analysis: &Analysis, module: &Module, function: &Function) 
 }
 
 /// How many bytes at the start of an overlay function its entry guard
-/// compares, as many as the runtime compares to pick a function to call.
+/// compares, as many as the runtime compares first to pick a function to
+/// call (it compares more only between overlays that all match these).
 const GUARD_BYTES: u32 = 16;
 
 /// Overlay code can change while its overlay is loaded: Black 2 and White 2

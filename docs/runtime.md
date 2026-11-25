@@ -69,7 +69,10 @@ The `nds` module provides:
 - `machine`: boot as the firmware leaves memory, CP15, BIOS calls (waits,
   division, copies, CRC, LZ77 and RLE), and interrupt delivery through the
   handler at the end of DTCM. Overlay-aware dispatch picks the overlay whose
-  code is currently in RAM.
+  code is currently in RAM. Overlays loaded at the same address often start
+  a function with the same bytes (the anti-piracy calls at the top of the
+  Pokémon World Tournament's ov134 and a dozen others), so where several
+  match the first 16 bytes, it compares on until one is left.
 - `interpreter`: runs code with no recompiled function, such as routines the
   game copies to ITCM before running them, or jumps into a function's middle.
   Calls from it go back to native code. Black 2 and White 2 keep some overlay
