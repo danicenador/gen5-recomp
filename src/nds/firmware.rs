@@ -96,7 +96,11 @@ impl Firmware {
         let base = match (copy(0), copy(1)) {
             (Some((first, a)), Some((second, b))) => {
                 // The counter wraps at 0x80.
-                if (second.wrapping_sub(first) & 0x7F) == 1 { b } else { a }
+                if (second.wrapping_sub(first) & 0x7F) == 1 {
+                    b
+                } else {
+                    a
+                }
             }
             (Some((_, a)), None) => a,
             (_, Some((_, b))) => b,
@@ -198,7 +202,10 @@ mod tests {
         let settings = firmware.user_settings();
         assert_eq!(settings[0x64] & 7, 1);
         let slot = &firmware.data[WFC_SLOTS..WFC_SLOTS + 0x100];
-        assert_eq!(crc16(0, &slot[..0xFE]), u16::from_le_bytes([slot[0xFE], slot[0xFF]]));
+        assert_eq!(
+            crc16(0, &slot[..0xFE]),
+            u16::from_le_bytes([slot[0xFE], slot[0xFF]])
+        );
     }
 
     #[test]

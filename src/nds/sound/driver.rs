@@ -480,7 +480,10 @@ fn calc_channel_volume(value: i32) -> u16 {
 
 impl Driver {
     fn random(&mut self) -> u16 {
-        self.random = self.random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        self.random = self
+            .random
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
         (self.random >> 16) as u16
     }
 
@@ -567,7 +570,11 @@ impl Driver {
             }
             PLAYER_GLOBAL_VAR => {
                 if self.shared != 0 && arg[0] < 16 {
-                    write16(ram, self.shared + SHARED_GLOBALS + arg[0] * 2, arg[1] as u16);
+                    write16(
+                        ram,
+                        self.shared + SHARED_GLOBALS + arg[0] * 2,
+                        arg[1] as u16,
+                    );
                 }
             }
             START_TIMER => self.start_timer(ram, arg[0], arg[2]),
@@ -1045,7 +1052,8 @@ impl Driver {
                 self.channel_finished(index);
                 continue;
             }
-            let mut volume = i32::from(DECIBEL_SQUARE[usize::from(self.channels[index].velocity & 0x7F)]);
+            let mut volume =
+                i32::from(DECIBEL_SQUARE[usize::from(self.channels[index].velocity & 0x7F)]);
             let channel = &self.channels[index];
             let mut pitch = (i32::from(channel.midi_key) - i32::from(channel.root_key)) * 0x40;
             volume += self.update_envelope(index, step);
@@ -1491,7 +1499,11 @@ impl Driver {
         self.players[player].prepared = false;
         if self.shared != 0 {
             let status = read32(ram, self.shared + SHARED_PLAYER_STATUS);
-            write32(ram, self.shared + SHARED_PLAYER_STATUS, status | (1 << player));
+            write32(
+                ram,
+                self.shared + SHARED_PLAYER_STATUS,
+                status | (1 << player),
+            );
         }
     }
 
@@ -1500,7 +1512,11 @@ impl Driver {
             self.player_stop(player);
             if self.shared != 0 {
                 let status = read32(ram, self.shared + SHARED_PLAYER_STATUS);
-                write32(ram, self.shared + SHARED_PLAYER_STATUS, status & !(1 << player));
+                write32(
+                    ram,
+                    self.shared + SHARED_PLAYER_STATUS,
+                    status & !(1 << player),
+                );
             }
         }
     }
@@ -1672,8 +1688,7 @@ impl Driver {
         state.priority = 64;
         state.tracks = [NO_TRACK; TRACKS_PER_PLAYER];
         if self.shared != 0 {
-            let base =
-                self.shared + SHARED_PLAYERS + u32::from(state.id) * SHARED_PLAYER_SIZE;
+            let base = self.shared + SHARED_PLAYERS + u32::from(state.id) * SHARED_PLAYER_SIZE;
             write32(ram, base + 0x20, 0);
             for variable in 0..16 {
                 write16(ram, base + variable * 2, 0xFFFF);
@@ -1833,8 +1848,7 @@ impl Driver {
                 };
                 let state = &self.tracks[track];
                 let mask = allowed & u32::from(state.channel_mask);
-                let priority =
-                    i32::from(self.players[player].priority) + i32::from(state.priority);
+                let priority = i32::from(self.players[player].priority) + i32::from(state.priority);
                 let tie = state.tie;
                 let Some(index) =
                     self.alloc_channel(mask, priority, state.channel_mask_set, track as u8)
@@ -1883,7 +1897,13 @@ impl Driver {
     }
 
     /// Run one tick of a track. Returns false when the track ended.
-    fn track_step_ticks(&mut self, ram: &mut [u8], track: usize, player: usize, play: bool) -> bool {
+    fn track_step_ticks(
+        &mut self,
+        ram: &mut [u8],
+        track: usize,
+        player: usize,
+        play: bool,
+    ) -> bool {
         let mut current = self.tracks[track].channels;
         while let Some(index) = current {
             let channel = &mut self.channels[usize::from(index)];
@@ -2116,7 +2136,14 @@ impl Driver {
         }
     }
 
-    fn variable_command(&mut self, ram: &mut [u8], track: usize, command: u8, address: u32, value: i16) {
+    fn variable_command(
+        &mut self,
+        ram: &mut [u8],
+        track: usize,
+        command: u8,
+        address: u32,
+        value: i16,
+    ) {
         let current = read16(ram, address) as i16;
         let result = match command {
             0xB0 => value,
@@ -2254,7 +2281,8 @@ fn lfo_param_from_bytes(bytes: &[u8]) -> LfoParam {
 
 /// `SNDPlayer` as the SDK lays it out.
 fn player_bytes(player: &Player, bytes: &mut [u8]) {
-    bytes[0] = u8::from(player.active) | (u8::from(player.prepared) << 1) | (u8::from(player.paused) << 2);
+    bytes[0] =
+        u8::from(player.active) | (u8::from(player.prepared) << 1) | (u8::from(player.paused) << 2);
     bytes[1] = player.id;
     bytes[4] = player.priority;
     bytes[5] = player.volume;
@@ -2324,9 +2352,9 @@ fn track_bytes(track: &Track, bytes: &mut [u8]) {
     }
     bytes[0x38..0x3B].copy_from_slice(&track.loop_count);
     bytes[0x3B] = track.depth;
-    let head = track
-        .channels
-        .map_or(0, |index| WORK_ADDRESS + WORK_CHANNELS + u32::from(index) * CHANNEL_SIZE);
+    let head = track.channels.map_or(0, |index| {
+        WORK_ADDRESS + WORK_CHANNELS + u32::from(index) * CHANNEL_SIZE
+    });
     put32(bytes, 0x3C, head);
 }
 
@@ -2417,9 +2445,9 @@ fn serialize_channel(channel: &ExChannel, ram: &mut [u8], base: u32) {
             WORK_ADDRESS + WORK_TRACKS + u32::from(owner) * TRACK_SIZE,
         );
     }
-    let next = channel
-        .next
-        .map_or(0, |index| WORK_ADDRESS + WORK_CHANNELS + u32::from(index) * CHANNEL_SIZE);
+    let next = channel.next.map_or(0, |index| {
+        WORK_ADDRESS + WORK_CHANNELS + u32::from(index) * CHANNEL_SIZE
+    });
     put32(&mut bytes, 0x50, next);
     for (offset, byte) in bytes.iter().enumerate() {
         write8(ram, base + offset as u32, *byte);
@@ -2441,20 +2469,37 @@ mod tests {
     /// square, and a sequence that plays one note and ends.
     fn setup() -> (Vec<u8>, Driver) {
         let mut ram = vec![0; RAM];
-        let (shared, bank, archive, sequence, list): (u32, u32, u32, u32, u32) =
-            (0x0210_0000, 0x0211_0000, 0x0212_0000, 0x0213_0000, 0x0214_0000);
+        let (shared, bank, archive, sequence, list): (u32, u32, u32, u32, u32) = (
+            0x0210_0000,
+            0x0211_0000,
+            0x0212_0000,
+            0x0213_0000,
+            0x0214_0000,
+        );
         // Bank: archive link 0, one instrument (PCM at +0x40).
         put(&mut ram, bank + 0x18, &archive.to_le_bytes());
         put(&mut ram, bank + 0x38, &1_u32.to_le_bytes());
-        put(&mut ram, bank + 0x3C, &((0x40 << 8) | u32::from(INST_PCM)).to_le_bytes());
+        put(
+            &mut ram,
+            bank + 0x3C,
+            &((0x40 << 8) | u32::from(INST_PCM)).to_le_bytes(),
+        );
         // wave 0 of archive 0, root key 60, attack 127, decay 127,
         // sustain 127, release 100, pan 64.
-        put(&mut ram, bank + 0x40, &[0, 0, 0, 0, 60, 127, 127, 127, 100, 64]);
+        put(
+            &mut ram,
+            bank + 0x40,
+            &[0, 0, 0, 0, 60, 127, 127, 127, 100, 64],
+        );
         // Archive: one wave at +0x40.
         put(&mut ram, archive + 0x38, &1_u32.to_le_bytes());
         put(&mut ram, archive + 0x3C, &0x40_u32.to_le_bytes());
         // Wave: PCM8, looped, 32 kHz-ish timer, loop start 0, length 1 word.
-        put(&mut ram, archive + 0x40, &[0, 1, 0, 0x80, 0x00, 0xFC, 0, 0, 1, 0, 0, 0]);
+        put(
+            &mut ram,
+            archive + 0x40,
+            &[0, 1, 0, 0x80, 0x00, 0xFC, 0, 0, 1, 0, 0, 0],
+        );
         put(&mut ram, archive + 0x4C, &[0x60, 0x60, 0xA0, 0xA0]);
         // Sequence: note 60 velocity 127 for 48 ticks, wait 48, end.
         put(&mut ram, sequence, &[60, 127, 48, 0x80, 48, 0xFF]);
@@ -2489,8 +2534,19 @@ mod tests {
         }
         assert!(heard, "the note reached the mixer");
         assert_eq!(read32(&ram, shared + 4), 0, "the sequence finished");
-        assert_eq!(driver.hardware.channels.iter().filter(|c| c.active()).count(), 0);
-        assert!(read32(&ram, shared + 0x20 + 0x20) >= 96, "ticks were counted");
+        assert_eq!(
+            driver
+                .hardware
+                .channels
+                .iter()
+                .filter(|c| c.active())
+                .count(),
+            0
+        );
+        assert!(
+            read32(&ram, shared + 0x20 + 0x20) >= 96,
+            "ticks were counted"
+        );
     }
 
     #[test]

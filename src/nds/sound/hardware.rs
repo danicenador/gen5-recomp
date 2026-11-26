@@ -304,7 +304,11 @@ mod tests {
         channel.loop_start = 1;
         channel.length = 1;
         channel.timer = (0x1_0000 - 512) as u16;
-        hardware.set_control(2, 0x8000_0000 | (2 << 29) | (1 << 27) | (127 << 16) | 127, &ram);
+        hardware.set_control(
+            2,
+            0x8000_0000 | (2 << 29) | (1 << 27) | (127 << 16) | 127,
+            &ram,
+        );
         let samples: Vec<i16> = (0..20).map(|_| hardware.mix(&ram)[1]).collect();
         assert!(hardware.channels[2].active());
         assert!(samples[7] > samples[0]);

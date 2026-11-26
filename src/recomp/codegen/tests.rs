@@ -310,7 +310,10 @@ fn callee_with_decode_problems_goes_through_runtime() {
         }
         let analysis = Analysis {
             functions: BTreeMap::from([
-                (caller, analyze_function(&program, caller, false, &HashSet::new())),
+                (
+                    caller,
+                    analyze_function(&program, caller, false, &HashSet::new()),
+                ),
                 (callee, target),
             ]),
             ..Analysis::default()

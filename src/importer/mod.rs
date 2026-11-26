@@ -3,12 +3,12 @@ pub mod title;
 
 use crate::Result;
 use crate::formats::nds::{NdsRom, RomFile};
-use title::Gen5Title;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use title::Gen5Title;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheManifest {

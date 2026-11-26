@@ -267,7 +267,9 @@ mod tests {
     #[test]
     fn checkpoint_sources_keep_only_the_run() {
         assert_eq!(
-            portable_source(Path::new(r"D:\gen5\debug\runs\1-2\history\frame-0000084621")),
+            portable_source(Path::new(
+                r"D:\gen5\debug\runs\1-2\history\frame-0000084621"
+            )),
             "debug/runs/1-2/history/frame-0000084621"
         );
         assert_eq!(
