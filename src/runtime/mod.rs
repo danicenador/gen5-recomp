@@ -16,10 +16,13 @@ use std::sync::Arc;
 /// Tab), and the window draws as often as `fps` says. PC preferences
 /// choose resolution, screen layout, widescreen, interpolation and controls;
 /// the in-game PC Settings menu and shortcuts edit the same values.
+/// `saved` is what the settings file holds and `settings` what this launch
+/// plays with; overrides between the two are not saved (see `Store`).
 pub fn play_recompiled(
     cache_root: &Path,
     rom: &Path,
     fps: pacing::Fps,
+    saved: settings::Settings,
     mut settings: settings::Settings,
 ) -> Result<()> {
     use crate::nds::{input::Input, machine, speed::Speed};
@@ -48,7 +51,11 @@ pub fn play_recompiled(
     });
     settings.fast_forward = speed.is_fast();
     settings.speed = speed.factor();
-    let settings_path = settings::Settings::path(cache_root);
+    let store = settings::Store::new(
+        settings::Settings::path(cache_root),
+        saved,
+        settings.clone(),
+    );
     let overlays = Arc::new(machine::LoadedOverlays::default());
     let audio = Arc::new(crate::nds::sound::AudioQueue::default());
     // Kept alive for as long as the window is open.
@@ -90,7 +97,7 @@ pub fn play_recompiled(
         widescreen,
         overlays,
         settings,
-        settings_path,
+        store,
     )?;
     // The game threads never return; closing the window ends the program.
     std::process::exit(0);

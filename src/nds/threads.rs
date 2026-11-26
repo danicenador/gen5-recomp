@@ -314,12 +314,15 @@ pub(super) fn describe(read32: &mut dyn FnMut(u32) -> u32) -> Vec<String> {
 }
 
 /// Run the boot code on a host thread with a large stack (generated code
-/// uses far more stack than the guest), as baton holder 0.
-pub(super) fn run_boot(run: impl FnOnce() + Send + 'static) {
+/// uses far more stack than the guest), as baton holder 0. The machine exits
+/// the process when it stops, so this returns only if the thread panicked.
+pub(super) fn run_boot(run: impl FnOnce() + Send + 'static) -> crate::Result<()> {
     let handle = std::thread::Builder::new()
         .name("guest-boot".to_owned())
         .stack_size(THREAD_STACK)
         .spawn(run)
-        .expect("could not start the boot thread");
-    let _ = handle.join();
+        .map_err(|error| format!("could not start the boot thread: {error}"))?;
+    handle
+        .join()
+        .map_err(|_| "the game's boot thread panicked".to_owned())
 }

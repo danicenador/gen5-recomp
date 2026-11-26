@@ -7,7 +7,6 @@
 //! settings, each with a valid CRC. The image is kept in a file so what the
 //! game writes survives restarts. Layout per GBATEK.
 
-use std::fs;
 use std::path::PathBuf;
 
 pub const SIZE: usize = 256 * 1024;
@@ -65,16 +64,18 @@ fn put16(data: &mut [u8], offset: usize, value: u16) {
 }
 
 impl Firmware {
-    /// Open the firmware file, or build a fresh one if there is none.
-    pub fn open(path: PathBuf) -> Self {
-        let mut data = fs::read(&path)
-            .ok()
+    /// Open the firmware file, or build a fresh one if there is none (or it
+    /// is not a firmware image). Any other read error is returned rather than
+    /// replacing the file with a fresh image.
+    pub fn open(path: PathBuf) -> std::result::Result<Self, String> {
+        let mut data = super::backup::read_if_present(&path)
+            .map_err(|error| format!("could not read firmware '{}': {error}", path.display()))?
             .filter(|data| data.len() == SIZE)
             .unwrap_or_else(fresh);
         if data[MAC_OFFSET..MAC_OFFSET + 6] == EMULATOR_MAC {
             set_mac(&mut data, MAC);
         }
-        Self { data, path }
+        Ok(Self { data, path })
     }
 
     /// The console's MAC address, which the ARM7 copies to shared RAM.
@@ -118,7 +119,7 @@ impl Firmware {
 
     /// Write the firmware file after a change.
     pub fn flush(&self) -> std::result::Result<(), String> {
-        fs::write(&self.path, &self.data).map_err(|error| {
+        super::backup::replace_file(&self.path, &self.data).map_err(|error| {
             format!(
                 "could not write firmware '{}': {error}",
                 self.path.display()
@@ -184,6 +185,7 @@ fn fresh() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn fresh_image_has_valid_settings() {
@@ -205,7 +207,7 @@ mod tests {
         let mut data = fresh();
         set_mac(&mut data, EMULATOR_MAC);
         fs::write(&path, &data).unwrap();
-        let firmware = Firmware::open(path.clone());
+        let firmware = Firmware::open(path.clone()).unwrap();
         let _ = fs::remove_file(path);
         assert_eq!(firmware.mac(), MAC);
         let stored = u16::from_le_bytes([firmware.data[WIFI_CRC], firmware.data[WIFI_CRC + 1]]);

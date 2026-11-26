@@ -364,6 +364,9 @@ impl FrameTiming {
     }
 }
 
+/// The exit code after [`Machine::stop`], so scripts can tell a stopped game
+/// from a run that finished (0) or could not start (1).
+pub const STOP_EXIT_CODE: i32 = 3;
 const EVENT_HISTORY: usize = 400;
 const ACTIVITY_PER_LINE: u64 = 32;
 /// Backward branches between `rt_tick` calls.
@@ -553,7 +556,7 @@ impl Machine {
             self.present();
             if self.io.frame != frame && self.io.frame >= self.options.max_frames {
                 let frames = self.io.frame;
-                self.stop(&format!("reached frame {frames}"));
+                self.finish(&format!("reached frame {frames}"));
             }
         }
     }
@@ -662,7 +665,7 @@ impl Machine {
             && Path::new(&path).exists()
         {
             let _ = fs::remove_file(&path);
-            self.stop("stop file found");
+            self.finish("stop file found");
         }
         if let Some(on_vblank) = &mut self.options.on_vblank {
             on_vblank(self.presented);
@@ -1543,7 +1546,19 @@ impl Machine {
 
     // --- Reports -----------------------------------------------------
 
+    /// Report the machine state and exit with [`STOP_EXIT_CODE`]: the game
+    /// hit something the runtime cannot continue from.
     pub fn stop(&mut self, reason: &str) -> ! {
+        self.report_and_exit(reason, STOP_EXIT_CODE)
+    }
+
+    /// Report the machine state and exit successfully: the run reached what
+    /// it was asked to (a frame count, a stop file).
+    pub fn finish(&mut self, reason: &str) -> ! {
+        self.report_and_exit(reason, 0)
+    }
+
+    fn report_and_exit(&mut self, reason: &str, code: i32) -> ! {
         let mut report = String::new();
         let _ = writeln!(report, "\n=== stopped: {reason}");
         let mode = self.banks.mode;
@@ -1697,7 +1712,7 @@ impl Machine {
             }
         }
         print!("{report}");
-        std::process::exit(0);
+        std::process::exit(code);
     }
 }
 
@@ -1947,7 +1962,7 @@ fn advance_frame(cpu: *mut Cpu) {
     machine.present();
     if machine.io.frame >= machine.options.max_frames {
         let frames = machine.io.frame;
-        machine.stop(&format!("reached frame {frames}"));
+        machine.finish(&format!("reached frame {frames}"));
     }
 }
 
@@ -2343,11 +2358,11 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
             state_root.display()
         )
     })?;
-    let mut backup = Backup::open(state_root.join("save.bin"));
+    let mut backup = Backup::open(state_root.join("save.bin"))?;
     if let Some(root) = std::env::var_os("GEN5_DEBUG_HISTORY") {
         backup.history = Some(crate::debug::History::open(root.into(), &backup.data)?);
     }
-    let firmware = Firmware::open(state_root.join("firmware.bin"));
+    let firmware = Firmware::open(state_root.join("firmware.bin"))?;
     if backup.history.is_some() {
         firmware.flush()?;
     }
@@ -2580,6 +2595,5 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         let cpu = cpu_address as *mut Cpu;
         call_target(cpu, entry);
         unsafe { get(cpu) }.stop("the entry function returned");
-    });
-    Ok(())
+    })
 }

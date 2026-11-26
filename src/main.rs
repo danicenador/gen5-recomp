@@ -346,6 +346,8 @@ fn run() -> Result<(), String> {
             use gen5::runtime::settings::Settings;
             let settings_path = Settings::path(Path::new(&args[1]));
             let mut settings = Settings::load(&settings_path)?;
+            // Flags and environment variables below apply to this launch only.
+            let saved = settings.clone();
             if let Ok(value) = std::env::var("GEN5_RESOLUTION") {
                 settings.resolution = Some(gen5::runtime::settings::Resolution::parse(&value)?);
                 settings.scale = None;
@@ -428,7 +430,7 @@ fn run() -> Result<(), String> {
                 None if settings.interpolate => gen5::runtime::pacing::Fps::Display,
                 None => gen5::runtime::pacing::Fps::Ds,
             };
-            gen5::runtime::play_recompiled(Path::new(&args[1]), &rom, fps, settings)
+            gen5::runtime::play_recompiled(Path::new(&args[1]), &rom, fps, saved, settings)
         }
         Some("disasm") if args.len() == 4 => {
             let module = args[2].parse::<ModuleId>()?;

@@ -273,9 +273,117 @@ impl Settings {
     }
 }
 
+/// Where the preferences are saved, and what this launch overrode in them.
+///
+/// Launch flags and environment variables apply to one launch. Saving keeps
+/// the file's value for each setting they overrode until the player changes
+/// that setting while playing; from then on the player's choice is saved.
+pub struct Store {
+    path: PathBuf,
+    /// What the file held at launch.
+    saved: Settings,
+    /// What this launch started with, overrides included.
+    launched: Settings,
+    /// Settings the player has changed since launch.
+    changed: Vec<&'static str>,
+}
+
+impl Store {
+    pub fn new(path: PathBuf, saved: Settings, launched: Settings) -> Self {
+        Self {
+            path,
+            saved,
+            launched,
+            changed: Vec::new(),
+        }
+    }
+
+    /// Save `current`, without the overrides the player has left alone.
+    pub fn save(&mut self, current: &Settings) -> Result<()> {
+        self.persisted(current).save(&self.path)
+    }
+
+    fn persisted(&mut self, current: &Settings) -> Settings {
+        let mut persisted = current.clone();
+        macro_rules! one_launch {
+            ($($field:ident),* $(,)?) => {
+                // Without `..`, a field added to Settings must be listed here.
+                let Settings { $($field: _),* } = current;
+                $(
+                    let name = stringify!($field);
+                    if current.$field != self.launched.$field && !self.changed.contains(&name) {
+                        self.changed.push(name);
+                    }
+                    if !self.changed.contains(&name) {
+                        persisted.$field = self.saved.$field.clone();
+                    }
+                )*
+            };
+        }
+        one_launch!(
+            resolution,
+            scale,
+            widescreen,
+            layout,
+            fullscreen,
+            smart_bottom,
+            fast_forward,
+            speed,
+            interpolate,
+            auto_continue,
+            stick_dead_zone,
+            stylus_sensitivity,
+            bindings,
+        );
+        persisted
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_overrides_are_not_saved_until_the_player_changes_them() {
+        let saved = Settings {
+            widescreen: false,
+            auto_continue: false,
+            layout: Layout::Split,
+            speed: 4,
+            ..Settings::default()
+        };
+        // `--continue --widescreen --single-screen`.
+        let launched = Settings {
+            widescreen: true,
+            auto_continue: true,
+            layout: Layout::Single,
+            ..saved.clone()
+        };
+        let mut store = Store::new(PathBuf::new(), saved.clone(), launched.clone());
+
+        // The player changes the speed: only that is saved.
+        let mut current = Settings {
+            speed: 6,
+            ..launched.clone()
+        };
+        let persisted = store.persisted(&current);
+        assert_eq!(
+            persisted,
+            Settings {
+                speed: 6,
+                ..saved.clone()
+            }
+        );
+
+        // Turning widescreen off and back on makes it the player's choice.
+        current.widescreen = false;
+        assert!(!store.persisted(&current).widescreen);
+        current.widescreen = true;
+        let persisted = store.persisted(&current);
+        assert!(persisted.widescreen);
+        assert!(!persisted.auto_continue);
+        assert_eq!(persisted.layout, Layout::Split);
+    }
 
     #[test]
     fn preferences_round_trip_without_touching_game_save() {

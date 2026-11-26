@@ -19,7 +19,6 @@ use crate::nds::input::{self, Input};
 use crate::nds::machine::{BottomScreen, LoadedOverlays};
 use crate::nds::speed::Speed;
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -115,21 +114,12 @@ pub fn run(
     widescreen: Arc<AtomicBool>,
     overlays: Arc<LoadedOverlays>,
     settings: Settings,
-    settings_path: PathBuf,
+    store: settings::Store,
 ) -> Result<()> {
     let event_loop =
         EventLoop::new().map_err(|error| format!("could not create event loop: {error}"))?;
     let mut app = App::new(
-        title,
-        screens,
-        input,
-        scale,
-        fps,
-        speed,
-        widescreen,
-        overlays,
-        settings,
-        settings_path,
+        title, screens, input, scale, fps, speed, widescreen, overlays, settings, store,
     );
     event_loop
         .run_app(&mut app)
@@ -139,7 +129,7 @@ pub fn run(
 
 struct App {
     settings: Settings,
-    settings_path: PathBuf,
+    store: settings::Store,
     menu: Menu,
     menu_pad: u32,
     /// Inputs used by the UI stay released in the game until physically released.
@@ -695,7 +685,7 @@ impl App {
         widescreen: Arc<AtomicBool>,
         overlays: Arc<LoadedOverlays>,
         settings: Settings,
-        settings_path: PathBuf,
+        store: settings::Store,
     ) -> Self {
         Self {
             title: title.to_owned(),
@@ -725,7 +715,7 @@ impl App {
             fps,
             interpolate: settings.interpolate && fps.interpolates(),
             settings,
-            settings_path,
+            store,
             menu: Menu::default(),
             menu_pad: 0,
             blocked_keyboard: Vec::new(),
@@ -903,7 +893,7 @@ impl App {
     }
 
     fn save_settings(&mut self) {
-        match self.settings.save(&self.settings_path) {
+        match self.store.save(&self.settings) {
             Ok(()) => {
                 if self.menu.status.is_empty() {
                     self.menu.status = "Settings saved".into();
@@ -2722,6 +2712,7 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn closing_settings_discards_the_paused_presentation_timeline() {
@@ -2737,7 +2728,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(LoadedOverlays::default()),
             Settings::default(),
-            PathBuf::new(),
+            settings::Store::new(PathBuf::new(), Settings::default(), Settings::default()),
         );
         let start = Instant::now();
         screens.publish(1, &Frame::blank(), start);
@@ -2792,7 +2783,7 @@ mod tests {
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(LoadedOverlays::default()),
                     Settings::default(),
-                    path.clone(),
+                    settings::Store::new(path.clone(), Settings::default(), Settings::default()),
                 );
                 app.resumed(event_loop);
                 assert!(app.error.is_none(), "{:?}", app.error);

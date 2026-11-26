@@ -5,7 +5,8 @@
 //! save memory is a file, and each request is applied to it directly.
 
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 /// `CARDiCommandArg` field offsets.
 pub const ARG_RESULT: u32 = 0x00;
@@ -41,13 +42,18 @@ pub struct Backup {
 
 impl Backup {
     /// Open the save file, or start with erased memory if there is none.
-    pub fn open(path: PathBuf) -> Self {
-        let data = fs::read(&path).unwrap_or_default();
-        Self {
+    ///
+    /// Any other read error is returned: starting empty would overwrite the
+    /// real save on the game's next write.
+    pub fn open(path: PathBuf) -> std::result::Result<Self, String> {
+        let data = read_if_present(&path)
+            .map_err(|error| format!("could not read save '{}': {error}", path.display()))?
+            .unwrap_or_default();
+        Ok(Self {
             data,
             path,
             history: None,
-        }
+        })
     }
 
     /// Size the memory to what the game's chip spec declares.
@@ -75,7 +81,70 @@ impl Backup {
 
     /// Write the save file after a change.
     pub fn flush(&self) -> std::result::Result<(), String> {
-        fs::write(&self.path, &self.data)
+        replace_file(&self.path, &self.data)
             .map_err(|error| format!("could not write save '{}': {error}", self.path.display()))
+    }
+}
+
+/// The file's contents, or `None` if it does not exist.
+pub(super) fn read_if_present(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(data) => Ok(Some(data)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Replace the file's contents in one step: write a sibling temporary file,
+/// then rename it over the file. The process can exit at any moment (a
+/// watchdog, a closed window, a crash), so writing in place could leave a
+/// truncated save.
+pub(super) fn replace_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    fs::write(&temporary, data)?;
+    fs::rename(&temporary, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("gen5-backup-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn missing_save_starts_empty_and_flush_replaces_it() {
+        let directory = scratch("missing");
+        let path = directory.join("save.bin");
+        let mut backup = Backup::open(path.clone()).unwrap();
+        assert!(backup.data.is_empty());
+        backup.ensure_size(16);
+        backup.data[0] = 0x12;
+        backup.flush().unwrap();
+        backup.data[0] = 0x34;
+        backup.flush().unwrap();
+        let mut expected = vec![0xFF; 16];
+        expected[0] = 0x34;
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert!(!directory.join("save.bin.tmp").exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn unreadable_save_is_an_error_not_an_empty_card() {
+        // A directory where the file should be cannot be read as one.
+        let directory = scratch("unreadable");
+        let path = directory.join("save.bin");
+        fs::create_dir(&path).unwrap();
+        let error = Backup::open(path).err().unwrap();
+        assert!(error.starts_with("could not read save"), "{error}");
+        let _ = fs::remove_dir_all(directory);
     }
 }

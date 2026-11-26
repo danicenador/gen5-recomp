@@ -73,18 +73,21 @@ Changes, including the existing display/speed shortcuts, are saved in
 Continue entry on the next launch, with the wireless C-Gear off. It is off
 by default. The menu stays hidden while the game checks the save and enters
 Continue, so its buttons do not flash before the saved game appears.
-`--continue` or `GEN5_AUTO_CONTINUE=1` also enables it. Missing
+`--continue` or `GEN5_AUTO_CONTINUE=1` also enables it for one launch. Missing
 or damaged saves retain the game's normal checks and menu. English Black 2
 and White 2 are supported; other builds keep their normal startup.
-Explicit launch flags and environment settings override saved preferences at
-launch. A settings-file error is reported instead of silently overwriting it.
+Explicit launch flags and environment settings override saved preferences for
+that launch only: the file keeps its value for each one unless you change that
+setting while playing. A settings-file error is reported instead of silently
+overwriting it.
 
 ## Screen layouts
 
 Add `--split-screens` to `run` to put the top and bottom DS screens in
 separate, independently resizable windows. Keyboard controls work in either
 window; the mouse acts as the stylus only in the bottom-screen window.
-Closing either window quits. The layout is saved; new preferences use a single screen.
+Closing either window quits. A layout chosen in the PC Settings menu is saved;
+new preferences use a single screen.
 
 Add `--single-screen` to `run` to play on one screen. The window opens full
 screen, and the top screen fits the chosen aspect ratio (H still switches

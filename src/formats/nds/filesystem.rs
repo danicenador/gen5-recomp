@@ -205,7 +205,12 @@ fn walk_directory(
             format!("{prefix}/{name}")
         };
         if is_directory {
-            let child_id = usize::from(u16_at(fnt, cursor));
+            let child_id = fnt
+                .get(cursor..cursor + 2)
+                .map(|bytes| usize::from(u16_at(bytes, 0)))
+                .ok_or_else(|| {
+                    format!("FNT subdirectory reference runs past the end of directory {directory_id} subtable")
+                })?;
             cursor += 2;
             if child_id & 0xF000 != 0xF000 {
                 return Err(format!(
@@ -280,4 +285,77 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 2],
         bytes[offset + 3],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk(fnt: &[u8], fat: &[(u32, u32)]) -> Result<Vec<RomFile>> {
+        let directories = parse_directory_records(fnt)?;
+        let mut files = Vec::new();
+        walk_directory(
+            0,
+            "",
+            fnt,
+            &directories,
+            fat,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut files,
+        )?;
+        Ok(files)
+    }
+
+    fn record(entries_offset: u32, first_file_id: u16, third: u16) -> Vec<u8> {
+        let mut bytes = entries_offset.to_le_bytes().to_vec();
+        bytes.extend(first_file_id.to_le_bytes());
+        bytes.extend(third.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn walks_files_and_subdirectories() {
+        // Root (2 directories) holds "sub/" and "a.bin"; "sub" holds "b.bin".
+        let mut fnt = record(16, 0, 2);
+        fnt.extend(record(29, 1, 0xF000));
+        fnt.extend([0x83, b's', b'u', b'b', 0x01, 0xF0]);
+        fnt.extend([0x05, b'a', b'.', b'b', b'i', b'n', 0x00]);
+        assert_eq!(fnt.len(), 29);
+        fnt.extend([0x05, b'b', b'.', b'b', b'i', b'n', 0x00]);
+        let files = walk(&fnt, &[(0x100, 0x110), (0x200, 0x204)]).unwrap();
+        let summary: Vec<_> = files
+            .iter()
+            .map(|file| (file.id, file.path.as_str(), file.offset, file.size))
+            .collect();
+        assert_eq!(
+            summary,
+            [(0, "a.bin", 0x100, 0x10), (1, "sub/b.bin", 0x200, 4)]
+        );
+    }
+
+    #[test]
+    fn truncated_subdirectory_reference_is_an_error() {
+        // A directory entry whose 2-byte child ID is cut off by the table's end.
+        for tail in [&[][..], &[0x01]] {
+            let mut fnt = record(8, 0, 1);
+            fnt.extend([0x83, b's', b'u', b'b']);
+            fnt.extend(tail);
+            let error = walk(&fnt, &[]).err().unwrap();
+            assert!(error.contains("runs past the end"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_path_traversal_and_directory_cycles() {
+        let mut fnt = record(8, 0, 1);
+        fnt.extend([0x02, b'.', b'.', 0x00]);
+        assert!(walk(&fnt, &[(0, 0)]).is_err());
+
+        // The root lists itself as a subdirectory.
+        let mut fnt = record(8, 0, 1);
+        fnt.extend([0x81, b'x', 0x00, 0xF0, 0x00]);
+        let error = walk(&fnt, &[]).err().unwrap();
+        assert!(error.contains("cycle"), "{error}");
+    }
 }

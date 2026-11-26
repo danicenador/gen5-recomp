@@ -27,6 +27,7 @@ try {
     $env:GEN5_SCREEN_EVERY = "$ScreenshotEvery"
     & cargo run --release -- boot $Cache $Rom $Frames (Join-Path $run 'screens') |
         Tee-Object -FilePath (Join-Path $run 'report.txt')
+    if ($LASTEXITCODE -eq 3) { throw "Replay stopped before frame $Frames; inspect $run/report.txt" }
     if ($LASTEXITCODE -ne 0) { throw "Replay failed with exit code $LASTEXITCODE" }
     if (-not (Select-String -LiteralPath (Join-Path $run 'report.txt') -SimpleMatch "=== stopped: reached frame $Frames" -Quiet)) {
         throw "Replay stopped before frame $Frames; inspect $run/report.txt"

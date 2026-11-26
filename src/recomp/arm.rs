@@ -732,6 +732,13 @@ fn decode_arm_000(word: u32) -> Op {
             (2 | 3, false) => MemSize::Double,
             _ => return Op::Undefined,
         };
+        // LDRD and STRD use rt and rt + 1: an odd rt, or r14 (whose pair is
+        // pc), is unpredictable and only shows up when data is decoded as
+        // code. Decoding it would also name a register r16.
+        let rt = reg(word, 12);
+        if size == MemSize::Double && (rt.0 % 2 == 1 || rt.0 == 14) {
+            return Op::Undefined;
+        }
         // LDRD is encoded with L=0 and SH=2; STRD with L=0 and SH=3.
         let load = load || (size == MemSize::Double && sh == 2);
         let subtract = !bit(word, 23);
@@ -749,7 +756,7 @@ fn decode_arm_000(word: u32) -> Op {
         return Op::Memory {
             load,
             size,
-            rt: reg(word, 12),
+            rt,
             rn: reg(word, 16),
             offset,
             addressing: addressing(bit(word, 24), bit(word, 21)),
@@ -1396,6 +1403,10 @@ mod tests {
         assert_eq!(arm(0xE1D1_00B2), "ldrh r0, [r1, #0x2]");
         assert_eq!(arm(0xE1C1_00D8), "ldrd r0, [r1, #0x8]");
         assert_eq!(arm(0xE1C1_00F8), "strd r0, [r1, #0x8]");
+        // The register pair must start at an even register below r14.
+        assert_eq!(arm(0xE1C1_10D8), ".word 0xE1C110D8");
+        assert_eq!(arm(0xE1C1_E0D8), ".word 0xE1C1E0D8");
+        assert_eq!(arm(0xE1C1_F0F8), ".word 0xE1C1F0F8");
         assert_eq!(arm(0xE92D_4010), "stmdb sp!, {r4, lr}");
         assert_eq!(arm(0xE8BD_8010), "ldmia sp!, {r4, pc}");
     }

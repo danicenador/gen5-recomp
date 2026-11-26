@@ -33,6 +33,16 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
             "BLZ compressed length 0x{enc_len:X} is invalid for a 0x{len:X}-byte image"
         ));
     }
+    // The compressed region decodes into `enc_len + extra` bytes. A flag byte
+    // governs 8 tokens and a 2-byte token yields at most 18 bytes, so the
+    // stream expands at most 144/17 times: a larger size is corrupt, and is
+    // rejected before allocating for it.
+    let stream_len = (enc_len - hdr_len) as u64;
+    if (enc_len as u64 + extra as u64) * 17 > stream_len * 144 {
+        return Err(format!(
+            "BLZ declares 0x{extra:X} added bytes, more than its 0x{stream_len:X}-byte stream can hold"
+        ));
+    }
 
     let raw_len = len
         .checked_add(extra)
@@ -131,6 +141,16 @@ mod tests {
         let reference = ((18_u16 - 3) << 12).to_le_bytes();
         let body = [reference[0], reference[1], b'c', 0b0100_0000];
         assert!(decompress(&image(b"P", &body, 15)).is_err());
+    }
+
+    #[test]
+    fn rejects_size_the_stream_cannot_produce() {
+        // One flag byte of 8 literals cannot add 4 GiB.
+        let mut bytes = vec![0; 8];
+        bytes.extend_from_slice(&(16_u32 | (8 << 24)).to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let error = decompress(&bytes).err().unwrap();
+        assert!(error.contains("more than its"), "{error}");
     }
 
     #[test]

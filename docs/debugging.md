@@ -3,7 +3,9 @@
 ## Headless runs
 
 `boot` runs headless for a number of frames and ends with a report; with a
-directory it also saves both screens as PNG every 30 frames.
+directory it also saves both screens as PNG every 30 frames. It exits with 0
+when it reaches the frame count (or finds `GEN5_STOP_FILE`), and with 3 when
+the game stops before that: an unsupported operation, or the watchdog below.
 `GEN5_INPUT=first-last:button+button,...` holds buttons over frame ranges,
 for example `GEN5_INPUT=1300-1305:start,1500-1506:start`.
 
