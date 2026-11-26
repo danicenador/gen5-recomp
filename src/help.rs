@@ -131,7 +131,8 @@ minutes.",
     Command {
         name: "run",
         usage: "gen5 run <cache> [rom.nds] [scale] [--fps=ds|display|uncapped|N]\n           \
-                [--split-screens | --single-screen] [--widescreen]",
+                [--split-screens | --single-screen] [--widescreen] [--continue]\n           \
+                [--resolution=WxH]",
         summary: "Play the game in a window",
         details: "\
 The ROM may be left out for a game set up with `gen5 install`, which keeps a

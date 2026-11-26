@@ -2,6 +2,7 @@ use gen5::formats::nds::{Cpu, NdsRom};
 use gen5::importer::{self, title as gen5_game};
 use gen5::recomp::analysis::{self as recomp_analysis, Analysis};
 use gen5::recomp::program::{ModuleId, Program, Resolution};
+use gen5::runtime::screen::MAX_SCALE;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -397,15 +398,18 @@ fn run() -> Result<(), String> {
                     widescreen = true;
                 } else if let Some(mode) = value.strip_prefix("--fps=") {
                     fps = Some(gen5::runtime::pacing::Fps::parse(mode)?);
-                } else {
+                } else if let Some(text) = scale_argument(value) {
                     explicit_scale = true;
                     settings.resolution = None;
-                    scale = Some(
-                        value
-                            .trim_start_matches("--scale=")
-                            .parse()
-                            .map_err(|_| format!("invalid scale: {value}"))?,
-                    );
+                    scale = Some(parse_scale(text).ok_or_else(|| {
+                        format!("invalid scale {text}: expected 1 to {MAX_SCALE}")
+                    })?);
+                } else {
+                    return Err(format!(
+                        "unknown option '{value}' for 'run'\n\nUsage: {}\n\nRun `gen5 help run` \
+                         for more.",
+                        help::command("run").map_or("", |command| command.usage)
+                    ));
                 }
             }
             if chosen_layout == Some(Layout::Single)
@@ -692,12 +696,25 @@ fn widescreen_from_env() -> bool {
 /// GEN5_SCALE: the resolution multiple to draw at (default 1).
 fn scale_from_env() -> Result<u32, String> {
     match std::env::var("GEN5_SCALE") {
-        Ok(value) => match value.parse::<u32>() {
-            Ok(scale @ 1..=8) => Ok(scale),
-            _ => Err(format!("invalid GEN5_SCALE {value}: expected 1 to 8")),
-        },
+        Ok(value) => parse_scale(&value)
+            .ok_or_else(|| format!("invalid GEN5_SCALE {value}: expected 1 to {MAX_SCALE}")),
         Err(_) => Ok(1),
     }
+}
+
+/// The scale a `run` argument gives, as `--scale=N` or a bare `N`; `None`
+/// for any other option, so a mistyped one is reported as unknown.
+fn scale_argument(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("--scale=")
+        .or_else(|| (!value.starts_with('-')).then_some(value))
+}
+
+/// A resolution multiple, 1 to `MAX_SCALE`.
+fn parse_scale(text: &str) -> Option<u32> {
+    text.parse()
+        .ok()
+        .filter(|scale| (1..=MAX_SCALE).contains(scale))
 }
 
 /// GEN5_FPS: how often the game window draws (default `ds`, once per game
@@ -790,6 +807,18 @@ fn parse_touch_script(
 #[cfg(test)]
 mod replay_tests {
     use super::*;
+
+    #[test]
+    fn run_scales_are_checked_and_other_options_are_not_scales() {
+        assert_eq!(scale_argument("3"), Some("3"));
+        assert_eq!(scale_argument("--scale=4"), Some("4"));
+        assert_eq!(scale_argument("--contine"), None);
+        assert_eq!(scale_argument("-x"), None);
+        assert_eq!(parse_scale("8"), Some(8));
+        assert_eq!(parse_scale("0"), None);
+        assert_eq!(parse_scale("99"), None);
+        assert_eq!(parse_scale("big"), None);
+    }
 
     #[test]
     fn replay_ranges_and_touch_coordinates_are_validated() {
