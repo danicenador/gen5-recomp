@@ -37,6 +37,13 @@ const ALL_BUTTONS: [Button; 19] = [
     Button::DPadRight,
 ];
 
+/// The name a controller button is saved under in the bindings, gilrs's
+/// name for it. A gilrs update that renamed a button would unbind it in
+/// every settings file, so the test below pins the names.
+pub fn button_name(button: Button) -> String {
+    format!("{button:?}")
+}
+
 pub struct Gamepads {
     gilrs: Gilrs,
     fast_forward_held: bool,
@@ -130,7 +137,7 @@ impl Gamepads {
                 if !gamepad.is_pressed(button) {
                     continue;
                 }
-                let name = format!("{button:?}");
+                let name = button_name(button);
                 for (action, bound) in bindings.controller.iter().enumerate().take(ACTION_COUNT) {
                     if *bound == name {
                         actions |= 1 << action;
@@ -210,6 +217,38 @@ fn stick_with_threshold(x: f32, y: f32, threshold: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_button_names_are_pinned() {
+        let names = ALL_BUTTONS.map(button_name);
+        assert_eq!(
+            names,
+            [
+                "South",
+                "East",
+                "North",
+                "West",
+                "C",
+                "Z",
+                "LeftTrigger",
+                "LeftTrigger2",
+                "RightTrigger",
+                "RightTrigger2",
+                "Select",
+                "Start",
+                "Mode",
+                "LeftThumb",
+                "RightThumb",
+                "DPadUp",
+                "DPadDown",
+                "DPadLeft",
+                "DPadRight",
+            ]
+        );
+        for name in Bindings::default().controller {
+            assert!(name.is_empty() || names.contains(&name), "{name}");
+        }
+    }
 
     #[test]
     fn stick_presses_directions_past_the_threshold() {

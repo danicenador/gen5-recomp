@@ -127,6 +127,13 @@ pub fn run(
     app.error.map_or(Ok(()), Err)
 }
 
+/// The name a key is saved under in the bindings, winit's name for its
+/// physical position. A winit update that renamed a key would unbind it in
+/// every settings file, so a test pins the names of the default keys.
+fn key_name(code: KeyCode) -> String {
+    format!("{code:?}")
+}
+
 struct App {
     settings: Settings,
     store: settings::Store,
@@ -764,7 +771,7 @@ impl App {
                         if code == KeyCode::Delete {
                             String::new()
                         } else {
-                            format!("{code:?}")
+                            key_name(code)
                         },
                         &mut self.settings,
                     )
@@ -825,7 +832,7 @@ impl App {
             self.update_buttons();
             return;
         }
-        if let Some(action) = self.settings.bindings.keyboard_action(&format!("{code:?}")) {
+        if let Some(action) = self.settings.bindings.keyboard_action(&key_name(code)) {
             if action < 12 {
                 let bit = 1 << action;
                 if down && bit == input::Y && self.input.native_options() {
@@ -1092,7 +1099,9 @@ impl App {
         if self.menu.open {
             if self.menu.capture.is_some() && self.menu.page == Page::Controller {
                 if let Some(button) = state.capture {
-                    let effect = self.menu.bind(format!("{button:?}"), &mut self.settings);
+                    let effect = self
+                        .menu
+                        .bind(super::gamepad::button_name(button), &mut self.settings);
                     self.menu_effect(effect, event_loop);
                 }
             } else if self.menu.capture.is_none() {
@@ -2713,6 +2722,39 @@ impl Gpu {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn saved_key_names_are_pinned() {
+        let keys = [
+            (KeyCode::KeyX, "KeyX"),
+            (KeyCode::KeyZ, "KeyZ"),
+            (KeyCode::KeyW, "KeyW"),
+            (KeyCode::KeyQ, "KeyQ"),
+            (KeyCode::KeyS, "KeyS"),
+            (KeyCode::KeyA, "KeyA"),
+            (KeyCode::ShiftRight, "ShiftRight"),
+            (KeyCode::Enter, "Enter"),
+            (KeyCode::ArrowRight, "ArrowRight"),
+            (KeyCode::ArrowLeft, "ArrowLeft"),
+            (KeyCode::ArrowUp, "ArrowUp"),
+            (KeyCode::ArrowDown, "ArrowDown"),
+            (KeyCode::Tab, "Tab"),
+            (KeyCode::Space, "Space"),
+            (KeyCode::F1, "F1"),
+            (KeyCode::F11, "F11"),
+            (KeyCode::Digit1, "Digit1"),
+            (KeyCode::Backspace, "Backspace"),
+        ];
+        for (code, name) in keys {
+            assert_eq!(key_name(code), name);
+        }
+        for name in settings::Bindings::default().keyboard {
+            assert!(
+                name.is_empty() || keys.iter().any(|(_, known)| *known == name),
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn closing_settings_discards_the_paused_presentation_timeline() {
