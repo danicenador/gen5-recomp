@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 /// Samples the queue should hold (about 50 ms) for steady playback.
 const TARGET_FILL: f64 = 1600.0;
+/// Samples taken from the queue at a time.
+const FETCH: usize = 512;
 
 pub struct Output {
     _stream: cpal::Stream,
@@ -109,7 +111,8 @@ impl Resampler {
             phase: 0.0,
             previous: [0.0; 2],
             current: [0.0; 2],
-            buffer: Vec::new(),
+            // `fetch` refills up to this size, so the callback never grows it.
+            buffer: Vec::with_capacity(FETCH),
             read: 0,
             countdown: 0,
             adjust: 1.0,
@@ -118,7 +121,7 @@ impl Resampler {
 
     fn fetch(&mut self) -> [f32; 2] {
         if self.read == self.buffer.len() {
-            self.buffer.resize(512, [0; 2]);
+            self.buffer.resize(FETCH, [0; 2]);
             let count = self.queue.pop(&mut self.buffer);
             self.buffer.truncate(count);
             self.read = 0;
@@ -141,9 +144,9 @@ impl Resampler {
             let error = (fill - TARGET_FILL) / TARGET_FILL;
             self.adjust = 1.0 + (error * 0.005).clamp(-0.005, 0.005);
             if fill > TARGET_FILL * 4.0 {
-                // Far behind (after a stall): drop the backlog.
-                let mut skip = vec![[0; 2]; (fill - TARGET_FILL) as usize];
-                self.queue.pop(&mut skip);
+                // Far behind (after a stall): drop the backlog. This runs on
+                // the device's real-time thread, so it must not allocate.
+                self.queue.discard((fill - TARGET_FILL) as usize);
             }
         }
         self.countdown -= 1;
@@ -208,5 +211,42 @@ impl WavWriter {
         self.file.seek(SeekFrom::Start(40))?;
         self.file.write_all(&self.bytes.to_le_bytes())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queue_with(samples: usize) -> Arc<AudioQueue> {
+        let queue = Arc::new(AudioQueue::default());
+        queue.push(&vec![[16384, -16384]; samples]);
+        queue
+    }
+
+    #[test]
+    fn a_backlog_after_a_stall_is_dropped_down_to_the_target() {
+        let queue = queue_with(8000);
+        let mut resampler = Resampler::new(queue.clone(), OUTPUT_RATE);
+        resampler.next();
+        // The backlog goes, then one fetch takes the next samples.
+        assert_eq!(queue.len(), TARGET_FILL as usize - FETCH);
+    }
+
+    #[test]
+    fn plays_queued_samples_then_fades_when_starved() {
+        let queue = queue_with(FETCH);
+        let mut resampler = Resampler::new(queue, OUTPUT_RATE);
+        // Below its target fill the rate is slowed by 0.5%, so the second
+        // output sample is 99.5% of the way to the first source sample.
+        resampler.next();
+        let [left, right] = resampler.next();
+        assert!((left - 0.5).abs() < 0.01 && (right + 0.5).abs() < 0.01);
+        // Once the queue runs dry the output fades towards silence.
+        for _ in 0..2 * FETCH {
+            resampler.next();
+        }
+        let [left, right] = resampler.next();
+        assert!(left.abs() < 0.1 && right.abs() < 0.1, "{left} {right}");
     }
 }

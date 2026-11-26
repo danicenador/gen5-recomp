@@ -53,6 +53,17 @@ impl AudioQueue {
         count
     }
 
+    /// Drop up to `count` of the oldest samples; returns how many. Unlike
+    /// `pop`, this needs no buffer, so the audio callback can call it.
+    pub fn discard(&self, count: usize) -> usize {
+        let Ok(mut queue) = self.samples.lock() else {
+            return 0;
+        };
+        let count = count.min(queue.len());
+        queue.drain(..count);
+        count
+    }
+
     pub fn len(&self) -> usize {
         self.samples.lock().map_or(0, |queue| queue.len())
     }
