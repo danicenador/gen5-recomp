@@ -3463,7 +3463,9 @@ mod tests {
             assert_eq!((w, h), (width, 2 * height));
             let mut bounds = [w, h, 0, 0];
             for (i, pixel) in pixels[..(w * height * 4) as usize]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .enumerate()
             {
                 if pixel[0] > 200 && pixel[1] < 10 && pixel[2] < 10 {

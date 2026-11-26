@@ -149,9 +149,9 @@ pub fn run(cpu_ptr: *mut Cpu, target: u32) {
 fn trace(cpu_ptr: *mut Cpu, ins: &Instruction) {
     use std::io::Write;
     use std::sync::Mutex;
-    static TRACE: std::sync::OnceLock<
-        Option<(u64, Mutex<(std::io::BufWriter<std::fs::File>, u32)>)>,
-    > = std::sync::OnceLock::new();
+    /// The first frame to trace, and the output with the lines written.
+    type Trace = Option<(u64, Mutex<(std::io::BufWriter<std::fs::File>, u32)>)>;
+    static TRACE: std::sync::OnceLock<Trace> = std::sync::OnceLock::new();
     let Some((from, out)) = TRACE.get_or_init(|| {
         let spec = std::env::var("GEN5_INTERP_TRACE").ok()?;
         let (frame, path) = spec.split_once(':')?;

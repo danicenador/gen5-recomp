@@ -224,11 +224,11 @@ fn side_of(side: Composed, mirrored: Composed, outer: Composed) -> Composed {
 /// bottom bar (`(0, HEIGHT)` without bars).
 fn letterbox(screen: &[Composed]) -> (usize, usize) {
     let black = Composed::fixed(0);
-    let is_bar = |row: &[Composed]| {
+    let is_bar = |row: &[Composed; WIDTH]| {
         row.iter()
             .all(|pixel| pixel.with == black.with && pixel.without & 0x7FFF == 0)
     };
-    let rows: Vec<&[Composed]> = screen.chunks_exact(WIDTH).collect();
+    let rows = screen.as_chunks::<WIDTH>().0;
     let top = rows.iter().take_while(|row| is_bar(row)).count();
     if top == rows.len() {
         // A black screen is a fade, which the sides follow anyway.
@@ -256,7 +256,9 @@ fn widescreen_cover(screen: &[Composed], side: Composed) -> Option<Composed> {
         .iter()
         .chain(&screen[(HEIGHT - 1) * WIDTH..]);
     let vertical = screen
-        .chunks_exact(WIDTH)
+        .as_chunks::<WIDTH>()
+        .0
+        .iter()
         .flat_map(|row| [&row[0], &row[WIDTH - 1]]);
     horizontal.chain(vertical).all(same).then_some(cover)
 }
@@ -478,7 +480,13 @@ fn capture_sides(io: &Io, memory: &Memory, three_d_only: bool, height: usize) ->
             engine.compose_line(dispcnt, y, row);
         });
     let cover = widescreen_cover(&screen, side);
-    for (y, row) in screen.chunks_exact(WIDTH).take(height).enumerate() {
+    for (y, row) in screen
+        .as_chunks::<WIDTH>()
+        .0
+        .iter()
+        .take(height)
+        .enumerate()
+    {
         for x in (0..WIDE_EXTRA).chain(WIDE_EXTRA + WIDTH..columns) {
             let column = if x < WIDE_EXTRA { x } else { x - WIDTH };
             let composed = match (cover, &captured) {
@@ -874,7 +882,7 @@ impl<'a> Engine<'a> {
         let factor = u32::from(bright & 0x1F).min(16);
         let mode = bright >> 14;
         let mut rgba = vec![0xFF; WIDTH * HEIGHT * 4];
-        for (out, &color) in rgba.chunks_exact_mut(4).zip(colors) {
+        for (out, &color) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(colors) {
             let mut channels =
                 [color & 0x1F, (color >> 5) & 0x1F, (color >> 10) & 0x1F].map(u32::from);
             match mode {
@@ -1749,8 +1757,8 @@ mod tests {
         memory.vram.banks[32..64].fill(0x11); // opaque black tile
         memory.vram.banks[64..96].fill(0x22); // white lettering
         memory.palette[4..6].copy_from_slice(&0x7fffu16.to_le_bytes());
-        for tile in memory.vram.banks[0x800..0x1000].chunks_exact_mut(2) {
-            tile.copy_from_slice(&1u16.to_le_bytes());
+        for tile in memory.vram.banks[0x800..0x1000].as_chunks_mut::<2>().0 {
+            *tile = 1u16.to_le_bytes();
         }
         memory.vram.banks[0x800 + (10 * 32 + 15) * 2] = 2;
         let columns = WIDTH + 2 * WIDE_EXTRA;

@@ -85,15 +85,12 @@ impl Channel {
 
     /// Move to the next sample, stopping or looping at the end.
     fn step(&mut self, ram: &[u8]) {
-        match self.format() {
-            FORMAT_PSG => {
-                self.position = (self.position + 1) & 7;
-                let duty = (self.control >> 24) & 7;
-                let high = duty != 7 && 7 - self.position <= duty;
-                self.current = if high { 0x7FFF } else { -0x7FFF };
-                return;
-            }
-            _ => {}
+        if self.format() == FORMAT_PSG {
+            self.position = (self.position + 1) & 7;
+            let duty = (self.control >> 24) & 7;
+            let high = duty != 7 && 7 - self.position <= duty;
+            self.current = if high { 0x7FFF } else { -0x7FFF };
+            return;
         }
         let (loop_start, total) = self.bounds();
         if self.position >= total {
@@ -189,22 +186,13 @@ impl Channel {
     }
 }
 
+#[derive(Default)]
 pub struct Hardware {
     pub channels: [Channel; 16],
     /// SOUNDCNT bits 0-6.
     pub master_volume: u8,
     /// SOUNDCNT bit 15.
     pub enabled: bool,
-}
-
-impl Default for Hardware {
-    fn default() -> Self {
-        Self {
-            channels: [Channel::default(); 16],
-            master_volume: 0,
-            enabled: false,
-        }
-    }
 }
 
 impl Hardware {

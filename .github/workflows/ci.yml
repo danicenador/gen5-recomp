@@ -25,9 +25,12 @@ jobs:
       - name: Install Rust
         shell: pwsh
         run: |
-          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component rustfmt,clippy
           rustup default stable-x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets --locked -- -D warnings
 
       # One test at a time: the GPU tests share the runner's software
       # renderer, which can crash when several start devices at once.

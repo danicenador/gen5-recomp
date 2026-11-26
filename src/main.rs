@@ -771,10 +771,11 @@ fn parse_input_script(spec: &str) -> Result<Vec<(std::ops::RangeInclusive<u64>, 
         .collect()
 }
 
+/// Stylus positions held over frame ranges.
+type TouchScript = Vec<(std::ops::RangeInclusive<u64>, (u8, u8))>;
+
 /// `first-last:x:y,...`; coordinates are pixels on the 256 x 192 touch screen.
-fn parse_touch_script(
-    spec: &str,
-) -> Result<Vec<(std::ops::RangeInclusive<u64>, (u8, u8))>, String> {
+fn parse_touch_script(spec: &str) -> Result<TouchScript, String> {
     spec.split(',')
         .filter(|entry| !entry.trim().is_empty())
         .map(|entry| {
@@ -802,42 +803,6 @@ fn parse_touch_script(
             Ok((first..=last, (x, y)))
         })
         .collect()
-}
-
-#[cfg(test)]
-mod replay_tests {
-    use super::*;
-
-    #[test]
-    fn run_scales_are_checked_and_other_options_are_not_scales() {
-        assert_eq!(scale_argument("3"), Some("3"));
-        assert_eq!(scale_argument("--scale=4"), Some("4"));
-        assert_eq!(scale_argument("--contine"), None);
-        assert_eq!(scale_argument("-x"), None);
-        assert_eq!(parse_scale("8"), Some(8));
-        assert_eq!(parse_scale("0"), None);
-        assert_eq!(parse_scale("99"), None);
-        assert_eq!(parse_scale("big"), None);
-    }
-
-    #[test]
-    fn replay_ranges_and_touch_coordinates_are_validated() {
-        assert_eq!(
-            parse_input_file("# comment\n10-15:a # hold\n\n").unwrap(),
-            vec![(10..=15, gen5::nds::input::A)]
-        );
-        assert!(parse_input_script("").unwrap().is_empty());
-        assert!(parse_input_script("20-10:a").is_err());
-        assert!(parse_input_script("0:a").is_err());
-        assert!(parse_input_script("10:unknown").is_err());
-        assert_eq!(
-            parse_touch_script("10-15:255:191").unwrap(),
-            vec![(10..=15, (255, 191))]
-        );
-        for invalid in ["0:0:0", "15-10:0:0", "10:256:0", "10:0:192", "10:0:0:1"] {
-            assert!(parse_touch_script(invalid).is_err(), "{invalid}");
-        }
-    }
 }
 
 fn parse_address(text: &str) -> Result<u32, String> {
@@ -1171,5 +1136,41 @@ fn human_size(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit])
     } else {
         format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    #[test]
+    fn run_scales_are_checked_and_other_options_are_not_scales() {
+        assert_eq!(scale_argument("3"), Some("3"));
+        assert_eq!(scale_argument("--scale=4"), Some("4"));
+        assert_eq!(scale_argument("--contine"), None);
+        assert_eq!(scale_argument("-x"), None);
+        assert_eq!(parse_scale("8"), Some(8));
+        assert_eq!(parse_scale("0"), None);
+        assert_eq!(parse_scale("99"), None);
+        assert_eq!(parse_scale("big"), None);
+    }
+
+    #[test]
+    fn replay_ranges_and_touch_coordinates_are_validated() {
+        assert_eq!(
+            parse_input_file("# comment\n10-15:a # hold\n\n").unwrap(),
+            vec![(10..=15, gen5::nds::input::A)]
+        );
+        assert!(parse_input_script("").unwrap().is_empty());
+        assert!(parse_input_script("20-10:a").is_err());
+        assert!(parse_input_script("0:a").is_err());
+        assert!(parse_input_script("10:unknown").is_err());
+        assert_eq!(
+            parse_touch_script("10-15:255:191").unwrap(),
+            vec![(10..=15, (255, 191))]
+        );
+        for invalid in ["0:0:0", "15-10:0:0", "10:256:0", "10:0:192", "10:0:0:1"] {
+            assert!(parse_touch_script(invalid).is_err(), "{invalid}");
+        }
     }
 }

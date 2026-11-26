@@ -170,7 +170,9 @@ impl NdsRom {
         let table = self.read_at(u64::from(section.offset), section.size as usize)?;
         let file_count = self.filesystem.allocations.len();
         table
-            .chunks_exact(OVERLAY_ENTRY_SIZE)
+            .as_chunks::<OVERLAY_ENTRY_SIZE>()
+            .0
+            .iter()
             .enumerate()
             .map(|(index, record)| {
                 let flags = u32_at(record, 28);

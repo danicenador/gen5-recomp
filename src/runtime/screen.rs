@@ -252,7 +252,7 @@ impl View {
         match self {
             Self::Stacked => [0.0, 0.0, 1.0, 1.0],
             Self::Top | Self::Single => [0.0, 0.0, 1.0, 0.5],
-            Self::Bottom => [extra as f32 / total, 0.5, WIDTH as f32 / total, 0.5],
+            Self::Bottom => [extra / total, 0.5, WIDTH as f32 / total, 0.5],
         }
     }
 
@@ -3413,11 +3413,11 @@ mod tests {
                 let mut gpu =
                     pollster::block_on(Gpu::new(&[window], &[View::Single], Fps::Ds)).unwrap();
                 let mut frame = Frame::blank();
-                for pixel in frame.top.chunks_exact_mut(4) {
-                    pixel.copy_from_slice(&[255, 0, 0, 255]);
+                for pixel in frame.top.as_chunks_mut::<4>().0 {
+                    *pixel = [255, 0, 0, 255];
                 }
-                for pixel in frame.bottom.chunks_exact_mut(4) {
-                    pixel.copy_from_slice(&[0, 255, 0, 255]);
+                for pixel in frame.bottom.as_chunks_mut::<4>().0 {
+                    *pixel = [0, 255, 0, 255];
                 }
                 gpu.upload(&frame);
                 // A 4:3 top screen fills 512x384; the bottom screen is
@@ -3520,7 +3520,9 @@ mod tests {
             .unwrap();
         receiver.recv().unwrap().unwrap();
         let data = buffer.slice(..).get_mapped_range().unwrap();
-        data.chunks_exact(4)
+        data.as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| match format {
                 wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
                     [pixel[2], pixel[1], pixel[0], pixel[3]]
@@ -3563,11 +3565,11 @@ mod tests {
                 assert_eq!(gpu.targets[0].view, View::Top);
                 assert_eq!(gpu.targets[1].view, View::Bottom);
                 let mut frame = Frame::blank();
-                for pixel in frame.top.chunks_exact_mut(4) {
-                    pixel.copy_from_slice(&[255, 0, 0, 255]);
+                for pixel in frame.top.as_chunks_mut::<4>().0 {
+                    *pixel = [255, 0, 0, 255];
                 }
-                for pixel in frame.bottom.chunks_exact_mut(4) {
-                    pixel.copy_from_slice(&[0, 255, 0, 255]);
+                for pixel in frame.bottom.as_chunks_mut::<4>().0 {
+                    *pixel = [0, 255, 0, 255];
                 }
                 gpu.upload(&frame);
                 verify_screen_pixels(&gpu);
@@ -3683,7 +3685,7 @@ mod tests {
                 .unwrap();
             receiver.recv().unwrap().unwrap();
             let data = buffer.slice(..).get_mapped_range().unwrap();
-            for (index, pixel) in data.chunks_exact(4).enumerate() {
+            for (index, pixel) in data.as_chunks::<4>().0.iter().enumerate() {
                 let bottom =
                     view == View::Bottom || (view == View::Stacked && index >= WIDTH * HEIGHT);
                 let expected = if bottom {

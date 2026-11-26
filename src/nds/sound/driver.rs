@@ -904,6 +904,7 @@ impl Driver {
         registers.source = data;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn setup_channel_psg(
         &mut self,
         ram: &[u8],
@@ -1366,6 +1367,7 @@ impl Driver {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn note_on(
         &mut self,
         ram: &[u8],

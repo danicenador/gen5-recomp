@@ -92,7 +92,7 @@ impl NdsHeader {
                 fnt.size
             ));
         }
-        if fat.size == 0 || fat.size % 8 != 0 {
+        if fat.size == 0 || !fat.size.is_multiple_of(8) {
             return Err(format!(
                 "NDS allocation table has invalid size 0x{:X} (expected a non-zero multiple of 8)",
                 fat.size

@@ -105,8 +105,8 @@ impl WideCapture {
         let bytes = vram.banks.get(self.start..end)?;
         let mut seen = [[None::<u8>; 32]; 3];
         let mut conflicts = 0;
-        for (pair, &old) in bytes.chunks_exact(2).zip(&self.written) {
-            let new = u16::from_le_bytes([pair[0], pair[1]]);
+        for (&pair, &old) in bytes.as_chunks::<2>().0.iter().zip(&self.written) {
+            let new = u16::from_le_bytes(pair);
             let mut conflict = false;
             for (channel, seen) in seen.iter_mut().enumerate() {
                 let shift = 5 * channel;
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(capture.height(), 4);
         assert_eq!(capture.side(-43, 0), Some(0x8000));
         assert_eq!(capture.side(-1, 0), Some(0x8000 | 10));
-        assert_eq!(capture.side(256, 1), Some(0x8000 | (86 + 43) as u16 % 32));
+        assert_eq!(capture.side(256, 1), Some(0x8000 | ((86 + 43) as u16 % 32)));
         assert_eq!(capture.side(0, 0), None);
         assert_eq!(capture.side(299, 0), None);
         let store = |vram: &mut Vram, colors: &[u16]| {

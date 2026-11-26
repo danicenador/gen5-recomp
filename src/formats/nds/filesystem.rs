@@ -95,11 +95,11 @@ fn read_range(file: &mut File, offset: u32, length: u32) -> Result<Vec<u8>> {
 }
 
 fn parse_fat(bytes: &[u8], rom_size: u64) -> Result<Vec<(u32, u32)>> {
-    if bytes.len() % 8 != 0 {
+    if !bytes.len().is_multiple_of(8) {
         return Err("NDS FAT length is not a multiple of 8 bytes".to_owned());
     }
     let mut entries = Vec::with_capacity(bytes.len() / 8);
-    for (id, record) in bytes.chunks_exact(8).enumerate() {
+    for (id, record) in bytes.as_chunks::<8>().0.iter().enumerate() {
         let start = u32_at(record, 0);
         let end = u32_at(record, 4);
         if end < start {
@@ -135,7 +135,7 @@ fn parse_directory_records(bytes: &[u8]) -> Result<Vec<DirectoryRecord>> {
         ));
     }
     let mut records = Vec::with_capacity(directory_count);
-    for record in bytes[..records_size].chunks_exact(8) {
+    for record in bytes[..records_size].as_chunks::<8>().0 {
         let entries_offset = u32_at(record, 0);
         if (entries_offset as usize) < records_size || (entries_offset as usize) >= bytes.len() {
             return Err(format!(
@@ -150,6 +150,7 @@ fn parse_directory_records(bytes: &[u8]) -> Result<Vec<DirectoryRecord>> {
     Ok(records)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_directory(
     directory_id: usize,
     prefix: &str,
