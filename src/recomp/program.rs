@@ -63,7 +63,28 @@ pub struct Module {
     pub sinit: Option<(u32, u32)>,
 }
 
+/// The ARM9 BIOS, the top of the address space. Code is loaded below it:
+/// in the TCMs, main RAM and, for small autoload blocks, even VRAM.
+pub const LOAD_LIMIT: u32 = 0xFFFF_0000;
+
 impl Module {
+    /// Check that the module, BSS included, lies below [`LOAD_LIMIT`], so
+    /// address arithmetic on it cannot wrap. The ranges come from the ROM.
+    pub fn check_range(&self) -> Result<()> {
+        let end = u64::from(self.base) + self.bytes.len() as u64 + u64::from(self.bss_size);
+        if end > u64::from(LOAD_LIMIT) {
+            return Err(format!(
+                "{} at 0x{:08X} (0x{:X} bytes and 0x{:X} of BSS) runs into the ARM9 BIOS \
+                 at 0x{LOAD_LIMIT:08X}",
+                self.id,
+                self.base,
+                self.bytes.len(),
+                self.bss_size
+            ));
+        }
+        Ok(())
+    }
+
     pub fn end(&self) -> u32 {
         self.base + self.bytes.len() as u32
     }
@@ -162,6 +183,9 @@ impl Program {
                 sinit: (entry.sinit_start != 0).then_some((entry.sinit_start, entry.sinit_end)),
             });
         }
+        for module in &modules {
+            module.check_range()?;
+        }
         Ok(Self {
             modules,
             entry: manifest.arm9.binary.entry,
@@ -235,6 +259,23 @@ mod tests {
         }
         assert_eq!(ModuleId::Overlay(7).to_string(), "ov007");
         assert!("ovx".parse::<ModuleId>().is_err());
+    }
+
+    #[test]
+    fn modules_must_lie_below_the_bios() {
+        let mut overlay = module(ModuleId::Overlay(5), 0x0210_0000, 0x1000);
+        overlay.bss_size = 0x100;
+        assert!(overlay.check_range().is_ok());
+        let mut last = module(ModuleId::Overlay(6), LOAD_LIMIT - 0x1000, 0x800);
+        last.bss_size = 0x800;
+        assert!(last.check_range().is_ok());
+        last.bss_size = 0x801;
+        assert!(last.check_range().is_err());
+        // A range that would wrap the 32-bit address space.
+        let mut wrapping = module(ModuleId::Overlay(7), 0xFFFF_FF00, 0x100);
+        wrapping.bss_size = 0x100;
+        let error = wrapping.check_range().unwrap_err();
+        assert!(error.starts_with("ov007 at 0xFFFFFF00"), "{error}");
     }
 
     #[test]
