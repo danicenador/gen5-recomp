@@ -261,10 +261,10 @@ pub struct Machine {
     /// Runtime callbacks since boot; display time advances with them.
     activity: u64,
     card: Card,
-    /// Every word the ARM9 sent through the IPC FIFO, for reports.
-    fifo_sent: Vec<(u32, u32)>,
-    /// Replies the ARM7 stand-in sent, as (tag, data), for reports.
-    fifo_replies: Vec<(u32, u32)>,
+    /// Words the ARM9 sent through the IPC FIFO, with the caller's lr.
+    fifo_sent: Runs<(u32, u32)>,
+    /// Replies the ARM7 stand-in sent, as (tag, data).
+    fifo_replies: Runs<(u32, u32)>,
     /// Command of the PM packet being received.
     arm7_pm_command: u32,
     arm7_tp_command: u32,
@@ -368,6 +368,8 @@ impl FrameTiming {
 /// from a run that finished (0) or could not start (1).
 pub const STOP_EXIT_CODE: i32 = 3;
 const EVENT_HISTORY: usize = 400;
+/// Runs of IPC messages kept for reports.
+const RUN_HISTORY: usize = 400;
 const ACTIVITY_PER_LINE: u64 = 32;
 /// Backward branches between `rt_tick` calls.
 const LOOP_BUDGET: u32 = 2000;
@@ -1598,8 +1600,8 @@ impl Machine {
         for event in &self.control {
             let _ = writeln!(report, "  {}", describe(event));
         }
-        report.push_str("IPC FIFO messages sent to the ARM7:\n");
-        for ((word, lr), count) in runs(&self.fifo_sent) {
+        report.push_str("recent IPC FIFO messages sent to the ARM7 (oldest first):\n");
+        for ((word, lr), count) in self.fifo_sent.iter() {
             let _ = writeln!(
                 report,
                 "  tag {:2} ({}) data 0x{:07X}{} (lr 0x{lr:08X}){}",
@@ -1614,8 +1616,8 @@ impl Machine {
                 repeated(count)
             );
         }
-        report.push_str("IPC FIFO replies from the ARM7 stand-in:\n");
-        for ((tag, data), count) in runs(&self.fifo_replies) {
+        report.push_str("recent IPC FIFO replies from the ARM7 stand-in (oldest first):\n");
+        for ((tag, data), count) in self.fifo_replies.iter() {
             let _ = writeln!(
                 report,
                 "  tag {tag:2} ({}) data 0x{data:07X}{}",
@@ -1738,15 +1740,30 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// Consecutive equal items, counted.
-fn runs<T: Copy + PartialEq>(items: &[T]) -> Vec<(T, usize)> {
-    let mut runs: Vec<(T, usize)> = Vec::new();
-    for &item in items {
-        match runs.last_mut() {
+/// The latest runs of equal items, oldest first, for reports. Repeats only
+/// count up, and the oldest run is dropped past `RUN_HISTORY` runs, so a
+/// long session does not keep every message it ever sent.
+#[derive(Default)]
+struct Runs<T> {
+    runs: VecDeque<(T, usize)>,
+}
+
+impl<T: Copy + PartialEq> Runs<T> {
+    fn push(&mut self, item: T) {
+        match self.runs.back_mut() {
             Some((last, count)) if *last == item => *count += 1,
-            _ => runs.push((item, 1)),
+            _ => {
+                if self.runs.len() == RUN_HISTORY {
+                    self.runs.pop_front();
+                }
+                self.runs.push_back((item, 1));
+            }
         }
     }
-    runs
+
+    fn iter(&self) -> impl Iterator<Item = (T, usize)> + '_ {
+        self.runs.iter().copied()
+    }
 }
 
 fn repeated(count: usize) -> String {
@@ -2463,8 +2480,8 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         activity: 0,
         pending_switch: None,
         card,
-        fifo_sent: Vec::new(),
-        fifo_replies: Vec::new(),
+        fifo_sent: Runs::default(),
+        fifo_replies: Runs::default(),
         arm7_pm_command: 0,
         arm7_tp_command: 0,
         nvram_command: 0,
@@ -2596,4 +2613,28 @@ pub fn boot(cache_root: &Path, rom: &Path, options: Options) -> Result<()> {
         call_target(cpu, entry);
         unsafe { get(cpu) }.stop("the entry function returned");
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runs_count_repeats_and_keep_only_the_latest() {
+        let mut runs = Runs::default();
+        for item in [1, 1, 2, 2, 2, 1] {
+            runs.push(item);
+        }
+        assert_eq!(runs.iter().collect::<Vec<_>>(), [(1, 2), (2, 3), (1, 1)]);
+
+        let mut runs = Runs::default();
+        for item in 0..RUN_HISTORY + 10 {
+            runs.push(item);
+            runs.push(item);
+        }
+        let kept: Vec<_> = runs.iter().collect();
+        assert_eq!(kept.len(), RUN_HISTORY);
+        assert_eq!(kept[0], (10, 2));
+        assert_eq!(kept[RUN_HISTORY - 1], (RUN_HISTORY + 9, 2));
+    }
 }
